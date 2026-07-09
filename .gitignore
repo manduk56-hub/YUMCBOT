@@ -1,0 +1,10 @@
+.env
+.venv/
+__pycache__/
+*.pyc
+data/
+data/backups/
+logs/
+.agents/
+.codex/
+56df2b91-9516-4cf5-a97b-1272df7df54b.png
