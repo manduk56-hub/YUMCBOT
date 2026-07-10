@@ -476,7 +476,7 @@ def start_trust_decision(round_id: int) -> dict[str, Any] | None:
                 (now_text(), json.dumps(extra, ensure_ascii=False), round_id),
             )
             embed = discord.Embed(
-                title=f"신뢰 거래 취소 #{round_id}",
+                title=f"{round_row['title']} · 취소",
                 description="참여자가 2명 미만이라 오늘의 메인 콘텐츠를 시작하지 못했습니다.",
                 color=discord.Color.light_grey(),
             )
@@ -898,7 +898,7 @@ bot = EventBot()
 
 def build_balance_embed(round_id: int, question: str, option_a: str, option_b: str) -> discord.Embed:
     embed = discord.Embed(
-        title=f"오늘의 선택 #{round_id}",
+        title=question,
         description=question,
         color=discord.Color.blurple(),
     )
@@ -918,7 +918,7 @@ def build_balance_embed(round_id: int, question: str, option_a: str, option_b: s
 
 def build_defuse_embed(round_id: int, title: str, hint: str) -> discord.Embed:
     embed = discord.Embed(
-        title=f"4선 폭탄 해체 게임 #{round_id}",
+        title=title,
         description=title,
         color=discord.Color.dark_red(),
     )
@@ -943,7 +943,7 @@ def build_defuse_embed(round_id: int, title: str, hint: str) -> discord.Embed:
 
 def build_grid_embed(round_id: int, title: str, admin_clue: str, reward_points: int) -> discord.Embed:
     embed = discord.Embed(
-        title=f"관리자 시점 타일 게임 #{round_id}",
+        title=title,
         description=title,
         color=discord.Color.purple(),
     )
@@ -967,7 +967,7 @@ def build_grid_embed(round_id: int, title: str, admin_clue: str, reward_points: 
 
 def build_cutting_embed(round_id: int, title: str) -> discord.Embed:
     embed = discord.Embed(
-        title=f"돌 세공 예측 게임 #{round_id}",
+        title=title,
         description=title,
         color=discord.Color.teal(),
     )
@@ -995,13 +995,12 @@ def build_thread_notice_embed(round_id: int, thread: discord.Thread, title: str,
         color=discord.Color.gold(),
     )
     embed.add_field(name="참여 방법", value="위 스레드를 눌러 의견을 남겨주세요.", inline=False)
-    embed.set_footer(text=f"라운드 #{round_id}")
     return embed
 
 
 def build_top3_embed(round_id: int, title: str, candidates: list[dict[str, Any]]) -> discord.Embed:
     embed = discord.Embed(
-        title=f"상위 3명 견제 투표 #{round_id}",
+        title=title,
         description=title,
         color=discord.Color.orange(),
     )
@@ -1024,7 +1023,7 @@ def build_top3_embed(round_id: int, title: str, candidates: list[dict[str, Any]]
 
 def build_trust_registration_embed(round_id: int, title: str, registration_minutes: int) -> discord.Embed:
     embed = discord.Embed(
-        title=f"오늘의 신뢰 거래 #{round_id} · 참여자 모집",
+        title=title,
         description=title,
         color=discord.Color.dark_gold(),
     )
@@ -1079,7 +1078,7 @@ def build_trust_decision_embed(
     unmatched_user_id: str | None,
 ) -> discord.Embed:
     embed = discord.Embed(
-        title=f"오늘의 신뢰 거래 #{round_id} · 선택 시간",
+        title=title,
         description=title,
         color=discord.Color.gold(),
     )
@@ -1219,7 +1218,7 @@ def build_cutting_progress_embed(round_row: sqlite3.Row, extra: dict[str, Any]) 
     logs = [str(log) for log in extra.get("cutting_logs", [])]
 
     embed = discord.Embed(
-        title=f"돌 세공 진행 #{round_row['id']}",
+        title=round_row["title"],
         description=round_row["title"],
         color=discord.Color.teal(),
     )
@@ -1284,7 +1283,7 @@ def finalize_cutting_round(
         for level in CUTTING_LEVEL_CHOICES
     ]
     embed = discord.Embed(
-        title=f"돌 세공 결과 #{round_row['id']}",
+        title=f"결과 · {round_row['title']}",
         description=round_row["title"],
         color=discord.Color.green(),
     )
@@ -1410,7 +1409,7 @@ def close_round_record(
                     )
 
             embed = discord.Embed(
-                title=f"결과 공개 #{round_row['id']}",
+                title=f"결과 · {round_row['title']}",
                 description=round_row["question"],
                 color=discord.Color.green() if winner else discord.Color.light_grey(),
             )
@@ -1451,7 +1450,7 @@ def close_round_record(
                 grouped.setdefault(row["choice"], []).append(row["user_id"])
 
             embed = discord.Embed(
-                title=f"{'4선 폭탄 해체 결과' if is_defuse else '폭탄 결과'} #{round_row['id']}",
+                title=f"결과 · {round_row['title']}",
                 description=round_row["title"],
                 color=discord.Color.green(),
             )
@@ -1506,7 +1505,7 @@ def close_round_record(
                 grid_lines.append(" | ".join(cells))
 
             embed = discord.Embed(
-                title=f"관리자 시점 타일 결과 #{round_row['id']}",
+                title=f"결과 · {round_row['title']}",
                 description=round_row["title"],
                 color=discord.Color.green(),
             )
@@ -1585,7 +1584,7 @@ def close_round_record(
                 (json.dumps(extra, ensure_ascii=False), round_row["id"]),
             )
             embed = discord.Embed(
-                title=f"신뢰 거래 결과 #{round_row['id']}",
+                title=f"결과 · {round_row['title']}",
                 description=round_row["title"],
                 color=discord.Color.gold(),
             )
@@ -1621,7 +1620,7 @@ def close_round_record(
                 lines.append(f"{level}강화: {len(users)}명")
 
             embed = discord.Embed(
-                title=f"돌 세공 예측 집계 #{round_row['id']}",
+                title=f"집계 · {round_row['title']}",
                 description=round_row["title"],
                 color=discord.Color.teal(),
             )
@@ -1684,7 +1683,7 @@ def close_round_record(
                 settlement = f"<@{target['user_id']}> -1점"
 
             embed = discord.Embed(
-                title=f"상위 3명 견제 투표 결과 #{round_row['id']}",
+                title=f"결과 · {round_row['title']}",
                 description=round_row["title"],
                 color=discord.Color.green(),
             )
@@ -2146,19 +2145,7 @@ async def create_round_from_setup(
     discussion_thread_id = None
     if 게임 in {"balance", "grid", "defuse4", "trust"}:
         try:
-            thread_name = (
-                f"토론방 #{round_id} | 의견 남기기"
-                if 게임 == "balance"
-                else (
-                    f"타일추리방 #{round_id} | 블러핑과 추리"
-                    if 게임 == "grid"
-                    else (
-                        f"거래 협상방 #{round_id} | 신뢰와 배신"
-                        if 게임 == "trust"
-                        else f"해체토론방 #{round_id} | 힌트와 블러핑"
-                    )
-                )
-            )
+            thread_name = f"{제목} | 토론방"[:100]
             thread = await message.create_thread(name=thread_name)
             if 게임 == "trust":
                 await thread.send(
@@ -2273,24 +2260,17 @@ async def close_round(interaction: discord.Interaction) -> None:
     await interaction.response.send_message(embed=embed)
 
 
-@bot.tree.command(name="세공진행", description="마감된 돌 세공 예측 라운드의 관리자 진행 패널을 엽니다.")
+@bot.tree.command(name="세공진행", description="가장 최근 마감된 돌 세공 예측의 관리자 진행 패널을 엽니다.")
 @admin_only()
-@app_commands.describe(라운드번호="비워두면 가장 최근 마감된 미진행 돌 세공 라운드를 사용합니다.")
-async def run_cutting(interaction: discord.Interaction, 라운드번호: int | None = None) -> None:
+async def run_cutting(interaction: discord.Interaction) -> None:
     with db() as conn:
-        if 라운드번호 is not None:
-            rows = conn.execute(
-                "SELECT * FROM rounds WHERE id = ? AND type = 'cutting'",
-                (라운드번호,),
-            ).fetchall()
-        else:
-            rows = conn.execute(
-                """
-                SELECT * FROM rounds
-                WHERE type = 'cutting' AND status = 'closed'
-                ORDER BY id DESC
-                """
-            ).fetchall()
+        rows = conn.execute(
+            """
+            SELECT * FROM rounds
+            WHERE type = 'cutting' AND status = 'closed'
+            ORDER BY id DESC
+            """
+        ).fetchall()
 
         round_row = None
         extra: dict[str, Any] = {}
@@ -2352,29 +2332,6 @@ async def ranking(interaction: discord.Interaction) -> None:
 
     embed = discord.Embed(title="현재 랭킹 TOP 10", description="\n".join(lines), color=discord.Color.gold())
     await interaction.response.send_message(embed=embed)
-
-
-@bot.tree.command(name="라운드현황", description="현재 열린 라운드 정보를 확인합니다.")
-async def round_status(interaction: discord.Interaction) -> None:
-    with db() as conn:
-        round_row = get_open_round(conn)
-        if not round_row:
-            await interaction.response.send_message("현재 열린 라운드가 없습니다.", ephemeral=True)
-            return
-        vote_count = conn.execute(
-            "SELECT COUNT(*) AS count FROM votes WHERE round_id = ?",
-            (round_row["id"],),
-        ).fetchone()["count"]
-
-    embed = discord.Embed(
-        title=f"진행 중인 라운드 #{round_row['id']}",
-        description=round_row["question"],
-        color=discord.Color.blurple(),
-    )
-    embed.add_field(name="종류", value=round_row["type"], inline=True)
-    embed.add_field(name="참여 인원", value=f"{vote_count}명", inline=True)
-    embed.add_field(name="비공개", value="선택 분포와 선택자는 마감 전까지 공개되지 않습니다.", inline=False)
-    await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
 @bot.tree.command(name="점수수정", description="운영자가 특정 유저의 점수를 수정합니다.")
