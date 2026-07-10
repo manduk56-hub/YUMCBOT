@@ -58,6 +58,14 @@ TOP3_NONE_CHOICE = "__none__"
 TRUST_SELF_CHOICE = "__self__"
 TRUST_SELF_REWARD = 1
 TRUST_OTHER_REWARD = 3
+TRUST_REGISTRATION_DEFAULT_MINUTES = 2
+TRUST_DECISION_SECONDS = 180
+TRUST_MATCH_HISTORY_ROUNDS = 3
+TRUST_PREDICTION_LABELS = {
+    "mutual": "상호 신뢰",
+    "single": "단독 배신",
+    "double": "동시 배신",
+}
 
 
 def now_text() -> str:
@@ -133,6 +141,33 @@ def init_db() -> None:
                 created_at TEXT NOT NULL,
                 responded_at TEXT,
                 PRIMARY KEY (round_id, proposer_id),
+                FOREIGN KEY (round_id) REFERENCES rounds(id) ON DELETE CASCADE
+            );
+
+            CREATE TABLE IF NOT EXISTS trust_registrations (
+                round_id INTEGER NOT NULL,
+                user_id TEXT NOT NULL,
+                registered_at TEXT NOT NULL,
+                PRIMARY KEY (round_id, user_id),
+                FOREIGN KEY (round_id) REFERENCES rounds(id) ON DELETE CASCADE
+            );
+
+            CREATE TABLE IF NOT EXISTS trust_pairings (
+                round_id INTEGER NOT NULL,
+                user_a_id TEXT NOT NULL,
+                user_b_id TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY (round_id, user_a_id),
+                UNIQUE (round_id, user_b_id),
+                FOREIGN KEY (round_id) REFERENCES rounds(id) ON DELETE CASCADE
+            );
+
+            CREATE TABLE IF NOT EXISTS trust_predictions (
+                round_id INTEGER NOT NULL,
+                user_id TEXT NOT NULL,
+                choice TEXT NOT NULL CHECK (choice IN ('mutual', 'single', 'double')),
+                created_at TEXT NOT NULL,
+                PRIMARY KEY (round_id, user_id),
                 FOREIGN KEY (round_id) REFERENCES rounds(id) ON DELETE CASCADE
             );
 
@@ -601,6 +636,246 @@ async def handle_trust_contract_response(
     await interaction.response.edit_message(content=content, view=None)
 
 
+def build_random_trust_pairs(
+    user_ids: list[str],
+    recent_pairs: set[tuple[str, str]],
+) -> tuple[list[tuple[str, str]], str | None]:
+    participants = list(user_ids)
+    predictor_id = None
+    if len(participants) % 2:
+        predictor_id = random.choice(participants)
+        participants.remove(predictor_id)
+
+    best_pairs: list[tuple[str, str]] = []
+    best_penalty: int | None = None
+    for _ in range(200):
+        shuffled = random.sample(participants, len(participants))
+        pairs = [(shuffled[index], shuffled[index + 1]) for index in range(0, len(shuffled), 2)]
+        penalty = sum(tuple(sorted(pair)) in recent_pairs for pair in pairs)
+        if best_penalty is None or penalty < best_penalty:
+            best_pairs = pairs
+            best_penalty = penalty
+        if penalty == 0:
+            break
+    return best_pairs, predictor_id
+
+
+def start_trust_decision(round_id: int) -> dict[str, Any] | None:
+    with db() as conn:
+        round_row = conn.execute(
+            "SELECT * FROM rounds WHERE id = ? AND type = 'trust' AND status = 'open'",
+            (round_id,),
+        ).fetchone()
+        if not round_row:
+            return None
+
+        extra = round_extra(round_row)
+        if extra.get("trust_phase") != "registration":
+            return None
+
+        registrations = conn.execute(
+            "SELECT user_id FROM trust_registrations WHERE round_id = ? ORDER BY registered_at ASC",
+            (round_id,),
+        ).fetchall()
+        user_ids = [str(row["user_id"]) for row in registrations]
+        if len(user_ids) < 2:
+            extra.update({"trust_phase": "cancelled", "cancelled_reason": "not_enough_participants"})
+            conn.execute(
+                "UPDATE rounds SET status = 'closed', closed_at = ?, extra_json = ? WHERE id = ?",
+                (now_text(), json.dumps(extra, ensure_ascii=False), round_id),
+            )
+            embed = discord.Embed(
+                title=f"신뢰 거래 취소 #{round_id}",
+                description="참여자가 2명 미만이라 오늘의 메인 콘텐츠를 시작하지 못했습니다.",
+                color=discord.Color.light_grey(),
+            )
+            return {
+                "state": "cancelled",
+                "channel_id": str(round_row["channel_id"]),
+                "message_id": str(round_row["message_id"] or ""),
+                "embed": embed,
+            }
+
+        history_rounds = conn.execute(
+            """
+            SELECT id FROM rounds
+            WHERE type = 'trust' AND id < ?
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            (round_id, TRUST_MATCH_HISTORY_ROUNDS),
+        ).fetchall()
+        history_ids = [int(row["id"]) for row in history_rounds]
+        recent_pairs: set[tuple[str, str]] = set()
+        if history_ids:
+            placeholders = ", ".join("?" for _ in history_ids)
+            history_pairs = conn.execute(
+                f"SELECT user_a_id, user_b_id FROM trust_pairings WHERE round_id IN ({placeholders})",
+                tuple(history_ids),
+            ).fetchall()
+            recent_pairs = {
+                tuple(sorted((str(row["user_a_id"]), str(row["user_b_id"]))))
+                for row in history_pairs
+            }
+
+        pairs, predictor_id = build_random_trust_pairs(user_ids, recent_pairs)
+        for user_a_id, user_b_id in pairs:
+            conn.execute(
+                """
+                INSERT INTO trust_pairings (round_id, user_a_id, user_b_id, created_at)
+                VALUES (?, ?, ?, ?)
+                """,
+                (round_id, user_a_id, user_b_id, now_text()),
+            )
+
+        decision_close_at = time.time() + TRUST_DECISION_SECONDS
+        extra.update(
+            {
+                "trust_phase": "decision",
+                "predictor_id": predictor_id,
+                "decision_close_at": decision_close_at,
+                "auto_close_at": decision_close_at,
+                "decision_duration_seconds": TRUST_DECISION_SECONDS,
+            }
+        )
+        conn.execute(
+            "UPDATE rounds SET extra_json = ? WHERE id = ?",
+            (json.dumps(extra, ensure_ascii=False), round_id),
+        )
+
+        embed = build_trust_decision_embed(round_id, str(round_row["title"]), pairs, predictor_id)
+        return {
+            "state": "decision",
+            "channel_id": str(round_row["channel_id"]),
+            "message_id": str(round_row["message_id"] or ""),
+            "embed": embed,
+            "view": trust_decision_view(round_id, predictor_id is not None),
+            "close_at": decision_close_at,
+        }
+
+
+async def update_trust_main_message(transition: dict[str, Any]) -> None:
+    try:
+        channel = bot.get_channel(int(transition["channel_id"]))
+        if channel is None:
+            channel = await bot.fetch_channel(int(transition["channel_id"]))
+        message_id = transition.get("message_id")
+        if message_id:
+            message = await channel.fetch_message(int(message_id))
+            await message.edit(embed=transition["embed"], view=transition.get("view"))
+        elif hasattr(channel, "send"):
+            await channel.send(embed=transition["embed"], view=transition.get("view"))
+    except discord.HTTPException:
+        return
+
+
+async def handle_trust_join(interaction: discord.Interaction, round_id: int) -> None:
+    with db() as conn:
+        round_row = conn.execute(
+            "SELECT * FROM rounds WHERE id = ? AND type = 'trust' AND status = 'open'",
+            (round_id,),
+        ).fetchone()
+        if not round_row or round_extra(round_row).get("trust_phase") != "registration":
+            await interaction.response.send_message("참여자 모집이 이미 끝났습니다.", ephemeral=True)
+            return
+
+        existing = conn.execute(
+            "SELECT 1 FROM trust_registrations WHERE round_id = ? AND user_id = ?",
+            (round_id, str(interaction.user.id)),
+        ).fetchone()
+        if existing:
+            await interaction.response.send_message("이미 오늘의 신뢰 거래에 참여 등록했습니다.", ephemeral=True)
+            return
+
+        ensure_user(conn, interaction.user)
+        conn.execute(
+            "INSERT INTO trust_registrations (round_id, user_id, registered_at) VALUES (?, ?, ?)",
+            (round_id, str(interaction.user.id), now_text()),
+        )
+    await interaction.response.send_message("참여 등록 완료! 모집 마감 후 무작위로 짝이 정해집니다.", ephemeral=True)
+
+
+async def handle_trust_decision(
+    interaction: discord.Interaction,
+    round_id: int,
+    choice: str,
+) -> None:
+    with db() as conn:
+        round_row = conn.execute(
+            "SELECT * FROM rounds WHERE id = ? AND type = 'trust' AND status = 'open'",
+            (round_id,),
+        ).fetchone()
+        if not round_row or round_extra(round_row).get("trust_phase") != "decision":
+            await interaction.response.send_message("현재는 선택할 수 있는 시간이 아닙니다.", ephemeral=True)
+            return
+
+        pairing = conn.execute(
+            """
+            SELECT 1 FROM trust_pairings
+            WHERE round_id = ? AND (user_a_id = ? OR user_b_id = ?)
+            """,
+            (round_id, str(interaction.user.id), str(interaction.user.id)),
+        ).fetchone()
+        if not pairing:
+            await interaction.response.send_message("랜덤 매칭된 참가자만 신뢰 또는 배신을 선택할 수 있습니다.", ephemeral=True)
+            return
+
+        existing = conn.execute(
+            "SELECT 1 FROM votes WHERE round_id = ? AND user_id = ?",
+            (round_id, str(interaction.user.id)),
+        ).fetchone()
+        if existing:
+            await interaction.response.send_message("선택을 이미 확정했습니다. 변경할 수 없습니다.", ephemeral=True)
+            return
+
+        ensure_user(conn, interaction.user)
+        conn.execute(
+            """
+            INSERT INTO votes (round_id, user_id, choice, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (round_id, str(interaction.user.id), choice, now_text(), now_text()),
+        )
+    await interaction.response.send_message("선택을 비공개로 확정했습니다.", ephemeral=True)
+
+
+async def handle_trust_prediction(
+    interaction: discord.Interaction,
+    round_id: int,
+    choice: str,
+) -> None:
+    if choice not in TRUST_PREDICTION_LABELS:
+        await interaction.response.send_message("잘못된 예측입니다.", ephemeral=True)
+        return
+
+    with db() as conn:
+        round_row = conn.execute(
+            "SELECT * FROM rounds WHERE id = ? AND type = 'trust' AND status = 'open'",
+            (round_id,),
+        ).fetchone()
+        if not round_row or round_extra(round_row).get("trust_phase") != "decision":
+            await interaction.response.send_message("현재는 예측할 수 있는 시간이 아닙니다.", ephemeral=True)
+            return
+        if str(round_extra(round_row).get("predictor_id") or "") != str(interaction.user.id):
+            await interaction.response.send_message("이번 회차의 예측자만 사용할 수 있습니다.", ephemeral=True)
+            return
+        existing = conn.execute(
+            "SELECT 1 FROM trust_predictions WHERE round_id = ? AND user_id = ?",
+            (round_id, str(interaction.user.id)),
+        ).fetchone()
+        if existing:
+            await interaction.response.send_message("예측을 이미 확정했습니다. 변경할 수 없습니다.", ephemeral=True)
+            return
+        conn.execute(
+            """
+            INSERT INTO trust_predictions (round_id, user_id, choice, created_at)
+            VALUES (?, ?, ?, ?)
+            """,
+            (round_id, str(interaction.user.id), choice, now_text()),
+        )
+    await interaction.response.send_message(f"`{TRUST_PREDICTION_LABELS[choice]}` 예측을 비공개로 확정했습니다.", ephemeral=True)
+
+
 class EventBot(discord.Client):
     def __init__(self) -> None:
         intents = discord.Intents.default()
@@ -655,7 +930,7 @@ class EventBot(discord.Client):
             await asyncio.sleep(max(0, close_at - time.time()))
             with db() as conn:
                 row = conn.execute(
-                    "SELECT channel_id FROM rounds WHERE id = ? AND status = 'open'",
+                    "SELECT * FROM rounds WHERE id = ? AND status = 'open'",
                     (round_id,),
                 ).fetchone()
             if not row:
@@ -669,6 +944,16 @@ class EventBot(discord.Client):
                 except discord.HTTPException:
                     return
             guild = getattr(channel, "guild", None)
+
+            if row["type"] == "trust" and round_extra(row).get("trust_phase") == "registration":
+                transition = start_trust_decision(round_id)
+                if not transition:
+                    return
+                await update_trust_main_message(transition)
+                if transition["state"] == "decision":
+                    self.schedule_auto_close(round_id, float(transition["close_at"]))
+                return
+
             result = close_round_record(round_id, guild, closed_by="자동 마감")
             if not result:
                 return
@@ -679,7 +964,8 @@ class EventBot(discord.Client):
         except asyncio.CancelledError:
             raise
         finally:
-            self.auto_close_tasks.pop(round_id, None)
+            if self.auto_close_tasks.get(round_id) is asyncio.current_task():
+                self.auto_close_tasks.pop(round_id, None)
 
     async def on_interaction(self, interaction: discord.Interaction) -> None:
         if interaction.type is not discord.InteractionType.component:
@@ -694,54 +980,53 @@ class EventBot(discord.Client):
             return
 
         _, action = parts[:2]
-        if action in {"contractaccept", "contractdecline"}:
-            if len(parts) != 5:
-                await interaction.response.send_message("잘못된 거래 제안입니다.", ephemeral=True)
+        if action == "trustjoin":
+            try:
+                round_id = int(parts[2])
+            except ValueError:
+                await interaction.response.send_message("잘못된 라운드 번호입니다.", ephemeral=True)
                 return
-            _, _, round_id_text, proposer_id, partner_id = parts
+            await handle_trust_join(interaction, round_id)
+            return
+
+        if action in {"trustdecision", "trustpredict"}:
+            if len(parts) != 4:
+                await interaction.response.send_message("잘못된 신뢰 거래 선택입니다.", ephemeral=True)
+                return
+            _, _, round_id_text, choice = parts
             try:
                 round_id = int(round_id_text)
             except ValueError:
                 await interaction.response.send_message("잘못된 라운드 번호입니다.", ephemeral=True)
                 return
-            await handle_trust_contract_response(
-                interaction,
-                round_id,
-                proposer_id,
-                partner_id,
-                accepted=action == "contractaccept",
+            if action == "trustdecision":
+                if choice not in {"trust", "betray"}:
+                    await interaction.response.send_message("잘못된 선택입니다.", ephemeral=True)
+                    return
+                await handle_trust_decision(interaction, round_id, choice)
+            else:
+                await handle_trust_prediction(interaction, round_id, choice)
+            return
+
+        if action in {"contractaccept", "contractdecline"}:
+            await interaction.response.send_message(
+                "거래 제안 방식은 랜덤 매칭 방식으로 변경되었습니다. 새 신뢰 거래에 참여해주세요.",
+                ephemeral=True,
             )
             return
 
         if action == "trustcontract":
-            try:
-                round_id = int(parts[2])
-            except ValueError:
-                await interaction.response.send_message("잘못된 라운드 번호입니다.", ephemeral=True)
-                return
-            selected_values = (interaction.data or {}).get("values", [])
-            if not selected_values:
-                await interaction.response.send_message("거래할 사용자를 선택해주세요.", ephemeral=True)
-                return
-            await handle_trust_contract_proposal(interaction, round_id, str(selected_values[0]))
+            await interaction.response.send_message(
+                "거래 제안 방식은 랜덤 매칭 방식으로 변경되었습니다. 새 신뢰 거래에 참여해주세요.",
+                ephemeral=True,
+            )
             return
 
         if action in {"trustself", "trust"}:
-            try:
-                round_id = int(parts[2])
-            except ValueError:
-                await interaction.response.send_message("잘못된 라운드 번호입니다.", ephemeral=True)
-                return
-
-            if action == "trustself":
-                await handle_trust_vote(interaction, round_id, TRUST_SELF_CHOICE)
-                return
-
-            selected_values = (interaction.data or {}).get("values", [])
-            if not selected_values:
-                await interaction.response.send_message("투표할 사용자를 선택해주세요.", ephemeral=True)
-                return
-            await handle_trust_vote(interaction, round_id, str(selected_values[0]))
+            await interaction.response.send_message(
+                "직접 점수 투표 방식은 랜덤 매칭 신뢰/배신 방식으로 변경되었습니다. 새 신뢰 거래에 참여해주세요.",
+                ephemeral=True,
+            )
             return
 
         if action == "anonymous":
@@ -982,26 +1267,24 @@ def build_top3_embed(round_id: int, title: str, candidates: list[dict[str, Any]]
     return embed
 
 
-def build_trust_embed(round_id: int, title: str) -> discord.Embed:
+def build_trust_registration_embed(round_id: int, title: str, registration_minutes: int) -> discord.Embed:
     embed = discord.Embed(
-        title=f"신뢰 거래 #{round_id}",
+        title=f"오늘의 신뢰 거래 #{round_id} · 참여자 모집",
         description=title,
         color=discord.Color.dark_gold(),
     )
     embed.add_field(
-        name="투표권 1장",
+        name="진행 순서",
         value=(
-            "`나에게 +1점` 또는 다른 한 사람에게 `+3점` 중 하나만 고를 수 있습니다.\n"
-            "한 번 제출하면 바꿀 수 없고, 투표 내용은 마감 전까지 비공개입니다.\n"
-            "거래를 수락한 상대와의 투표는 아래 거래 규칙으로 별도 정산됩니다."
+            f"참여자 모집 {registration_minutes}분 → 랜덤 매칭 → 신뢰/배신 선택 3분 → 점수 정산 → 미니게임"
         ),
         inline=False,
     )
     embed.add_field(
-        name="거래와 배신 (수락한 두 사람)",
+        name="메인 규칙",
         value=(
-            "서로 이행: 각 +1점 · 한 명만 배신: 배신자 +2점, 상대 0점 · 둘 다 배신: 각 -1점\n"
-            "거래 제안과 수락은 공개되지만, 실제 투표는 마감 전까지 비공개입니다."
+            "봇이 참가자를 무작위로 둘씩 매칭합니다. 상호 신뢰는 각 +1점, 단독 배신은 배신자 +2점·상대 0점, 동시 배신은 각 -1점입니다.\n"
+            "홀수로 남은 한 명은 예측자가 되어 가장 많이 나올 결과를 맞히면 +1점입니다."
         ),
         inline=False,
     )
@@ -1021,54 +1304,77 @@ def vote_view(round_id: int, choices: list[tuple[str, str]]) -> discord.ui.View:
     return view
 
 
-def trust_vote_view(round_id: int) -> discord.ui.View:
+def trust_registration_view(round_id: int) -> discord.ui.View:
     view = discord.ui.View(timeout=None)
     view.add_item(
         discord.ui.Button(
-            label="나에게 +1점",
-            emoji="🙋",
+            label="오늘의 신뢰 거래 참여하기",
+            emoji="✋",
             style=discord.ButtonStyle.success,
-            custom_id=f"eventbot:trustself:{round_id}",
-        )
-    )
-    view.add_item(
-        discord.ui.UserSelect(
-            placeholder="다른 한 사람에게 +3점 주기",
-            custom_id=f"eventbot:trust:{round_id}",
-            min_values=1,
-            max_values=1,
-            row=1,
-        )
-    )
-    view.add_item(
-        discord.ui.UserSelect(
-            placeholder="거래를 제안할 사용자 선택",
-            custom_id=f"eventbot:trustcontract:{round_id}",
-            min_values=1,
-            max_values=1,
-            row=2,
+            custom_id=f"eventbot:trustjoin:{round_id}",
         )
     )
     return view
 
 
-def trust_contract_response_view(round_id: int, proposer_id: str, partner_id: str) -> discord.ui.View:
+def build_trust_decision_embed(
+    round_id: int,
+    title: str,
+    pairs: list[tuple[str, str]],
+    predictor_id: str | None,
+) -> discord.Embed:
+    embed = discord.Embed(
+        title=f"오늘의 신뢰 거래 #{round_id} · 선택 시간",
+        description=title,
+        color=discord.Color.gold(),
+    )
+    pair_lines = [f"<@{user_a_id}> ↔ <@{user_b_id}>" for user_a_id, user_b_id in pairs]
+    embed.add_field(name="랜덤 매칭", value=field_text(pair_lines), inline=False)
+    if predictor_id:
+        embed.add_field(
+            name="예측자",
+            value=(
+                f"<@{predictor_id}>님은 전체 짝에서 가장 많이 나올 결과를 비공개로 예측하세요.\n"
+                "성공 +1점 · 실패 또는 동률 0점"
+            ),
+            inline=False,
+        )
+    embed.add_field(
+        name="선택 규칙 (3분)",
+        value="짝과 공개적으로 협상한 뒤, 아래 버튼으로 `신뢰` 또는 `배신`을 한 번만 확정하세요.",
+        inline=False,
+    )
+    return embed
+
+
+def trust_decision_view(round_id: int, has_predictor: bool) -> discord.ui.View:
     view = discord.ui.View(timeout=None)
     view.add_item(
         discord.ui.Button(
-            label="거래 수락",
+            label="상대를 신뢰",
             emoji="🤝",
             style=discord.ButtonStyle.success,
-            custom_id=f"eventbot:contractaccept:{round_id}:{proposer_id}:{partner_id}",
+            custom_id=f"eventbot:trustdecision:{round_id}:trust",
         )
     )
     view.add_item(
         discord.ui.Button(
-            label="거절",
-            style=discord.ButtonStyle.secondary,
-            custom_id=f"eventbot:contractdecline:{round_id}:{proposer_id}:{partner_id}",
+            label="상대를 배신",
+            emoji="🗡️",
+            style=discord.ButtonStyle.danger,
+            custom_id=f"eventbot:trustdecision:{round_id}:betray",
         )
     )
+    if has_predictor:
+        for index, (choice, label) in enumerate(TRUST_PREDICTION_LABELS.items()):
+            view.add_item(
+                discord.ui.Button(
+                    label=f"예측: {label}",
+                    style=discord.ButtonStyle.secondary,
+                    custom_id=f"eventbot:trustpredict:{round_id}:{choice}",
+                    row=1,
+                )
+            )
     return view
 
 
@@ -1470,43 +1776,41 @@ def close_round_record(
             embed.add_field(name="정산", value=f"정답자 {len(correct_users)}명 전원 +{reward_points}점", inline=False)
         elif round_row["type"] == "trust":
             vote_choices = {str(row["user_id"]): str(row["choice"]) for row in votes}
-            contracts = conn.execute(
+            pairs = conn.execute(
                 """
-                SELECT proposer_id, partner_id FROM trust_contracts
-                WHERE round_id = ? AND status = 'accepted'
+                SELECT user_a_id, user_b_id FROM trust_pairings
+                WHERE round_id = ?
                 ORDER BY created_at ASC
                 """,
                 (round_row["id"],),
             ).fetchall()
-            contract_participants: set[str] = set()
-            contract_lines: list[str] = []
+            outcome_counts = {choice: 0 for choice in TRUST_PREDICTION_LABELS}
+            result_lines: list[str] = []
 
-            for contract in contracts:
-                proposer_id = str(contract["proposer_id"])
-                partner_id = str(contract["partner_id"])
-                contract_participants.update({proposer_id, partner_id})
-                proposer_choice = vote_choices.get(proposer_id)
-                partner_choice = vote_choices.get(partner_id)
+            for pair in pairs:
+                user_a_id = str(pair["user_a_id"])
+                user_b_id = str(pair["user_b_id"])
+                user_a_choice = vote_choices.get(user_a_id)
+                user_b_choice = vote_choices.get(user_b_id)
+                if not user_a_choice or not user_b_choice:
+                    result_lines.append(f"<@{user_a_id}> ↔ <@{user_b_id}>: 미선택 (0점)")
+                    continue
 
-                if not proposer_choice or not partner_choice:
-                    contract_lines.append(
-                        f"<@{proposer_id}> ↔ <@{partner_id}>: 미투표로 정산 없음 (0점)"
-                    )
-                elif proposer_choice == partner_id and partner_choice == proposer_id:
-                    for user_id in (proposer_id, partner_id):
+                if user_a_choice == "trust" and user_b_choice == "trust":
+                    outcome = "mutual"
+                    for user_id in (user_a_id, user_b_id):
                         add_score(
                             conn,
                             user_id,
                             member_name(guild, user_id),
                             1,
-                            f"라운드 #{round_row['id']} 신뢰 거래 상호 이행",
+                            f"라운드 #{round_row['id']} 신뢰 거래 상호 신뢰",
                             round_row["id"],
                         )
-                    contract_lines.append(
-                        f"<@{proposer_id}> ↔ <@{partner_id}>: 서로 이행 (각 +1점)"
-                    )
-                elif proposer_choice != partner_id and partner_choice != proposer_id:
-                    for user_id in (proposer_id, partner_id):
+                    result_lines.append(f"<@{user_a_id}> ↔ <@{user_b_id}>: 상호 신뢰 (각 +1점)")
+                elif user_a_choice == "betray" and user_b_choice == "betray":
+                    outcome = "double"
+                    for user_id in (user_a_id, user_b_id):
                         add_score(
                             conn,
                             user_id,
@@ -1515,12 +1819,11 @@ def close_round_record(
                             f"라운드 #{round_row['id']} 신뢰 거래 동시 배신",
                             round_row["id"],
                         )
-                    contract_lines.append(
-                        f"<@{proposer_id}> ↔ <@{partner_id}>: 동시 배신 (각 -1점)"
-                    )
+                    result_lines.append(f"<@{user_a_id}> ↔ <@{user_b_id}>: 동시 배신 (각 -1점)")
                 else:
-                    betrayer_id = proposer_id if proposer_choice != partner_id else partner_id
-                    victim_id = partner_id if betrayer_id == proposer_id else proposer_id
+                    outcome = "single"
+                    betrayer_id = user_a_id if user_a_choice == "betray" else user_b_id
+                    victim_id = user_b_id if betrayer_id == user_a_id else user_a_id
                     add_score(
                         conn,
                         betrayer_id,
@@ -1529,61 +1832,62 @@ def close_round_record(
                         f"라운드 #{round_row['id']} 신뢰 거래 단독 배신",
                         round_row["id"],
                     )
-                    contract_lines.append(
+                    result_lines.append(
                         f"<@{betrayer_id}> → <@{victim_id}>: 단독 배신 (배신자 +2점, 상대 0점)"
                     )
+                outcome_counts[outcome] += 1
 
-            regular_votes = [row for row in votes if str(row["user_id"]) not in contract_participants]
-            self_voters = [row["user_id"] for row in regular_votes if row["choice"] == TRUST_SELF_CHOICE]
-            transfers = [
-                (row["user_id"], row["choice"])
-                for row in regular_votes
-                if row["choice"] != TRUST_SELF_CHOICE and row["choice"] != row["user_id"]
-            ]
+            predictor_id = str(extra.get("predictor_id") or "")
+            prediction_result = "예측자 없음"
+            if predictor_id:
+                prediction = conn.execute(
+                    "SELECT choice FROM trust_predictions WHERE round_id = ? AND user_id = ?",
+                    (round_row["id"], predictor_id),
+                ).fetchone()
+                highest_count = max(outcome_counts.values(), default=0)
+                leading_choices = [
+                    choice for choice, count in outcome_counts.items() if count == highest_count and count > 0
+                ]
+                if not prediction:
+                    prediction_result = f"<@{predictor_id}>: 예측 미선택 (0점)"
+                elif len(leading_choices) != 1:
+                    prediction_result = f"<@{predictor_id}>: 최다 결과 동률 (0점)"
+                elif str(prediction["choice"]) == leading_choices[0]:
+                    add_score(
+                        conn,
+                        predictor_id,
+                        member_name(guild, predictor_id),
+                        1,
+                        f"라운드 #{round_row['id']} 신뢰 거래 예측 성공",
+                        round_row["id"],
+                    )
+                    prediction_result = f"<@{predictor_id}>: 예측 성공 · +1점"
+                else:
+                    prediction_result = f"<@{predictor_id}>: 예측 실패 · 0점"
 
-            for user_id in self_voters:
-                add_score(
-                    conn,
-                    user_id,
-                    member_name(guild, user_id),
-                    TRUST_SELF_REWARD,
-                    f"라운드 #{round_row['id']} 신뢰 거래 자기 투표",
-                    round_row["id"],
-                )
-
-            received_counts: dict[str, int] = {}
-            for _, target_id in transfers:
-                received_counts[target_id] = received_counts.get(target_id, 0) + 1
-            for target_id, count in received_counts.items():
-                add_score(
-                    conn,
-                    target_id,
-                    member_name(guild, target_id),
-                    TRUST_OTHER_REWARD * count,
-                    f"라운드 #{round_row['id']} 신뢰 거래 타인 투표 {count}표",
-                    round_row["id"],
-                )
-
-            transfer_lines = [f"<@{voter_id}> → <@{target_id}>" for voter_id, target_id in transfers]
-            recipient_lines = [
-                f"<@{target_id}>: {count}표 · +{TRUST_OTHER_REWARD * count}점"
-                for target_id, count in received_counts.items()
-            ]
+            extra.update({"trust_phase": "scored", "trust_scored_at": now_text()})
+            conn.execute(
+                "UPDATE rounds SET extra_json = ? WHERE id = ?",
+                (json.dumps(extra, ensure_ascii=False), round_row["id"]),
+            )
             embed = discord.Embed(
                 title=f"신뢰 거래 결과 #{round_row['id']}",
                 description=round_row["title"],
                 color=discord.Color.gold(),
             )
-            embed.add_field(name="성립한 거래 정산", value=field_text(contract_lines), inline=False)
-            embed.add_field(name="거래 없는 자기 투표", value=mention_list(self_voters), inline=False)
-            embed.add_field(name="거래 없는 타인 투표", value=field_text(transfer_lines), inline=False)
-            embed.add_field(name="거래 없는 타인 투표 정산", value=field_text(recipient_lines), inline=False)
+            embed.add_field(name="짝별 결과", value=field_text(result_lines), inline=False)
+            embed.add_field(
+                name="전체 결과 분포",
+                value=" · ".join(
+                    f"{TRUST_PREDICTION_LABELS[choice]} {count}쌍"
+                    for choice, count in outcome_counts.items()
+                ),
+                inline=False,
+            )
+            embed.add_field(name="예측자 결과", value=prediction_result, inline=False)
             embed.add_field(
                 name="정산",
-                value=(
-                    "거래 당사자는 거래 결과만 적용됩니다. 거래가 없는 자기 투표는 +1점, "
-                    "거래가 없는 타인 투표는 대상에게 +3점입니다."
-                ),
+                value="상호 신뢰는 각 +1점, 단독 배신은 배신자 +2점·상대 0점, 동시 배신은 각 -1점입니다.",
                 inline=False,
             )
         elif round_row["type"] == "cutting":
@@ -1744,9 +2048,9 @@ class StartSetupModal(discord.ui.Modal):
             max_length=120,
         )
         self.duration = discord.ui.TextInput(
-            label="진행 시간(분)",
-            placeholder="예: 5",
-            default="5",
+            label="참여자 모집 시간(분)" if game == "trust" else "진행 시간(분)",
+            placeholder="예: 2" if game == "trust" else "예: 5",
+            default=str(TRUST_REGISTRATION_DEFAULT_MINUTES) if game == "trust" else "5",
             max_length=4,
         )
         self.add_item(self.game_title)
@@ -1889,15 +2193,24 @@ async def create_round_from_setup(
                 return
 
         if 게임 == "trust":
-            if previous_round and previous_round["type"] == "trust":
+            if (
+                previous_round
+                and previous_round["type"] == "trust"
+                and round_extra(previous_round).get("trust_phase") not in {"cancelled", None}
+            ):
                 await interaction.response.send_message(
                     "신뢰 거래 다음에는 미니게임 하나를 진행해야 합니다.",
                     ephemeral=True,
                 )
                 return
-        elif not previous_round or previous_round["type"] != "trust" or previous_round["status"] != "closed":
+        elif (
+            not previous_round
+            or previous_round["type"] != "trust"
+            or previous_round["status"] != "closed"
+            or round_extra(previous_round).get("trust_phase") not in {"scored", None}
+        ):
             await interaction.response.send_message(
-                "미니게임을 시작하려면 먼저 신뢰 거래를 진행하고 마감해야 합니다.",
+                "미니게임을 시작하려면 참여자 모집·매칭·선택·정산까지 끝난 신뢰 거래가 필요합니다.",
                 ephemeral=True,
             )
             return
@@ -2006,6 +2319,13 @@ async def create_round_from_setup(
             embed = build_grid_embed(round_id, 제목, 관리자설명, GRID_REWARD_POINTS)
             view = grid_vote_view(round_id)
         elif 게임 == "trust":
+            extra.update(
+                {
+                    "trust_phase": "registration",
+                    "registration_minutes": int(진행시간분),
+                    "registration_close_at": close_at,
+                }
+            )
             cursor = conn.execute(
                 """
                 INSERT INTO rounds
@@ -2021,8 +2341,8 @@ async def create_round_from_setup(
                 ),
             )
             round_id = int(cursor.lastrowid)
-            embed = build_trust_embed(round_id, 제목)
-            view = trust_vote_view(round_id)
+            embed = build_trust_registration_embed(round_id, 제목, int(진행시간분))
+            view = trust_registration_view(round_id)
         elif 게임 == "top3":
             rows = conn.execute(
                 """
@@ -2085,11 +2405,21 @@ async def create_round_from_setup(
             embed = build_cutting_embed(round_id, 제목)
             view = cutting_vote_view(round_id)
 
-    embed.add_field(
-        name="자동 마감",
-        value=f"{진행시간분}분 후 자동으로 종료됩니다.\n예정 시각: {close_time_text(close_at)}",
-        inline=False,
-    )
+    if 게임 == "trust":
+        embed.add_field(
+            name="참여자 모집 마감",
+            value=(
+                f"{진행시간분}분 후 랜덤 매칭을 시작합니다.\n예정 시각: {close_time_text(close_at)}\n"
+                "매칭 후에는 신뢰/배신 선택 시간이 3분 주어집니다."
+            ),
+            inline=False,
+        )
+    else:
+        embed.add_field(
+            name="자동 마감",
+            value=f"{진행시간분}분 후 자동으로 종료됩니다.\n예정 시각: {close_time_text(close_at)}",
+            inline=False,
+        )
     await interaction.response.send_message(embed=embed, view=view)
     message = await interaction.original_response()
 
@@ -2112,14 +2442,14 @@ async def create_round_from_setup(
             thread = await message.create_thread(name=thread_name)
             if 게임 == "trust":
                 await thread.send(
-                    "이곳은 작성자가 표시되는 공개 협상방입니다. 서로 거래를 제안하고, "
-                    "메인 화면의 `거래를 제안할 사용자 선택` 메뉴로 공식 거래를 맺어주세요.",
+                    "이곳은 작성자가 표시되는 공개 협상방입니다. 참여 등록과 랜덤 매칭이 끝나면 "
+                    "배정된 상대와 신뢰 또는 배신을 두고 협상하세요.",
                 )
                 notice_embed = build_thread_notice_embed(
                     round_id,
                     thread,
                     "거래 협상방이 열렸습니다",
-                    "작성자가 표시되는 협상방에서 거래를 논의한 뒤, 메인 화면에서 공식 거래를 제안하고 수락할 수 있습니다.",
+                    "참여 등록 뒤 봇이 무작위로 둘씩 매칭합니다. 매칭 후 공개 협상방에서 상대와 대화할 수 있습니다.",
                 )
             elif 게임 == "balance":
                 await thread.send(
@@ -2182,6 +2512,22 @@ async def close_round(interaction: discord.Interaction) -> None:
         round_row = get_open_round(conn)
     if not round_row:
         await interaction.response.send_message("현재 열린 라운드가 없습니다.", ephemeral=True)
+        return
+
+    if round_row["type"] == "trust" and round_extra(round_row).get("trust_phase") == "registration":
+        transition = start_trust_decision(int(round_row["id"]))
+        if not transition:
+            await interaction.response.send_message("참여자 모집을 마감하지 못했습니다.", ephemeral=True)
+            return
+        task = bot.auto_close_tasks.pop(int(round_row["id"]), None)
+        if task:
+            task.cancel()
+        await update_trust_main_message(transition)
+        if transition["state"] == "decision":
+            bot.schedule_auto_close(int(round_row["id"]), float(transition["close_at"]))
+            await interaction.response.send_message("참여자 모집을 마감하고 랜덤 매칭 및 3분 선택을 시작했습니다.", ephemeral=True)
+        else:
+            await interaction.response.send_message("참여자가 부족해 신뢰 거래를 취소했습니다.", ephemeral=True)
         return
 
     result = close_round_record(int(round_row["id"]), interaction.guild)
