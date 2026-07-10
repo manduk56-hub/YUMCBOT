@@ -1850,6 +1850,7 @@ class StartSetupModal(discord.ui.Modal):
 
 
 @bot.tree.command(name="start", description="게임을 고르면 설정 창이 열립니다.")
+@app_commands.default_permissions()
 @admin_only()
 @app_commands.choices(
     게임=[
@@ -2223,6 +2224,7 @@ async def create_round_from_setup(
 
 
 @bot.tree.command(name="라운드마감", description="현재 열린 라운드를 마감하고 결과를 공개합니다.")
+@app_commands.default_permissions()
 @admin_only()
 async def close_round(interaction: discord.Interaction) -> None:
     with db() as conn:
@@ -2261,6 +2263,7 @@ async def close_round(interaction: discord.Interaction) -> None:
 
 
 @bot.tree.command(name="세공진행", description="가장 최근 마감된 돌 세공 예측의 관리자 진행 패널을 엽니다.")
+@app_commands.default_permissions()
 @admin_only()
 async def run_cutting(interaction: discord.Interaction) -> None:
     with db() as conn:
@@ -2335,6 +2338,7 @@ async def ranking(interaction: discord.Interaction) -> None:
 
 
 @bot.tree.command(name="점수수정", description="운영자가 특정 유저의 점수를 수정합니다.")
+@app_commands.default_permissions()
 @admin_only()
 @app_commands.describe(사용자="점수를 수정할 유저", 점수="더하거나 뺄 점수", 사유="기록에 남길 사유")
 async def adjust_score(
@@ -2349,6 +2353,7 @@ async def adjust_score(
 
 
 @bot.tree.command(name="데이터백업", description="SQLite 데이터베이스를 백업합니다.")
+@app_commands.default_permissions()
 @admin_only()
 async def backup_data(interaction: discord.Interaction) -> None:
     if not DB_PATH.exists():
