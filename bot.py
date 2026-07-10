@@ -54,6 +54,23 @@ DEFUSE_COLOR_ALIASES = {
 GRID_TILE_CHOICES = [str(index) for index in range(1, 10)]
 GRID_REWARD_POINTS = 3
 CUTTING_LEVEL_CHOICES = [str(index) for index in range(0, 7)]
+CUTTING_REWARD_POINTS = {
+    0: 1,
+    1: 1,
+    2: 1,
+    3: 2,
+    4: 2,
+    5: 3,
+    6: 4,
+}
+CUTTING_SUCCESS_RATES = {
+    0: 0.8,
+    1: 0.8,
+    2: 0.6,
+    3: 0.6,
+    4: 0.5,
+    5: 0.3,
+}
 TOP3_NONE_CHOICE = "__none__"
 TRUST_REGISTRATION_DEFAULT_MINUTES = 2
 TRUST_DECISION_SECONDS = 180
@@ -67,6 +84,10 @@ TRUST_OUTCOME_LABELS = {
 
 def now_text() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def cutting_success_rate(current_level: int) -> float:
+    return CUTTING_SUCCESS_RATES[current_level]
 
 
 @contextmanager
@@ -979,8 +1000,9 @@ def build_cutting_embed(round_id: int, title: str) -> discord.Embed:
     embed.add_field(
         name="규칙",
         value=(
-            "각 세공 시도는 50% 확률로 성공하거나 실패합니다.\n"
+            "강화 성공 확률: 0→1·1→2 80% | 2→3·3→4 60% | 4→5 50% | 5→6 30%\n"
             "처음 실패하기 직전의 강화 단계를 맞히는 게임입니다.\n"
+            "정답 보상: 0~2강화 +1점 | 3~4강화 +2점 | 5강화 +3점 | 6강화 +4점\n"
             "투표 집계가 끝나면 운영자가 `/세공진행`으로 직접 세공을 진행합니다."
         ),
         inline=False,
@@ -1214,7 +1236,7 @@ def round_extra(row: sqlite3.Row) -> dict[str, Any]:
 def build_cutting_progress_embed(round_row: sqlite3.Row, extra: dict[str, Any]) -> discord.Embed:
     current_level = int(extra.get("cutting_current_level", 0))
     max_level = int(extra.get("max_level", 6))
-    success_rate = float(extra.get("success_rate", 0.5))
+    success_rate = cutting_success_rate(current_level) if current_level < max_level else None
     logs = [str(log) for log in extra.get("cutting_logs", [])]
 
     embed = discord.Embed(
@@ -1224,7 +1246,11 @@ def build_cutting_progress_embed(round_row: sqlite3.Row, extra: dict[str, Any]) 
     )
     embed.add_field(name="현재 단계", value=f"{current_level}강화", inline=True)
     embed.add_field(name="최대 단계", value=f"{max_level}강화", inline=True)
-    embed.add_field(name="성공 확률", value=f"{success_rate * 100:.0f}%", inline=True)
+    embed.add_field(
+        name="다음 시도 확률",
+        value=f"{success_rate * 100:.0f}%" if success_rate is not None else "최대 단계 도달",
+        inline=True,
+    )
     embed.add_field(
         name="진행 기록",
         value="\n".join(logs[-10:]) if logs else "아직 시도 없음",
@@ -1246,6 +1272,7 @@ def finalize_cutting_round(
     logs: list[str],
     guild: discord.Guild | None,
 ) -> discord.Embed:
+    reward_points = CUTTING_REWARD_POINTS[result_level]
     votes = conn.execute(
         "SELECT user_id, choice FROM votes WHERE round_id = ? ORDER BY updated_at ASC",
         (round_row["id"],),
@@ -1256,7 +1283,7 @@ def finalize_cutting_round(
             conn,
             user_id,
             member_name(guild, user_id),
-            1,
+            reward_points,
             f"라운드 #{round_row['id']} 돌 세공 {result_level}강화 예측",
             round_row["id"],
         )
@@ -1292,7 +1319,11 @@ def finalize_cutting_round(
     embed.add_field(name="정답자", value=f"{len(correct_users)}명", inline=True)
     embed.add_field(name="예측 분포", value="\n".join(prediction_lines), inline=False)
     embed.add_field(name="정답자 명단", value=mention_list(correct_users), inline=False)
-    embed.add_field(name="정산", value=f"{result_level}강화를 맞힌 {len(correct_users)}명 전원 +1점", inline=False)
+    embed.add_field(
+        name="정산",
+        value=f"{result_level}강화를 맞힌 {len(correct_users)}명 전원 +{reward_points}점",
+        inline=False,
+    )
     return embed
 
 
@@ -1319,7 +1350,6 @@ async def handle_cutting_button(interaction: discord.Interaction, round_id: int)
             return
 
         max_level = int(extra.get("max_level", 6))
-        success_rate = float(extra.get("success_rate", 0.5))
         current_level = int(extra.get("cutting_current_level", 0))
         logs = [str(log) for log in extra.get("cutting_logs", [])]
 
@@ -1330,6 +1360,7 @@ async def handle_cutting_button(interaction: discord.Interaction, round_id: int)
             return
 
         next_level = current_level + 1
+        success_rate = cutting_success_rate(current_level)
         if random.random() < success_rate:
             current_level = next_level
             logs.append(f"{next_level}강 시도: 성공")
@@ -2106,7 +2137,7 @@ async def create_round_from_setup(
             embed = build_top3_embed(round_id, 제목, candidates)
             view = top3_vote_view(round_id, candidates)
         else:
-            extra.update({"max_level": 6, "success_rate": 0.5})
+            extra.update({"max_level": 6})
             cursor = conn.execute(
                 """
                 INSERT INTO rounds
