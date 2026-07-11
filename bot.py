@@ -344,6 +344,61 @@ def get_current_event(conn: sqlite3.Connection) -> sqlite3.Row | None:
     ).fetchone()
 
 
+def force_close_current_event(
+    conn: sqlite3.Connection,
+) -> tuple[sqlite3.Row, list[sqlite3.Row]] | None:
+    event_row = get_current_event(conn)
+    if not event_row:
+        return None
+
+    round_rows = conn.execute(
+        """
+        SELECT * FROM rounds
+        WHERE event_session_id = ?
+        ORDER BY id ASC
+        """,
+        (event_row["id"],),
+    ).fetchall()
+    closed_at = now_text()
+
+    for round_row in round_rows:
+        extra = round_extra(round_row)
+        is_open = round_row["status"] == "open"
+        is_unresolved_cutting = (
+            round_row["type"] == "cutting" and "cutting_result_level" not in extra
+        )
+        if not is_open and not is_unresolved_cutting:
+            continue
+        extra.update(
+            {
+                "force_closed": True,
+                "force_closed_reason": "development_command",
+            }
+        )
+        if is_open and round_row["type"] == "trust":
+            extra["trust_phase"] = "cancelled"
+        elif is_open and round_row["type"] == "sand":
+            extra["sand_phase"] = "cancelled"
+        conn.execute(
+            """
+            UPDATE rounds
+            SET status = 'closed', closed_at = COALESCE(closed_at, ?), extra_json = ?
+            WHERE id = ?
+            """,
+            (closed_at, json.dumps(extra, ensure_ascii=False), round_row["id"]),
+        )
+
+    conn.execute(
+        """
+        UPDATE event_sessions
+        SET status = 'closed', closed_at = ?
+        WHERE id = ?
+        """,
+        (closed_at, event_row["id"]),
+    )
+    return event_row, round_rows
+
+
 def is_event_participant(
     conn: sqlite3.Connection,
     event_session_id: int,
@@ -388,14 +443,30 @@ def format_score_message(display_name: str, total_score: int) -> str:
 def fetch_ranking_rows(conn: sqlite3.Connection, current_bot_id: str) -> list[sqlite3.Row]:
     return conn.execute(
         """
-        SELECT user_id, display_name, total_score
+        SELECT users.user_id, users.display_name, users.total_score
         FROM users
-        WHERE user_id != ?
-        ORDER BY total_score DESC, updated_at ASC
-        LIMIT 10
+        WHERE users.user_id != ?
+          AND (
+              EXISTS (
+                  SELECT 1 FROM votes
+                  WHERE votes.user_id = users.user_id
+              )
+              OR EXISTS (
+                  SELECT 1 FROM trust_registrations
+                  WHERE trust_registrations.user_id = users.user_id
+              )
+          )
+        ORDER BY users.total_score DESC, users.updated_at ASC
         """,
         (current_bot_id,),
     ).fetchall()
+
+
+async def current_guild_member(guild: discord.Guild, user_id: str) -> discord.Member | None:
+    try:
+        return await guild.fetch_member(int(user_id))
+    except discord.NotFound:
+        return None
 
 
 def field_text(lines: list[str], empty: str = "없음", limit: int = 1024) -> str:
@@ -545,6 +616,13 @@ async def handle_planned_mini_game(interaction: discord.Interaction, main_round_
         ).fetchone()
         if not main_round or main_round["type"] not in MAIN_GAME_TYPES:
             await interaction.response.send_message("완료된 메인게임을 찾을 수 없습니다.", ephemeral=True)
+            return
+        event_row = conn.execute(
+            "SELECT status FROM event_sessions WHERE id = ?",
+            (main_round["event_session_id"],),
+        ).fetchone()
+        if not event_row or event_row["status"] == "closed":
+            await interaction.response.send_message("이미 종료된 이벤트입니다.", ephemeral=True)
             return
 
         extra = round_extra(main_round)
@@ -3493,6 +3571,68 @@ async def close_round(interaction: discord.Interaction) -> None:
     )
 
 
+@bot.tree.command(name="이벤트종료", description="개발 중인 현재 이벤트를 남은 게임과 관계없이 강제로 종료합니다.")
+@app_commands.default_permissions()
+@admin_only()
+async def force_end_event(interaction: discord.Interaction) -> None:
+    await interaction.response.defer(ephemeral=True)
+
+    with db() as conn:
+        result = force_close_current_event(conn)
+    if not result:
+        await interaction.followup.send("현재 열려 있는 이벤트가 없습니다.", ephemeral=True)
+        return
+
+    event_row, round_rows = result
+    open_round_count = sum(1 for row in round_rows if row["status"] == "open")
+
+    for round_row in round_rows:
+        task = bot.auto_close_tasks.pop(int(round_row["id"]), None)
+        if task:
+            task.cancel()
+
+        channel_id = round_row["channel_id"]
+        message_id = round_row["message_id"]
+        if channel_id and message_id:
+            try:
+                channel = bot.get_channel(int(channel_id)) or await bot.fetch_channel(int(channel_id))
+                if hasattr(channel, "fetch_message"):
+                    message = await channel.fetch_message(int(message_id))
+                    await message.edit(view=None)
+            except (discord.HTTPException, ValueError):
+                pass
+
+        thread_id = round_row["discussion_thread_id"]
+        if thread_id:
+            try:
+                thread = bot.get_channel(int(thread_id)) or await bot.fetch_channel(int(thread_id))
+                if isinstance(thread, discord.Thread):
+                    await thread.edit(
+                        archived=True,
+                        locked=True,
+                        reason="개발용 이벤트 강제 종료",
+                    )
+            except (discord.HTTPException, ValueError):
+                pass
+
+    if event_row["message_id"]:
+        try:
+            channel = bot.get_channel(int(event_row["channel_id"])) or await bot.fetch_channel(
+                int(event_row["channel_id"])
+            )
+            if hasattr(channel, "fetch_message"):
+                message = await channel.fetch_message(int(event_row["message_id"]))
+                await message.edit(view=None)
+        except (discord.HTTPException, ValueError):
+            pass
+
+    await interaction.followup.send(
+        f"이벤트 #{event_row['id']}을 강제로 종료했습니다. "
+        f"미완료 라운드 {open_round_count}개는 점수 정산 없이 취소했습니다.",
+        ephemeral=True,
+    )
+
+
 @bot.tree.command(name="세공진행", description="가장 최근 마감된 돌 세공 예측의 관리자 진행 패널을 엽니다.")
 @app_commands.default_permissions()
 @admin_only()
@@ -3510,7 +3650,7 @@ async def run_cutting(interaction: discord.Interaction) -> None:
         extra: dict[str, Any] = {}
         for row in rows:
             parsed_extra = round_extra(row)
-            if "cutting_result_level" not in parsed_extra:
+            if "cutting_result_level" not in parsed_extra and not parsed_extra.get("force_closed"):
                 round_row = row
                 extra = parsed_extra
                 break
@@ -3557,12 +3697,31 @@ async def show_score(interaction: discord.Interaction, 사용자: discord.Member
 
 @bot.tree.command(name="랭킹", description="현재 누적 점수 랭킹을 확인합니다.")
 async def ranking(interaction: discord.Interaction) -> None:
+    if interaction.guild is None:
+        await interaction.response.send_message("서버 안에서만 랭킹을 확인할 수 있습니다.", ephemeral=True)
+        return
+
     current_bot_id = str(interaction.client.user.id) if interaction.client.user else ""
     with db() as conn:
-        rows = fetch_ranking_rows(conn, current_bot_id)
+        candidates = fetch_ranking_rows(conn, current_bot_id)
+
+    rows = []
+    try:
+        for candidate in candidates:
+            if await current_guild_member(interaction.guild, str(candidate["user_id"])) is None:
+                continue
+            rows.append(candidate)
+            if len(rows) == 10:
+                break
+    except discord.HTTPException:
+        await interaction.response.send_message(
+            "현재 서버 멤버를 확인하지 못했습니다. 잠시 후 다시 시도해주세요.",
+            ephemeral=True,
+        )
+        return
 
     if not rows:
-        await interaction.response.send_message("아직 점수 기록이 없습니다.", ephemeral=True)
+        await interaction.response.send_message("현재 서버에 게임 참여 기록이 있는 유저가 없습니다.", ephemeral=True)
         return
 
     lines = []
