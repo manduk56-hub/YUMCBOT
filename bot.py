@@ -81,6 +81,16 @@ TRUST_OUTCOME_LABELS = {
     "double": "동시 배신",
 }
 MAIN_GAME_TYPES = {"trust", "sand"}
+MINI_GAME_TYPES = {"balance", "defuse4", "grid", "cutting", "top3"}
+GAME_NAMES = {
+    "balance": "일반 밸런스",
+    "defuse4": "4선 폭탄 해체",
+    "grid": "관리자 시점 타일",
+    "cutting": "돌 세공 예측",
+    "top3": "상위 3명 견제",
+    "trust": "신뢰 거래",
+    "sand": "모래성 게임",
+}
 SAND_NUMBER_CHOICES = [str(index) for index in range(1, 11)]
 SAND_PLAY_SECONDS = 600
 SAND_OUTCOME_LABELS = {
@@ -453,17 +463,87 @@ def build_event_open_embed() -> discord.Embed:
     return embed
 
 
-def event_join_view(event_session_id: int) -> discord.ui.View:
+def event_join_view(event_session_id: int, participant_count: int = 0) -> discord.ui.View:
     view = discord.ui.View(timeout=None)
     view.add_item(
         discord.ui.Button(
-            label="참여하기",
+            label=f"참여하기 ({participant_count}명)",
             emoji="🙋",
             style=discord.ButtonStyle.success,
             custom_id=f"eventbot:eventjoin:{event_session_id}",
         )
     )
     return view
+
+
+def planned_mini_game_view(main_round_id: int) -> discord.ui.View | None:
+    with db() as conn:
+        round_row = conn.execute(
+            "SELECT * FROM rounds WHERE id = ? AND status = 'closed'",
+            (main_round_id,),
+        ).fetchone()
+    if not round_row or round_row["type"] not in MAIN_GAME_TYPES:
+        return None
+
+    extra = round_extra(round_row)
+    phase = extra.get("trust_phase") if round_row["type"] == "trust" else extra.get("sand_phase")
+    mini_game = str(extra.get("planned_mini_game") or "")
+    if phase != "scored" or mini_game not in MINI_GAME_TYPES:
+        return None
+
+    view = discord.ui.View(timeout=None)
+    view.add_item(
+        discord.ui.Button(
+            label=f"{GAME_NAMES[mini_game]} 설정 후 시작",
+            style=discord.ButtonStyle.primary,
+            custom_id=f"eventbot:startmini:{main_round_id}",
+        )
+    )
+    return view
+
+
+async def handle_planned_mini_game(interaction: discord.Interaction, main_round_id: int) -> None:
+    if not is_operator_user(interaction.user):
+        await interaction.response.send_message(
+            "이 버튼은 관리자 권한 또는 운영자 역할이 필요합니다.",
+            ephemeral=True,
+        )
+        return
+
+    with db() as conn:
+        main_round = conn.execute(
+            "SELECT * FROM rounds WHERE id = ? AND status = 'closed'",
+            (main_round_id,),
+        ).fetchone()
+        if not main_round or main_round["type"] not in MAIN_GAME_TYPES:
+            await interaction.response.send_message("완료된 메인게임을 찾을 수 없습니다.", ephemeral=True)
+            return
+
+        extra = round_extra(main_round)
+        phase = extra.get("trust_phase") if main_round["type"] == "trust" else extra.get("sand_phase")
+        mini_game = str(extra.get("planned_mini_game") or "")
+        if phase != "scored" or mini_game not in MINI_GAME_TYPES:
+            await interaction.response.send_message("시작할 미니게임이 지정되어 있지 않습니다.", ephemeral=True)
+            return
+        if get_open_round(conn):
+            await interaction.response.send_message(
+                "이미 열린 라운드가 있습니다. 먼저 `/라운드마감`을 해주세요.",
+                ephemeral=True,
+            )
+            return
+        latest_round = conn.execute(
+            """
+            SELECT id FROM rounds
+            WHERE event_session_id = ?
+            ORDER BY id DESC LIMIT 1
+            """,
+            (main_round["event_session_id"],),
+        ).fetchone()
+        if not latest_round or int(latest_round["id"]) != main_round_id:
+            await interaction.response.send_message("이 이벤트의 미니게임은 이미 시작되었습니다.", ephemeral=True)
+            return
+
+    await interaction.response.send_modal(StartSetupModal(mini_game))
 
 
 async def handle_event_join(interaction: discord.Interaction, event_session_id: int) -> None:
@@ -505,8 +585,20 @@ async def handle_event_join(interaction: discord.Interaction, event_session_id: 
             """,
             (event_session_id, str(interaction.user.id), now_text()),
         )
+        participant_count = int(
+            conn.execute(
+                """
+                SELECT COUNT(*) AS count FROM event_participants
+                WHERE event_session_id = ?
+                """,
+                (event_session_id,),
+            ).fetchone()["count"]
+        )
 
-    await interaction.response.send_message(
+    await interaction.response.edit_message(
+        view=event_join_view(event_session_id, participant_count),
+    )
+    await interaction.followup.send(
         "참여 등록 완료! 이번 이벤트의 메인게임과 미니게임에 참여할 수 있습니다.",
         ephemeral=True,
     )
@@ -995,7 +1087,7 @@ async def refresh_or_finish_sand_round(
     if task:
         task.cancel()
     _, result_embed = result
-    await interaction.followup.send(embed=result_embed)
+    await interaction.followup.send(embed=result_embed, view=planned_mini_game_view(round_id))
 
 
 async def handle_sand_number(
@@ -1250,7 +1342,7 @@ class EventBot(discord.Client):
 
             _, embed = result
             if hasattr(channel, "send"):
-                await channel.send(embed=embed)
+                await channel.send(embed=embed, view=planned_mini_game_view(round_id))
         except asyncio.CancelledError:
             raise
         finally:
@@ -1277,6 +1369,15 @@ class EventBot(discord.Client):
                 await interaction.response.send_message("잘못된 이벤트 번호입니다.", ephemeral=True)
                 return
             await handle_event_join(interaction, event_session_id)
+            return
+
+        if action == "startmini":
+            try:
+                main_round_id = int(parts[2])
+            except ValueError:
+                await interaction.response.send_message("잘못된 메인게임 번호입니다.", ephemeral=True)
+                return
+            await handle_planned_mini_game(interaction, main_round_id)
             return
 
         if action == "sandjoin":
@@ -2512,6 +2613,13 @@ def close_round_record(
         if close_at:
             stats.append(f"예정 마감: {close_time_text(float(close_at))}")
         embed.add_field(name="통계", value="\n".join(stats), inline=False)
+        planned_mini_game = str(extra.get("planned_mini_game") or "")
+        if round_row["type"] in MAIN_GAME_TYPES and planned_mini_game in MINI_GAME_TYPES:
+            embed.add_field(
+                name="다음 미니게임",
+                value=f"처음 선택한 `{GAME_NAMES[planned_mini_game]}`의 설정 버튼을 눌러 시작해주세요.",
+                inline=False,
+            )
         embed.set_footer(text=f"시작: {round_row['created_at']} · 종료: {now_text()}")
 
         return str(round_row["channel_id"]), embed
@@ -2560,18 +2668,16 @@ def parse_range_int(value: str, name: str, minimum: int, maximum: int) -> int:
 
 
 class StartSetupModal(discord.ui.Modal):
-    def __init__(self, game: str) -> None:
+    def __init__(
+        self,
+        game: str,
+        planned_mini_game: str | None = None,
+        standalone_mini_game: bool = False,
+    ) -> None:
         self.game = game
-        game_names = {
-            "balance": "일반 밸런스",
-            "defuse4": "4선 폭탄 해체",
-            "grid": "관리자 시점 타일",
-            "cutting": "돌 세공 예측",
-            "top3": "상위 3명 견제",
-            "trust": "신뢰 거래",
-            "sand": "모래성 게임",
-        }
-        super().__init__(title=f"{game_names.get(game, '게임')} 설정")
+        self.planned_mini_game = planned_mini_game
+        self.standalone_mini_game = standalone_mini_game
+        super().__init__(title=f"{GAME_NAMES.get(game, '게임')} 설정")
 
         self.game_title = discord.ui.TextInput(
             label="제목",
@@ -2636,6 +2742,8 @@ class StartSetupModal(discord.ui.Modal):
                     title,
                     선택_a=str(self.option_a.value).strip(),
                     선택_b=str(self.option_b.value).strip(),
+                    예정_미니게임=self.planned_mini_game,
+                    단독_미니게임=self.standalone_mini_game,
                 )
             elif self.game == "defuse4":
                 await create_round_from_setup(
@@ -2645,6 +2753,8 @@ class StartSetupModal(discord.ui.Modal):
                     title,
                     안전색=parse_defuse_color(str(self.safe_color.value)),
                     힌트=str(self.defuse_hint.value).strip(),
+                    예정_미니게임=self.planned_mini_game,
+                    단독_미니게임=self.standalone_mini_game,
                 )
             elif self.game == "grid":
                 await create_round_from_setup(
@@ -2654,9 +2764,18 @@ class StartSetupModal(discord.ui.Modal):
                     title,
                     정답칸=parse_range_int(str(self.target_tile.value), "정답 칸", 1, 9),
                     관리자설명=str(self.admin_clue.value).strip(),
+                    예정_미니게임=self.planned_mini_game,
+                    단독_미니게임=self.standalone_mini_game,
                 )
             else:
-                await create_round_from_setup(interaction, self.game, duration, title)
+                await create_round_from_setup(
+                    interaction,
+                    self.game,
+                    duration,
+                    title,
+                    예정_미니게임=self.planned_mini_game,
+                    단독_미니게임=self.standalone_mini_game,
+                )
         except ValueError as exc:
             await interaction.response.send_message(str(exc), ephemeral=True)
 
@@ -2715,7 +2834,42 @@ async def open_event(interaction: discord.Interaction) -> None:
         )
 
 
-@bot.tree.command(name="start", description="게임을 고르면 설정 창이 열립니다.")
+@bot.tree.command(name="start", description="메인게임과 미니게임을 골라 이벤트를 시작합니다.")
+@app_commands.default_permissions()
+@admin_only()
+@app_commands.choices(
+    메인게임=[
+        app_commands.Choice(name="신뢰 거래", value="trust"),
+        app_commands.Choice(name="모래성 게임", value="sand"),
+    ],
+    미니게임=[
+        app_commands.Choice(name="일반 밸런스", value="balance"),
+        app_commands.Choice(name="4선 폭탄 해체", value="defuse4"),
+        app_commands.Choice(name="관리자 시점 타일", value="grid"),
+        app_commands.Choice(name="돌 세공 예측", value="cutting"),
+        app_commands.Choice(name="상위 3명 견제", value="top3"),
+    ],
+)
+@app_commands.describe(메인게임="먼저 진행할 메인게임", 미니게임="메인게임 뒤에 진행할 미니게임")
+async def start(interaction: discord.Interaction, 메인게임: str, 미니게임: str) -> None:
+    with db() as conn:
+        event_row = get_current_event(conn)
+        if not event_row:
+            await interaction.response.send_message(
+                "먼저 `/오픈`으로 오늘의 이벤트 참가 모집을 열어주세요.",
+                ephemeral=True,
+            )
+            return
+        if event_row["status"] != "recruiting":
+            await interaction.response.send_message(
+                "이번 이벤트의 게임 조합은 이미 확정되었습니다. 다음 이벤트는 `/오픈`부터 다시 시작해주세요.",
+                ephemeral=True,
+            )
+            return
+    await interaction.response.send_modal(StartSetupModal(메인게임, planned_mini_game=미니게임))
+
+
+@bot.tree.command(name="미니게임", description="메인게임 없이 선택한 미니게임만 시작합니다.")
 @app_commands.default_permissions()
 @admin_only()
 @app_commands.choices(
@@ -2725,20 +2879,25 @@ async def open_event(interaction: discord.Interaction) -> None:
         app_commands.Choice(name="관리자 시점 타일", value="grid"),
         app_commands.Choice(name="돌 세공 예측", value="cutting"),
         app_commands.Choice(name="상위 3명 견제", value="top3"),
-        app_commands.Choice(name="신뢰 거래 (메인)", value="trust"),
-        app_commands.Choice(name="모래성 게임 (메인)", value="sand"),
     ]
 )
-@app_commands.describe(게임="진행할 게임 종류")
-async def start(interaction: discord.Interaction, 게임: str) -> None:
+@app_commands.describe(게임="바로 시작할 미니게임")
+async def start_mini_game(interaction: discord.Interaction, 게임: str) -> None:
     with db() as conn:
-        if not get_current_event(conn):
+        event_row = get_current_event(conn)
+        if not event_row:
             await interaction.response.send_message(
                 "먼저 `/오픈`으로 오늘의 이벤트 참가 모집을 열어주세요.",
                 ephemeral=True,
             )
             return
-    await interaction.response.send_modal(StartSetupModal(게임))
+        if get_open_round(conn):
+            await interaction.response.send_message(
+                "이미 열린 라운드가 있습니다. 먼저 `/라운드마감`을 해주세요.",
+                ephemeral=True,
+            )
+            return
+    await interaction.response.send_modal(StartSetupModal(게임, standalone_mini_game=True))
 
 
 async def create_round_from_setup(
@@ -2758,6 +2917,8 @@ async def create_round_from_setup(
     힌트: str | None = None,
     정답칸: int | None = None,
     관리자설명: str | None = None,
+    예정_미니게임: str | None = None,
+    단독_미니게임: bool = False,
 ) -> None:
     if not isinstance(interaction.channel, (discord.TextChannel, discord.Thread)):
         await interaction.response.send_message("서버 텍스트 채널에서만 사용할 수 있습니다.", ephemeral=True)
@@ -2768,6 +2929,11 @@ async def create_round_from_setup(
         "auto_close_at": close_at,
         "duration_minutes": int(진행시간분),
     }
+    if 게임 in MAIN_GAME_TYPES:
+        if 예정_미니게임 not in MINI_GAME_TYPES:
+            await interaction.response.send_message("시작할 미니게임을 함께 선택해주세요.", ephemeral=True)
+            return
+        extra["planned_mini_game"] = 예정_미니게임
 
     with db() as conn:
         if get_open_round(conn):
@@ -2806,6 +2972,12 @@ async def create_round_from_setup(
             """,
             (event_session_id,),
         ).fetchone()
+        if 게임 in MAIN_GAME_TYPES and (event_row["status"] != "recruiting" or previous_round):
+            await interaction.response.send_message(
+                "이번 이벤트의 게임 조합은 이미 확정되었습니다. 다음 이벤트는 `/오픈`부터 다시 시작해주세요.",
+                ephemeral=True,
+            )
+            return
         if previous_round and previous_round["type"] == "cutting":
             previous_extra = round_extra(previous_round)
             if "cutting_result_level" not in previous_extra:
@@ -2834,7 +3006,7 @@ async def create_round_from_setup(
                     ephemeral=True,
                 )
                 return
-        else:
+        elif not 단독_미니게임:
             previous_extra = round_extra(previous_round) if previous_round else {}
             previous_phase = None
             if previous_round and previous_round["type"] == "trust":
@@ -3104,6 +3276,11 @@ async def create_round_from_setup(
             ),
             inline=False,
         )
+        embed.add_field(
+            name="선택한 미니게임",
+            value=f"메인게임 정산 후 `{GAME_NAMES[str(예정_미니게임)]}` 설정 버튼이 표시됩니다.",
+            inline=False,
+        )
     else:
         embed.add_field(
             name="자동 마감",
@@ -3245,7 +3422,10 @@ async def close_round(interaction: discord.Interaction) -> None:
         task.cancel()
 
     _, embed = result
-    await interaction.response.send_message(embed=embed)
+    await interaction.response.send_message(
+        embed=embed,
+        view=planned_mini_game_view(int(round_row["id"])),
+    )
 
 
 @bot.tree.command(name="세공진행", description="가장 최근 마감된 돌 세공 예측의 관리자 진행 패널을 엽니다.")
