@@ -59,6 +59,35 @@ class BotRegressionTests(unittest.TestCase):
 
         self.assertEqual([row["user_id"] for row in rows], ["300"])
 
+    def test_ranking_lines_show_rank_and_score_without_users(self) -> None:
+        self.add_user("200", "첫번째 참가자", 7)
+        self.add_user("300", "두번째 참가자", 4)
+        with bot.db() as conn:
+            rows = conn.execute(
+                "SELECT user_id, display_name, total_score FROM users ORDER BY total_score DESC"
+            ).fetchall()
+
+        lines = bot.format_ranking_lines(rows)
+
+        self.assertEqual(lines, ["1등 - **7점**", "2등 - **4점**"])
+        self.assertNotIn("<@", "\n".join(lines))
+        self.assertNotIn("참가자", "\n".join(lines))
+
+    def test_ranking_randomizes_only_users_with_the_same_score(self) -> None:
+        rows = [
+            {"user_id": "100", "total_score": 9},
+            {"user_id": "200", "total_score": 7},
+            {"user_id": "300", "total_score": 7},
+            {"user_id": "400", "total_score": 3},
+        ]
+
+        with patch.object(bot.random, "shuffle", side_effect=lambda tied_rows: tied_rows.reverse()) as shuffle:
+            shuffled_rows = bot.shuffle_tied_ranking_rows(rows)
+
+        self.assertEqual([row["user_id"] for row in shuffled_rows], ["100", "300", "200", "400"])
+        self.assertEqual([row["total_score"] for row in shuffled_rows], [9, 7, 7, 3])
+        shuffle.assert_called_once()
+
     def test_sand_registration_transitions_to_playing(self) -> None:
         self.add_user("1", "참가자1", 0)
         self.add_user("2", "참가자2", 0)

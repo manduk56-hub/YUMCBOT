@@ -462,6 +462,26 @@ def fetch_ranking_rows(conn: sqlite3.Connection, current_bot_id: str) -> list[sq
     ).fetchall()
 
 
+def shuffle_tied_ranking_rows(rows: list[sqlite3.Row]) -> list[sqlite3.Row]:
+    shuffled_rows = list(rows)
+    group_start = 0
+    while group_start < len(shuffled_rows):
+        group_end = group_start + 1
+        score = shuffled_rows[group_start]["total_score"]
+        while group_end < len(shuffled_rows) and shuffled_rows[group_end]["total_score"] == score:
+            group_end += 1
+        if group_end - group_start > 1:
+            tied_rows = shuffled_rows[group_start:group_end]
+            random.shuffle(tied_rows)
+            shuffled_rows[group_start:group_end] = tied_rows
+        group_start = group_end
+    return shuffled_rows
+
+
+def format_ranking_lines(rows: list[sqlite3.Row]) -> list[str]:
+    return [f"{index}등 - **{row['total_score']}점**" for index, row in enumerate(rows, start=1)]
+
+
 async def current_guild_member(guild: discord.Guild, user_id: str) -> discord.Member | None:
     try:
         return await guild.fetch_member(int(user_id))
@@ -3703,7 +3723,7 @@ async def ranking(interaction: discord.Interaction) -> None:
 
     current_bot_id = str(interaction.client.user.id) if interaction.client.user else ""
     with db() as conn:
-        candidates = fetch_ranking_rows(conn, current_bot_id)
+        candidates = shuffle_tied_ranking_rows(fetch_ranking_rows(conn, current_bot_id))
 
     rows = []
     try:
@@ -3724,10 +3744,7 @@ async def ranking(interaction: discord.Interaction) -> None:
         await interaction.response.send_message("현재 서버에 게임 참여 기록이 있는 유저가 없습니다.", ephemeral=True)
         return
 
-    lines = []
-    for index, row in enumerate(rows, start=1):
-        lines.append(f"{index}. <@{row['user_id']}> - **{row['total_score']}점**")
-
+    lines = format_ranking_lines(rows)
     embed = discord.Embed(title="현재 랭킹 TOP 10", description="\n".join(lines), color=discord.Color.gold())
     await interaction.response.send_message(embed=embed, allowed_mentions=discord.AllowedMentions.none())
 
