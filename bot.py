@@ -80,6 +80,15 @@ TRUST_OUTCOME_LABELS = {
     "single": "단독 배신",
     "double": "동시 배신",
 }
+MAIN_GAME_TYPES = {"trust", "sand"}
+SAND_NUMBER_CHOICES = [str(index) for index in range(1, 11)]
+SAND_PLAY_SECONDS = 600
+SAND_OUTCOME_LABELS = {
+    "mutual_quit": "둘 다 포기",
+    "quit_success": "포기 후 상대 덜기 성공",
+    "quit_collapse": "포기 후 상대 모래성 붕괴",
+    "plain_collapse": "일반 모래성 붕괴",
+}
 
 
 def now_text() -> str:
@@ -117,7 +126,7 @@ def init_db() -> None:
 
             CREATE TABLE IF NOT EXISTS rounds (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                type TEXT NOT NULL CHECK (type IN ('balance', 'bomb')),
+                type TEXT NOT NULL CHECK (type IN ('balance', 'bomb', 'grid', 'cutting', 'top3', 'trust', 'sand')),
                 title TEXT NOT NULL,
                 question TEXT NOT NULL,
                 option_a TEXT,
@@ -129,6 +138,24 @@ def init_db() -> None:
                 extra_json TEXT NOT NULL DEFAULT '{}',
                 created_at TEXT NOT NULL,
                 closed_at TEXT
+            );
+
+            CREATE TABLE IF NOT EXISTS event_sessions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                status TEXT NOT NULL CHECK (status IN ('recruiting', 'active', 'closed')),
+                channel_id TEXT NOT NULL,
+                message_id TEXT,
+                created_at TEXT NOT NULL,
+                closed_at TEXT
+            );
+
+            CREATE TABLE IF NOT EXISTS event_participants (
+                event_session_id INTEGER NOT NULL,
+                user_id TEXT NOT NULL,
+                joined_at TEXT NOT NULL,
+                PRIMARY KEY (event_session_id, user_id),
+                FOREIGN KEY (event_session_id) REFERENCES event_sessions(id) ON DELETE CASCADE,
+                FOREIGN KEY (user_id) REFERENCES users(user_id) ON DELETE CASCADE
             );
 
             CREATE TABLE IF NOT EXISTS votes (
@@ -181,13 +208,14 @@ def init_db() -> None:
             """
         )
         migrate_round_type_check(conn)
+        ensure_event_session_schema(conn)
 
 
 def migrate_round_type_check(conn: sqlite3.Connection) -> None:
     row = conn.execute(
         "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'rounds'"
     ).fetchone()
-    if not row or "trust" in row["sql"]:
+    if not row or "sand" in row["sql"]:
         return
 
     conn.execute("PRAGMA foreign_keys = OFF")
@@ -195,7 +223,7 @@ def migrate_round_type_check(conn: sqlite3.Connection) -> None:
         """
         CREATE TABLE rounds_new (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            type TEXT NOT NULL CHECK (type IN ('balance', 'bomb', 'grid', 'cutting', 'top3', 'trust')),
+            type TEXT NOT NULL CHECK (type IN ('balance', 'bomb', 'grid', 'cutting', 'top3', 'trust', 'sand')),
             title TEXT NOT NULL,
             question TEXT NOT NULL,
             option_a TEXT,
@@ -222,6 +250,15 @@ def migrate_round_type_check(conn: sqlite3.Connection) -> None:
         """
     )
     conn.execute("PRAGMA foreign_keys = ON")
+
+
+def ensure_event_session_schema(conn: sqlite3.Connection) -> None:
+    columns = {
+        str(row["name"])
+        for row in conn.execute("PRAGMA table_info(rounds)").fetchall()
+    }
+    if "event_session_id" not in columns:
+        conn.execute("ALTER TABLE rounds ADD COLUMN event_session_id INTEGER")
 
 
 def ensure_user(conn: sqlite3.Connection, user: discord.abc.User) -> None:
@@ -275,6 +312,44 @@ def get_open_round(conn: sqlite3.Connection) -> sqlite3.Row | None:
     return conn.execute(
         "SELECT * FROM rounds WHERE status = 'open' ORDER BY id DESC LIMIT 1"
     ).fetchone()
+
+
+def get_current_event(conn: sqlite3.Connection) -> sqlite3.Row | None:
+    return conn.execute(
+        """
+        SELECT * FROM event_sessions
+        WHERE status IN ('recruiting', 'active')
+        ORDER BY id DESC LIMIT 1
+        """
+    ).fetchone()
+
+
+def is_event_participant(
+    conn: sqlite3.Connection,
+    event_session_id: int,
+    user_id: str,
+) -> bool:
+    return conn.execute(
+        """
+        SELECT 1 FROM event_participants
+        WHERE event_session_id = ? AND user_id = ?
+        """,
+        (event_session_id, user_id),
+    ).fetchone() is not None
+
+
+def can_join_round(conn: sqlite3.Connection, round_id: int, user_id: str) -> bool:
+    round_row = conn.execute(
+        "SELECT event_session_id FROM rounds WHERE id = ?",
+        (round_id,),
+    ).fetchone()
+    if not round_row:
+        return False
+    event_session_id = round_row["event_session_id"]
+    # 기존 DB에서 기능 추가 전에 생성된 라운드는 종전 동작을 유지합니다.
+    if event_session_id is None:
+        return True
+    return is_event_participant(conn, int(event_session_id), user_id)
 
 
 def mention_list(user_ids: list[str], limit: int = 40) -> str:
@@ -351,6 +426,92 @@ def anonymous_discussion_view(round_id: int) -> discord.ui.View:
     return view
 
 
+def build_event_open_embed() -> discord.Embed:
+    embed = discord.Embed(
+        title="오늘의 이벤트가 열렸습니다!",
+        description="아래 `참여하기` 버튼을 누른 유저만 이번 이벤트의 모든 게임에 참여할 수 있습니다.",
+        color=discord.Color.green(),
+    )
+    embed.add_field(
+        name="진행 흐름",
+        value=(
+            "1. 지금 `참여하기` 버튼으로 오늘의 참가 등록\n"
+            "2. 메인게임 1개 진행 (신뢰 거래 또는 모래성 게임)\n"
+            "3. 메인게임 결과와 점수 정산\n"
+            "4. 미니게임 1개 진행 후 결과와 점수 정산"
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="꼭 확인해주세요",
+        value=(
+            "게임이 시작되면 참가 등록이 마감됩니다. 이전 이벤트의 참가 기록은 이어지지 않으며, "
+            "이벤트가 다시 열릴 때마다 새로 `참여하기`를 눌러야 합니다."
+        ),
+        inline=False,
+    )
+    return embed
+
+
+def event_join_view(event_session_id: int) -> discord.ui.View:
+    view = discord.ui.View(timeout=None)
+    view.add_item(
+        discord.ui.Button(
+            label="참여하기",
+            emoji="🙋",
+            style=discord.ButtonStyle.success,
+            custom_id=f"eventbot:eventjoin:{event_session_id}",
+        )
+    )
+    return view
+
+
+async def handle_event_join(interaction: discord.Interaction, event_session_id: int) -> None:
+    if interaction.user.bot:
+        await interaction.response.send_message("봇 계정은 이벤트에 참여할 수 없습니다.", ephemeral=True)
+        return
+
+    with db() as conn:
+        event_row = conn.execute(
+            "SELECT status FROM event_sessions WHERE id = ?",
+            (event_session_id,),
+        ).fetchone()
+        if not event_row or event_row["status"] != "recruiting":
+            await interaction.response.send_message(
+                "이 이벤트의 참가 등록은 이미 마감되었습니다. 다음 오픈을 기다려주세요.",
+                ephemeral=True,
+            )
+            return
+
+        ensure_user(conn, interaction.user)
+        existing = conn.execute(
+            """
+            SELECT 1 FROM event_participants
+            WHERE event_session_id = ? AND user_id = ?
+            """,
+            (event_session_id, str(interaction.user.id)),
+        ).fetchone()
+        if existing:
+            await interaction.response.send_message(
+                "이미 이번 이벤트에 참여 등록되어 있습니다.",
+                ephemeral=True,
+            )
+            return
+
+        conn.execute(
+            """
+            INSERT INTO event_participants (event_session_id, user_id, joined_at)
+            VALUES (?, ?, ?)
+            """,
+            (event_session_id, str(interaction.user.id), now_text()),
+        )
+
+    await interaction.response.send_message(
+        "참여 등록 완료! 이번 이벤트의 메인게임과 미니게임에 참여할 수 있습니다.",
+        ephemeral=True,
+    )
+
+
 class AnonymousDiscussionModal(discord.ui.Modal):
     def __init__(self, round_id: int) -> None:
         super().__init__(title="익명 발언하기")
@@ -383,6 +544,12 @@ class AnonymousDiscussionModal(discord.ui.Modal):
             ).fetchone()
             if not round_row:
                 await interaction.response.send_message("이미 마감되었거나 유효하지 않은 토론방입니다.", ephemeral=True)
+                return
+            if not can_join_round(conn, self.round_id, str(interaction.user.id)):
+                await interaction.response.send_message(
+                    "이번 이벤트에서 `참여하기`를 누른 유저만 토론에 참여할 수 있습니다.",
+                    ephemeral=True,
+                )
                 return
 
             already = conn.execute(
@@ -594,6 +761,12 @@ async def handle_trust_join(interaction: discord.Interaction, round_id: int) -> 
         if not round_row or round_extra(round_row).get("trust_phase") != "registration":
             await interaction.response.send_message("참여자 모집이 이미 끝났습니다.", ephemeral=True)
             return
+        if not can_join_round(conn, round_id, str(interaction.user.id)):
+            await interaction.response.send_message(
+                "이벤트 오픈 때 `참여하기`를 누른 유저만 게임에 참여할 수 있습니다.",
+                ephemeral=True,
+            )
+            return
 
         existing = conn.execute(
             "SELECT 1 FROM trust_registrations WHERE round_id = ? AND user_id = ?",
@@ -653,6 +826,335 @@ async def handle_trust_decision(
             (round_id, str(interaction.user.id), choice, now_text(), now_text()),
         )
     await interaction.response.send_message("선택을 비공개로 확정했습니다.", ephemeral=True)
+
+
+def start_sand_game(round_id: int) -> dict[str, Any] | None:
+    with db() as conn:
+        round_row = conn.execute(
+            "SELECT * FROM rounds WHERE id = ? AND type = 'sand' AND status = 'open'",
+            (round_id,),
+        ).fetchone()
+        if not round_row:
+            return None
+
+        extra = round_extra(round_row)
+        if extra.get("sand_phase") != "registration":
+            return None
+
+        registrations = conn.execute(
+            "SELECT user_id FROM trust_registrations WHERE round_id = ? ORDER BY registered_at ASC",
+            (round_id,),
+        ).fetchall()
+        user_ids = [str(row["user_id"]) for row in registrations]
+        if len(user_ids) < 2:
+            extra.update({"sand_phase": "cancelled", "cancelled_reason": "not_enough_participants"})
+            conn.execute(
+                "UPDATE rounds SET status = 'closed', closed_at = ?, extra_json = ? WHERE id = ?",
+                (now_text(), json.dumps(extra, ensure_ascii=False), round_id),
+            )
+            embed = discord.Embed(
+                title=f"{round_row['title']} · 취소",
+                description="참여자가 2명 미만이라 모래성 게임을 시작하지 못했습니다.",
+                color=discord.Color.light_grey(),
+            )
+            return {
+                "state": "cancelled",
+                "channel_id": str(round_row["channel_id"]),
+                "message_id": str(round_row["message_id"] or ""),
+                "embed": embed,
+            }
+
+        pairs, unmatched_user_id = build_random_trust_pairs(user_ids, set())
+        sand_pairs: list[dict[str, Any]] = []
+        for user_a_id, user_b_id in pairs:
+            conn.execute(
+                """
+                INSERT INTO trust_pairings (round_id, user_a_id, user_b_id, created_at)
+                VALUES (?, ?, ?, ?)
+                """,
+                (round_id, user_a_id, user_b_id, now_text()),
+            )
+            sand_pairs.append(
+                {
+                    "user_a_id": user_a_id,
+                    "user_b_id": user_b_id,
+                    "number_a": None,
+                    "number_b": None,
+                    "phase": "number_selection",
+                    "current_user_id": random.choice([user_a_id, user_b_id]),
+                    "successful_removals": 0,
+                }
+            )
+
+        play_close_at = time.time() + SAND_PLAY_SECONDS
+        extra.update(
+            {
+                "sand_phase": "playing",
+                "sand_pairs": sand_pairs,
+                "unmatched_user_id": unmatched_user_id,
+                "play_close_at": play_close_at,
+                "auto_close_at": play_close_at,
+                "play_duration_seconds": SAND_PLAY_SECONDS,
+            }
+        )
+        conn.execute(
+            "UPDATE rounds SET extra_json = ? WHERE id = ?",
+            (json.dumps(extra, ensure_ascii=False), round_id),
+        )
+        updated_row = conn.execute("SELECT * FROM rounds WHERE id = ?", (round_id,)).fetchone()
+        return {
+            "state": "playing",
+            "channel_id": str(round_row["channel_id"]),
+            "message_id": str(round_row["message_id"] or ""),
+            "embed": build_sand_play_embed(updated_row, extra),
+            "view": sand_play_view(round_id),
+            "close_at": play_close_at,
+        }
+
+
+async def handle_sand_join(interaction: discord.Interaction, round_id: int) -> None:
+    if interaction.user.bot:
+        await interaction.response.send_message("봇 계정은 참여할 수 없습니다.", ephemeral=True)
+        return
+    with db() as conn:
+        round_row = conn.execute(
+            "SELECT * FROM rounds WHERE id = ? AND type = 'sand' AND status = 'open'",
+            (round_id,),
+        ).fetchone()
+        if not round_row or round_extra(round_row).get("sand_phase") != "registration":
+            await interaction.response.send_message("참여자 모집이 이미 끝났습니다.", ephemeral=True)
+            return
+        if not can_join_round(conn, round_id, str(interaction.user.id)):
+            await interaction.response.send_message(
+                "이벤트 오픈 때 `참여하기`를 누른 유저만 게임에 참여할 수 있습니다.",
+                ephemeral=True,
+            )
+            return
+        existing = conn.execute(
+            "SELECT 1 FROM trust_registrations WHERE round_id = ? AND user_id = ?",
+            (round_id, str(interaction.user.id)),
+        ).fetchone()
+        if existing:
+            await interaction.response.send_message("이미 모래성 게임에 참여 등록했습니다.", ephemeral=True)
+            return
+        ensure_user(conn, interaction.user)
+        conn.execute(
+            "INSERT INTO trust_registrations (round_id, user_id, registered_at) VALUES (?, ?, ?)",
+            (round_id, str(interaction.user.id), now_text()),
+        )
+    await interaction.response.send_message("참여 체크 완료! 모집 마감 후 1:1로 무작위 매칭됩니다.", ephemeral=True)
+
+
+def find_sand_pair(extra: dict[str, Any], user_id: str) -> dict[str, Any] | None:
+    for pair in extra.get("sand_pairs", []):
+        if user_id in {str(pair.get("user_a_id")), str(pair.get("user_b_id"))}:
+            return pair
+    return None
+
+
+def sand_pair_threshold(pair: dict[str, Any]) -> tuple[int, int]:
+    raw_difference = abs(int(pair["number_a"]) - int(pair["number_b"]))
+    return raw_difference, max(1, raw_difference)
+
+
+def sand_games_complete(extra: dict[str, Any]) -> bool:
+    pairs = extra.get("sand_pairs", [])
+    return bool(pairs) and all(pair.get("phase") == "resolved" for pair in pairs)
+
+
+async def refresh_or_finish_sand_round(
+    interaction: discord.Interaction,
+    round_id: int,
+    private_message: str,
+) -> None:
+    with db() as conn:
+        round_row = conn.execute("SELECT * FROM rounds WHERE id = ?", (round_id,)).fetchone()
+        if not round_row:
+            await interaction.response.send_message("존재하지 않는 라운드입니다.", ephemeral=True)
+            return
+        extra = round_extra(round_row)
+        complete = sand_games_complete(extra)
+        progress_embed = build_sand_play_embed(round_row, extra)
+
+    await interaction.response.send_message(private_message, ephemeral=True)
+    if interaction.message:
+        try:
+            await interaction.message.edit(
+                embed=progress_embed,
+                view=sand_play_view(round_id, disabled=complete),
+            )
+        except discord.HTTPException:
+            pass
+
+    if not complete:
+        return
+    result = close_round_record(round_id, interaction.guild, closed_by="모든 1:1 게임 종료")
+    if not result:
+        return
+    task = bot.auto_close_tasks.pop(round_id, None)
+    if task:
+        task.cancel()
+    _, result_embed = result
+    await interaction.followup.send(embed=result_embed)
+
+
+async def handle_sand_number(
+    interaction: discord.Interaction,
+    round_id: int,
+    number: int,
+) -> None:
+    user_id = str(interaction.user.id)
+    with db() as conn:
+        round_row = conn.execute(
+            "SELECT * FROM rounds WHERE id = ? AND type = 'sand' AND status = 'open'",
+            (round_id,),
+        ).fetchone()
+        if not round_row:
+            await interaction.response.send_message("이미 끝난 모래성 게임입니다.", ephemeral=True)
+            return
+        extra = round_extra(round_row)
+        if extra.get("sand_phase") != "playing":
+            await interaction.response.send_message("아직 숫자를 정할 수 없습니다.", ephemeral=True)
+            return
+        pair = find_sand_pair(extra, user_id)
+        if not pair:
+            await interaction.response.send_message("이 라운드에 매칭된 참가자가 아닙니다.", ephemeral=True)
+            return
+        if pair.get("phase") != "number_selection":
+            await interaction.response.send_message("숫자 선택 단계가 이미 끝났습니다.", ephemeral=True)
+            return
+        key = "number_a" if user_id == str(pair["user_a_id"]) else "number_b"
+        if pair.get(key) is not None:
+            await interaction.response.send_message("숫자를 이미 확정했습니다. 변경할 수 없습니다.", ephemeral=True)
+            return
+        pair[key] = number
+        both_selected = pair.get("number_a") is not None and pair.get("number_b") is not None
+        if both_selected:
+            pair["phase"] = "active"
+        conn.execute(
+            "UPDATE rounds SET extra_json = ? WHERE id = ?",
+            (json.dumps(extra, ensure_ascii=False), round_id),
+        )
+        current_user_id = str(pair["current_user_id"])
+
+    suffix = (
+        f" 두 사람의 선택이 끝났습니다. {'내 차례입니다.' if current_user_id == user_id else f'<@{current_user_id}>님의 차례입니다.'}"
+        if both_selected
+        else " 상대의 비공개 선택을 기다립니다."
+    )
+    await refresh_or_finish_sand_round(interaction, round_id, f"`{number}`을 비공개로 확정했습니다.{suffix}")
+
+
+async def handle_sand_action(
+    interaction: discord.Interaction,
+    round_id: int,
+    action: str,
+) -> None:
+    user_id = str(interaction.user.id)
+    with db() as conn:
+        round_row = conn.execute(
+            "SELECT * FROM rounds WHERE id = ? AND type = 'sand' AND status = 'open'",
+            (round_id,),
+        ).fetchone()
+        if not round_row:
+            await interaction.response.send_message("이미 끝난 모래성 게임입니다.", ephemeral=True)
+            return
+        extra = round_extra(round_row)
+        pair = find_sand_pair(extra, user_id)
+        if not pair:
+            await interaction.response.send_message("이 라운드에 매칭된 참가자가 아닙니다.", ephemeral=True)
+            return
+        phase = str(pair.get("phase"))
+        if phase == "number_selection":
+            await interaction.response.send_message("두 참가자 모두 먼저 1~10 중 숫자를 확정해야 합니다.", ephemeral=True)
+            return
+        if phase == "resolved":
+            await interaction.response.send_message("이 1:1 게임은 이미 끝났습니다.", ephemeral=True)
+            return
+        if user_id != str(pair.get("current_user_id")):
+            await interaction.response.send_message("지금은 상대의 차례입니다.", ephemeral=True)
+            return
+
+        user_a_id = str(pair["user_a_id"])
+        user_b_id = str(pair["user_b_id"])
+        other_user_id = user_b_id if user_id == user_a_id else user_a_id
+        raw_difference, collapse_attempt = sand_pair_threshold(pair)
+        private_message: str
+
+        if action == "quit":
+            if phase == "awaiting_quit_response":
+                quitter_id = str(pair["quitter_id"])
+                pair.update(
+                    {
+                        "phase": "resolved",
+                        "outcome": "mutual_quit",
+                        "result": {"losers": [quitter_id, user_id]},
+                    }
+                )
+                private_message = "상대의 포기에 함께 포기했습니다. 두 사람 모두 -1점입니다."
+            else:
+                pair.update(
+                    {
+                        "phase": "awaiting_quit_response",
+                        "quitter_id": user_id,
+                        "current_user_id": other_user_id,
+                    }
+                )
+                private_message = "포기했습니다. 상대가 포기할지, 마지막으로 모래를 덜지 결정합니다."
+        else:
+            attempt = int(pair.get("successful_removals", 0)) + 1
+            collapsed = attempt >= collapse_attempt
+            if collapsed:
+                if phase == "awaiting_quit_response":
+                    quitter_id = str(pair["quitter_id"])
+                    pair.update(
+                        {
+                            "phase": "resolved",
+                            "outcome": "quit_collapse",
+                            "result": {"winner": quitter_id, "collapsed_user": user_id},
+                            "collapse_attempt": attempt,
+                            "raw_difference": raw_difference,
+                        }
+                    )
+                    private_message = "모래를 덜다가 무너졌습니다. 나는 -1점, 먼저 포기한 상대는 +1점입니다."
+                else:
+                    pair.update(
+                        {
+                            "phase": "resolved",
+                            "outcome": "plain_collapse",
+                            "result": {"collapsed_user": user_id},
+                            "collapse_attempt": attempt,
+                            "raw_difference": raw_difference,
+                        }
+                    )
+                    private_message = "모래를 덜다가 무너졌습니다. 무너진 차례의 참가자는 -1점입니다."
+            elif phase == "awaiting_quit_response":
+                quitter_id = str(pair["quitter_id"])
+                pair.update(
+                    {
+                        "phase": "resolved",
+                        "outcome": "quit_success",
+                        "successful_removals": attempt,
+                        "result": {"winner": user_id, "quitter": quitter_id},
+                        "raw_difference": raw_difference,
+                    }
+                )
+                private_message = "마지막 모래 덜기에 성공했습니다. 나는 +2점, 먼저 포기한 상대는 -1점입니다."
+            else:
+                pair.update(
+                    {
+                        "successful_removals": attempt,
+                        "current_user_id": other_user_id,
+                    }
+                )
+                private_message = f"모래 덜기 성공! 이제 <@{other_user_id}>님의 차례입니다."
+
+        conn.execute(
+            "UPDATE rounds SET extra_json = ? WHERE id = ?",
+            (json.dumps(extra, ensure_ascii=False), round_id),
+        )
+
+    await refresh_or_finish_sand_round(interaction, round_id, private_message)
 
 
 class EventBot(discord.Client):
@@ -733,6 +1235,15 @@ class EventBot(discord.Client):
                     self.schedule_auto_close(round_id, float(transition["close_at"]))
                 return
 
+            if row["type"] == "sand" and round_extra(row).get("sand_phase") == "registration":
+                transition = start_sand_game(round_id)
+                if not transition:
+                    return
+                await update_trust_main_message(transition)
+                if transition["state"] == "playing":
+                    self.schedule_auto_close(round_id, float(transition["close_at"]))
+                return
+
             result = close_round_record(round_id, guild, closed_by="자동 마감")
             if not result:
                 return
@@ -759,6 +1270,48 @@ class EventBot(discord.Client):
             return
 
         _, action = parts[:2]
+        if action == "eventjoin":
+            try:
+                event_session_id = int(parts[2])
+            except ValueError:
+                await interaction.response.send_message("잘못된 이벤트 번호입니다.", ephemeral=True)
+                return
+            await handle_event_join(interaction, event_session_id)
+            return
+
+        if action == "sandjoin":
+            try:
+                round_id = int(parts[2])
+            except ValueError:
+                await interaction.response.send_message("잘못된 라운드 번호입니다.", ephemeral=True)
+                return
+            await handle_sand_join(interaction, round_id)
+            return
+
+        if action == "sandnumber":
+            if len(parts) != 4 or parts[3] not in SAND_NUMBER_CHOICES:
+                await interaction.response.send_message("잘못된 모래성 숫자입니다.", ephemeral=True)
+                return
+            try:
+                round_id = int(parts[2])
+            except ValueError:
+                await interaction.response.send_message("잘못된 라운드 번호입니다.", ephemeral=True)
+                return
+            await handle_sand_number(interaction, round_id, int(parts[3]))
+            return
+
+        if action == "sandaction":
+            if len(parts) != 4 or parts[3] not in {"quit", "remove"}:
+                await interaction.response.send_message("잘못된 모래성 행동입니다.", ephemeral=True)
+                return
+            try:
+                round_id = int(parts[2])
+            except ValueError:
+                await interaction.response.send_message("잘못된 라운드 번호입니다.", ephemeral=True)
+                return
+            await handle_sand_action(interaction, round_id, parts[3])
+            return
+
         if action == "trustjoin":
             try:
                 round_id = int(parts[2])
@@ -827,6 +1380,12 @@ class EventBot(discord.Client):
             if not round_row:
                 await interaction.response.send_message("이미 마감되었거나 유효하지 않은 토론방입니다.", ephemeral=True)
                 return
+            if not can_join_round(conn, round_id, str(interaction.user.id)):
+                await interaction.response.send_message(
+                    "이번 이벤트에서 `참여하기`를 누른 유저만 토론에 참여할 수 있습니다.",
+                    ephemeral=True,
+                )
+                return
 
             await interaction.response.send_modal(AnonymousDiscussionModal(round_id))
             return
@@ -863,6 +1422,12 @@ class EventBot(discord.Client):
                 return
             if round_row["status"] != "open":
                 await interaction.response.send_message("이미 마감된 라운드입니다.", ephemeral=True)
+                return
+            if not can_join_round(conn, round_id, str(interaction.user.id)):
+                await interaction.response.send_message(
+                    "이번 이벤트에서 `참여하기`를 누른 유저만 게임에 참여할 수 있습니다.",
+                    ephemeral=True,
+                )
                 return
 
             ensure_user(conn, interaction.user)
@@ -1052,14 +1617,14 @@ def build_trust_registration_embed(round_id: int, title: str, registration_minut
     embed.add_field(
         name="진행 순서",
         value=(
-            f"참여 체크 {registration_minutes}분 → 무작위 2인 1세트 매칭 → 신뢰/배신 선택 3분 → 점수 정산 → 미니게임"
+            f"매칭 준비 {registration_minutes}분 → 무작위 2인 1세트 매칭 → 신뢰/배신 선택 3분 → 점수 정산 → 미니게임"
         ),
         inline=False,
     )
     embed.add_field(
         name="메인 규칙",
         value=(
-            "아래 참여 체크 버튼을 누른 유저만 게임에 참여합니다. 모집이 끝나면 봇이 참가자를 무작위로 둘씩 매칭합니다.\n"
+            "이벤트 오픈 때 `참여하기`를 누른 유저가 자동으로 참가합니다. 준비 시간이 끝나면 봇이 참가자를 무작위로 둘씩 매칭합니다.\n"
             "참여자가 홀수면 한 명은 이번 회차 매칭 대기이며, 나머지만 2명씩 게임을 진행합니다. 상호 신뢰는 각 +1점, 단독 배신은 배신자 +2점·상대 0점, 동시 배신은 각 -1점입니다."
         ),
         inline=False,
@@ -1136,6 +1701,119 @@ def trust_decision_view(round_id: int) -> discord.ui.View:
             emoji="🗡️",
             style=discord.ButtonStyle.danger,
             custom_id=f"eventbot:trustdecision:{round_id}:betray",
+        )
+    )
+    return view
+
+
+def build_sand_registration_embed(round_id: int, title: str, registration_minutes: int) -> discord.Embed:
+    embed = discord.Embed(title=title, description=title, color=discord.Color.from_rgb(218, 165, 90))
+    embed.add_field(
+        name="진행 순서",
+        value=(
+            f"매칭 준비 {registration_minutes}분 → 무작위 1:1 매칭 → 각자 비공개 숫자 선택 → "
+            "번갈아 포기/모래 덜기 → 정산 → 미니게임"
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="메인 규칙",
+        value=(
+            "이벤트 오픈 때 `참여하기`를 누른 유저가 자동으로 참가합니다. "
+            "각자 1~10 중 숫자 하나를 비공개로 정하고, 두 수의 차이가 실제 붕괴 횟수가 됩니다. "
+            "차이가 0이면 첫 모래 덜기에서 바로 무너집니다.\n"
+            "한 명이 포기하면 상대는 함께 포기하거나 마지막으로 모래를 덜 수 있습니다. "
+            "둘 다 포기하면 각 -1점, 마지막 덜기 성공 시 포기자 -1점·도전자 +2점, "
+            "마지막 덜기 중 붕괴 시 도전자 -1점·포기자 +1점입니다. 평소 덜기에서 무너지면 그 사람만 -1점입니다."
+        ),
+        inline=False,
+    )
+    return embed
+
+
+def sand_registration_view(round_id: int) -> discord.ui.View:
+    view = discord.ui.View(timeout=None)
+    view.add_item(
+        discord.ui.Button(
+            label="참여 체크하기",
+            emoji="🏖️",
+            style=discord.ButtonStyle.success,
+            custom_id=f"eventbot:sandjoin:{round_id}",
+        )
+    )
+    return view
+
+
+def build_sand_play_embed(round_row: sqlite3.Row, extra: dict[str, Any]) -> discord.Embed:
+    embed = discord.Embed(
+        title=str(round_row["title"]),
+        description="아래 숫자 버튼과 행동 버튼은 매칭된 본인에게만 적용되며, 선택 내용은 비공개입니다.",
+        color=discord.Color.from_rgb(218, 165, 90),
+    )
+    lines: list[str] = []
+    for index, pair in enumerate(extra.get("sand_pairs", []), start=1):
+        user_a_id = str(pair["user_a_id"])
+        user_b_id = str(pair["user_b_id"])
+        phase = str(pair.get("phase"))
+        if phase == "number_selection":
+            selected = int(pair.get("number_a") is not None) + int(pair.get("number_b") is not None)
+            status = f"비공개 숫자 선택 {selected}/2"
+        elif phase == "active":
+            status = (
+                f"<@{pair['current_user_id']}> 차례 · 성공한 모래 덜기 "
+                f"{int(pair.get('successful_removals', 0))}회"
+            )
+        elif phase == "awaiting_quit_response":
+            status = f"<@{pair['current_user_id']}>님이 함께 포기/마지막 덜기 선택 중"
+        else:
+            status = SAND_OUTCOME_LABELS.get(str(pair.get("outcome")), "종료")
+        lines.append(f"{index}. <@{user_a_id}> ↔ <@{user_b_id}> · {status}")
+    embed.add_field(name="1:1 진행 현황", value=field_text(lines), inline=False)
+    unmatched_user_id = str(extra.get("unmatched_user_id") or "")
+    if unmatched_user_id:
+        embed.add_field(
+            name="매칭 대기",
+            value=f"<@{unmatched_user_id}>님은 참여자가 홀수여서 이번 회차에 짝이 배정되지 않았습니다.",
+            inline=False,
+        )
+    embed.add_field(
+        name="선택 제한 시간",
+        value=f"10분 안에 모든 1:1 게임을 끝내주세요. 예정 마감: {close_time_text(extra.get('play_close_at'))}",
+        inline=False,
+    )
+    return embed
+
+
+def sand_play_view(round_id: int, disabled: bool = False) -> discord.ui.View:
+    view = discord.ui.View(timeout=None)
+    for index, value in enumerate(SAND_NUMBER_CHOICES):
+        view.add_item(
+            discord.ui.Button(
+                label=value,
+                style=discord.ButtonStyle.secondary,
+                custom_id=f"eventbot:sandnumber:{round_id}:{value}",
+                disabled=disabled,
+                row=index // 5,
+            )
+        )
+    view.add_item(
+        discord.ui.Button(
+            label="포기하기",
+            emoji="🏳️",
+            style=discord.ButtonStyle.danger,
+            custom_id=f"eventbot:sandaction:{round_id}:quit",
+            disabled=disabled,
+            row=2,
+        )
+    )
+    view.add_item(
+        discord.ui.Button(
+            label="모래 덜기",
+            emoji="🏖️",
+            style=discord.ButtonStyle.primary,
+            custom_id=f"eventbot:sandaction:{round_id}:remove",
+            disabled=disabled,
+            row=2,
         )
     )
     return view
@@ -1640,6 +2318,95 @@ def close_round_record(
                 value="상호 신뢰는 각 +1점, 단독 배신은 배신자 +2점·상대 0점, 동시 배신은 각 -1점입니다.",
                 inline=False,
             )
+        elif round_row["type"] == "sand":
+            result_lines: list[str] = []
+            completed_count = 0
+            for pair in extra.get("sand_pairs", []):
+                user_a_id = str(pair["user_a_id"])
+                user_b_id = str(pair["user_b_id"])
+                outcome = str(pair.get("outcome") or "")
+                result = pair.get("result", {})
+                number_a = pair.get("number_a")
+                number_b = pair.get("number_b")
+                number_text = (
+                    f"선택 {number_a}/{number_b}, 차이 {abs(int(number_a) - int(number_b))}"
+                    if number_a is not None and number_b is not None
+                    else "숫자 선택 미완료"
+                )
+
+                if outcome == "mutual_quit":
+                    for user_id in (user_a_id, user_b_id):
+                        add_score(
+                            conn, user_id, member_name(guild, user_id), -1,
+                            f"라운드 #{round_row['id']} 모래성 둘 다 포기", round_row["id"],
+                        )
+                    settlement = "각 -1점"
+                elif outcome == "quit_success":
+                    winner_id = str(result["winner"])
+                    quitter_id = str(result["quitter"])
+                    add_score(
+                        conn, winner_id, member_name(guild, winner_id), 2,
+                        f"라운드 #{round_row['id']} 모래성 포기 후 덜기 성공", round_row["id"],
+                    )
+                    add_score(
+                        conn, quitter_id, member_name(guild, quitter_id), -1,
+                        f"라운드 #{round_row['id']} 모래성 단독 포기", round_row["id"],
+                    )
+                    settlement = f"<@{winner_id}> +2점 · <@{quitter_id}> -1점"
+                elif outcome == "quit_collapse":
+                    winner_id = str(result["winner"])
+                    collapsed_user_id = str(result["collapsed_user"])
+                    add_score(
+                        conn, winner_id, member_name(guild, winner_id), 1,
+                        f"라운드 #{round_row['id']} 모래성 상대 붕괴", round_row["id"],
+                    )
+                    add_score(
+                        conn, collapsed_user_id, member_name(guild, collapsed_user_id), -1,
+                        f"라운드 #{round_row['id']} 모래성 마지막 덜기 붕괴", round_row["id"],
+                    )
+                    settlement = f"<@{winner_id}> +1점 · <@{collapsed_user_id}> -1점"
+                elif outcome == "plain_collapse":
+                    collapsed_user_id = str(result["collapsed_user"])
+                    add_score(
+                        conn, collapsed_user_id, member_name(guild, collapsed_user_id), -1,
+                        f"라운드 #{round_row['id']} 모래성 일반 붕괴", round_row["id"],
+                    )
+                    settlement = f"<@{collapsed_user_id}> -1점"
+                else:
+                    result_lines.append(
+                        f"<@{user_a_id}> ↔ <@{user_b_id}>: 제한 시간 내 미완료 (0점)"
+                    )
+                    continue
+
+                completed_count += 1
+                result_lines.append(
+                    f"<@{user_a_id}> ↔ <@{user_b_id}>: {SAND_OUTCOME_LABELS[outcome]} "
+                    f"({number_text}) · {settlement}"
+                )
+
+            extra.update({"sand_phase": "scored", "sand_scored_at": now_text()})
+            conn.execute(
+                "UPDATE rounds SET extra_json = ? WHERE id = ?",
+                (json.dumps(extra, ensure_ascii=False), round_row["id"]),
+            )
+            embed = discord.Embed(
+                title=f"결과 · {round_row['title']}",
+                description=round_row["title"],
+                color=discord.Color.from_rgb(218, 165, 90),
+            )
+            embed.add_field(name="짝별 결과", value=field_text(result_lines), inline=False)
+            embed.add_field(
+                name="정산 완료",
+                value=f"완료된 1:1 게임 {completed_count}쌍의 점수를 반영했습니다.",
+                inline=False,
+            )
+            unmatched_user_id = str(extra.get("unmatched_user_id") or "")
+            if unmatched_user_id:
+                embed.add_field(
+                    name="매칭 대기",
+                    value=f"<@{unmatched_user_id}>님은 이번 회차에 짝이 없어 점수 변동이 없습니다.",
+                    inline=False,
+                )
         elif round_row["type"] == "cutting":
             grouped: dict[str, list[str]] = {}
             for row in votes:
@@ -1678,14 +2445,27 @@ def close_round_record(
                 )
 
             if none_votes > candidate_vote_sum:
-                winners = conn.execute(
-                    """
-                    SELECT user_id, display_name FROM users
-                    WHERE user_id NOT IN (?, ?, ?)
-                    ORDER BY total_score DESC, updated_at ASC
-                    """,
-                    tuple(candidate_ids),
-                ).fetchall()
+                if round_row["event_session_id"] is None:
+                    winners = conn.execute(
+                        """
+                        SELECT user_id, display_name FROM users
+                        WHERE user_id NOT IN (?, ?, ?)
+                        ORDER BY total_score DESC, updated_at ASC
+                        """,
+                        tuple(candidate_ids),
+                    ).fetchall()
+                else:
+                    winners = conn.execute(
+                        """
+                        SELECT users.user_id, users.display_name
+                        FROM event_participants
+                        JOIN users ON users.user_id = event_participants.user_id
+                        WHERE event_participants.event_session_id = ?
+                          AND users.user_id NOT IN (?, ?, ?)
+                        ORDER BY users.total_score DESC, users.updated_at ASC
+                        """,
+                        (round_row["event_session_id"], *candidate_ids),
+                    ).fetchall()
                 for winner in winners:
                     add_score(
                         conn,
@@ -1789,6 +2569,7 @@ class StartSetupModal(discord.ui.Modal):
             "cutting": "돌 세공 예측",
             "top3": "상위 3명 견제",
             "trust": "신뢰 거래",
+            "sand": "모래성 게임",
         }
         super().__init__(title=f"{game_names.get(game, '게임')} 설정")
 
@@ -1798,9 +2579,9 @@ class StartSetupModal(discord.ui.Modal):
             max_length=120,
         )
         self.duration = discord.ui.TextInput(
-            label="참여자 모집 시간(분)" if game == "trust" else "진행 시간(분)",
-            placeholder="예: 2" if game == "trust" else "예: 5",
-            default=str(TRUST_REGISTRATION_DEFAULT_MINUTES) if game == "trust" else "5",
+            label="매칭 준비 시간(분)" if game in MAIN_GAME_TYPES else "진행 시간(분)",
+            placeholder="예: 2" if game in MAIN_GAME_TYPES else "예: 5",
+            default=str(TRUST_REGISTRATION_DEFAULT_MINUTES) if game in MAIN_GAME_TYPES else "5",
             max_length=4,
         )
         self.add_item(self.game_title)
@@ -1880,6 +2661,60 @@ class StartSetupModal(discord.ui.Modal):
             await interaction.response.send_message(str(exc), ephemeral=True)
 
 
+@bot.tree.command(name="오픈", description="새 이벤트 참가 모집을 열고 진행 흐름을 안내합니다.")
+@app_commands.default_permissions()
+@admin_only()
+async def open_event(interaction: discord.Interaction) -> None:
+    if not isinstance(interaction.channel, (discord.TextChannel, discord.Thread)):
+        await interaction.response.send_message("서버 텍스트 채널에서만 사용할 수 있습니다.", ephemeral=True)
+        return
+
+    with db() as conn:
+        if get_open_round(conn):
+            await interaction.response.send_message(
+                "진행 중인 라운드가 있습니다. 먼저 `/라운드마감`으로 마무리해주세요.",
+                ephemeral=True,
+            )
+            return
+
+        conn.execute(
+            """
+            UPDATE event_sessions
+            SET status = 'closed', closed_at = ?
+            WHERE status IN ('recruiting', 'active')
+            """,
+            (now_text(),),
+        )
+        cursor = conn.execute(
+            """
+            INSERT INTO event_sessions (status, channel_id, created_at)
+            VALUES ('recruiting', ?, ?)
+            """,
+            (str(interaction.channel.id), now_text()),
+        )
+        event_session_id = int(cursor.lastrowid)
+
+    try:
+        await interaction.response.send_message(
+            embed=build_event_open_embed(),
+            view=event_join_view(event_session_id),
+        )
+        message = await interaction.original_response()
+    except discord.HTTPException:
+        with db() as conn:
+            conn.execute(
+                "UPDATE event_sessions SET status = 'closed', closed_at = ? WHERE id = ?",
+                (now_text(), event_session_id),
+            )
+        raise
+
+    with db() as conn:
+        conn.execute(
+            "UPDATE event_sessions SET message_id = ? WHERE id = ?",
+            (str(message.id), event_session_id),
+        )
+
+
 @bot.tree.command(name="start", description="게임을 고르면 설정 창이 열립니다.")
 @app_commands.default_permissions()
 @admin_only()
@@ -1891,10 +2726,18 @@ class StartSetupModal(discord.ui.Modal):
         app_commands.Choice(name="돌 세공 예측", value="cutting"),
         app_commands.Choice(name="상위 3명 견제", value="top3"),
         app_commands.Choice(name="신뢰 거래 (메인)", value="trust"),
+        app_commands.Choice(name="모래성 게임 (메인)", value="sand"),
     ]
 )
 @app_commands.describe(게임="진행할 게임 종류")
 async def start(interaction: discord.Interaction, 게임: str) -> None:
+    with db() as conn:
+        if not get_current_event(conn):
+            await interaction.response.send_message(
+                "먼저 `/오픈`으로 오늘의 이벤트 참가 모집을 열어주세요.",
+                ephemeral=True,
+            )
+            return
     await interaction.response.send_modal(StartSetupModal(게임))
 
 
@@ -1931,8 +2774,37 @@ async def create_round_from_setup(
             await interaction.response.send_message("이미 열린 라운드가 있습니다. 먼저 `/라운드마감`을 해주세요.", ephemeral=True)
             return
 
+        event_row = get_current_event(conn)
+        if not event_row:
+            await interaction.response.send_message(
+                "현재 열린 이벤트가 없습니다. 먼저 `/오픈`을 실행해주세요.",
+                ephemeral=True,
+            )
+            return
+        event_session_id = int(event_row["id"])
+        participant_count = int(
+            conn.execute(
+                """
+                SELECT COUNT(*) AS count FROM event_participants
+                WHERE event_session_id = ?
+                """,
+                (event_session_id,),
+            ).fetchone()["count"]
+        )
+        if 게임 in MAIN_GAME_TYPES and participant_count < 2:
+            await interaction.response.send_message(
+                "메인게임을 시작하려면 `/오픈`의 `참여하기` 등록자가 최소 2명 필요합니다.",
+                ephemeral=True,
+            )
+            return
+
         previous_round = conn.execute(
-            "SELECT * FROM rounds ORDER BY id DESC LIMIT 1"
+            """
+            SELECT * FROM rounds
+            WHERE event_session_id = ?
+            ORDER BY id DESC LIMIT 1
+            """,
+            (event_session_id,),
         ).fetchone()
         if previous_round and previous_round["type"] == "cutting":
             previous_extra = round_extra(previous_round)
@@ -1943,28 +2815,43 @@ async def create_round_from_setup(
                 )
                 return
 
-        if 게임 == "trust":
+        if 게임 in MAIN_GAME_TYPES:
+            previous_phase = None
+            if previous_round:
+                previous_extra = round_extra(previous_round)
+                previous_phase = (
+                    previous_extra.get("trust_phase")
+                    if previous_round["type"] == "trust"
+                    else previous_extra.get("sand_phase")
+                )
             if (
                 previous_round
-                and previous_round["type"] == "trust"
-                and round_extra(previous_round).get("trust_phase") not in {"cancelled", None}
+                and previous_round["type"] in MAIN_GAME_TYPES
+                and previous_phase not in {"cancelled", None}
             ):
                 await interaction.response.send_message(
-                    "신뢰 거래 다음에는 미니게임 하나를 진행해야 합니다.",
+                    "메인게임 다음에는 미니게임 하나를 진행해야 합니다.",
                     ephemeral=True,
                 )
                 return
-        elif (
-            not previous_round
-            or previous_round["type"] != "trust"
-            or previous_round["status"] != "closed"
-            or round_extra(previous_round).get("trust_phase") not in {"scored", None}
-        ):
-            await interaction.response.send_message(
-                "미니게임을 시작하려면 참여자 모집·매칭·선택·정산까지 끝난 신뢰 거래가 필요합니다.",
-                ephemeral=True,
-            )
-            return
+        else:
+            previous_extra = round_extra(previous_round) if previous_round else {}
+            previous_phase = None
+            if previous_round and previous_round["type"] == "trust":
+                previous_phase = previous_extra.get("trust_phase")
+            elif previous_round and previous_round["type"] == "sand":
+                previous_phase = previous_extra.get("sand_phase")
+            if (
+                not previous_round
+                or previous_round["type"] not in MAIN_GAME_TYPES
+                or previous_round["status"] != "closed"
+                or previous_phase not in {"scored", None}
+            ):
+                await interaction.response.send_message(
+                    "미니게임을 시작하려면 참여자 모집·매칭·선택·정산까지 끝난 메인게임이 필요합니다.",
+                    ephemeral=True,
+                )
+                return
 
         if 게임 == "balance":
             if not 선택_a or not 선택_b:
@@ -2093,19 +2980,47 @@ async def create_round_from_setup(
             )
             round_id = int(cursor.lastrowid)
             embed = build_trust_registration_embed(round_id, 제목, int(진행시간분))
-            view = trust_registration_view(round_id)
+            view = None
+        elif 게임 == "sand":
+            extra.update(
+                {
+                    "sand_phase": "registration",
+                    "registration_minutes": int(진행시간분),
+                    "registration_close_at": close_at,
+                }
+            )
+            cursor = conn.execute(
+                """
+                INSERT INTO rounds
+                    (type, title, question, status, channel_id, extra_json, created_at)
+                VALUES ('sand', ?, ?, 'open', ?, ?, ?)
+                """,
+                (
+                    제목,
+                    제목,
+                    str(interaction.channel.id),
+                    json.dumps(extra, ensure_ascii=False),
+                    now_text(),
+                ),
+            )
+            round_id = int(cursor.lastrowid)
+            embed = build_sand_registration_embed(round_id, 제목, int(진행시간분))
+            view = None
         elif 게임 == "top3":
             rows = conn.execute(
                 """
-                SELECT user_id, display_name, total_score
-                FROM users
-                ORDER BY total_score DESC, updated_at ASC
+                SELECT users.user_id, users.display_name, users.total_score
+                FROM event_participants
+                JOIN users ON users.user_id = event_participants.user_id
+                WHERE event_participants.event_session_id = ?
+                ORDER BY users.total_score DESC, users.updated_at ASC
                 LIMIT 3
-                """
+                """,
+                (event_session_id,),
             ).fetchall()
             if len(rows) < 3:
                 await interaction.response.send_message(
-                    "상위 3명 견제 게임은 점수 기록이 있는 유저가 최소 3명 필요합니다.",
+                    "상위 3명 견제 게임은 이번 이벤트 참가자 중 점수 기록 유저가 최소 3명 필요합니다.",
                     ephemeral=True,
                 )
                 return
@@ -2156,12 +3071,36 @@ async def create_round_from_setup(
             embed = build_cutting_embed(round_id, 제목)
             view = cutting_vote_view(round_id)
 
-    if 게임 == "trust":
+        conn.execute(
+            "UPDATE rounds SET event_session_id = ? WHERE id = ?",
+            (event_session_id, round_id),
+        )
+        conn.execute(
+            "UPDATE event_sessions SET status = 'active' WHERE id = ?",
+            (event_session_id,),
+        )
+        if 게임 in MAIN_GAME_TYPES:
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO trust_registrations (round_id, user_id, registered_at)
+                SELECT ?, user_id, joined_at
+                FROM event_participants
+                WHERE event_session_id = ?
+                """,
+                (round_id, event_session_id),
+            )
+
+    if 게임 in MAIN_GAME_TYPES:
+        next_step = (
+            "매칭 후에는 신뢰/배신 선택 시간이 3분 주어집니다."
+            if 게임 == "trust"
+            else "매칭 후에는 비공개 숫자 선택과 1:1 진행 시간이 10분 주어집니다."
+        )
         embed.add_field(
-            name="참여자 모집 마감",
+            name="랜덤 매칭 시작",
             value=(
-                f"{진행시간분}분 후 랜덤 매칭을 시작합니다.\n예정 시각: {close_time_text(close_at)}\n"
-                "매칭 후에는 신뢰/배신 선택 시간이 3분 주어집니다."
+                f"오늘의 이벤트 참가 명단으로 {진행시간분}분 후 랜덤 매칭을 시작합니다.\n예정 시각: {close_time_text(close_at)}\n"
+                f"{next_step}"
             ),
             inline=False,
         )
@@ -2278,6 +3217,22 @@ async def close_round(interaction: discord.Interaction) -> None:
             await interaction.response.send_message("참여자 모집을 마감하고 랜덤 매칭 및 3분 선택을 시작했습니다.", ephemeral=True)
         else:
             await interaction.response.send_message("참여자가 부족해 신뢰 거래를 취소했습니다.", ephemeral=True)
+        return
+
+    if round_row["type"] == "sand" and round_extra(round_row).get("sand_phase") == "registration":
+        transition = start_sand_game(int(round_row["id"]))
+        if not transition:
+            await interaction.response.send_message("참여자 모집을 마감하지 못했습니다.", ephemeral=True)
+            return
+        task = bot.auto_close_tasks.pop(int(round_row["id"]), None)
+        if task:
+            task.cancel()
+        await update_trust_main_message(transition)
+        if transition["state"] == "playing":
+            bot.schedule_auto_close(int(round_row["id"]), float(transition["close_at"]))
+            await interaction.response.send_message("참여자 모집을 마감하고 1:1 모래성 게임을 시작했습니다.", ephemeral=True)
+        else:
+            await interaction.response.send_message("참여자가 부족해 모래성 게임을 취소했습니다.", ephemeral=True)
         return
 
     result = close_round_record(int(round_row["id"]), interaction.guild)
