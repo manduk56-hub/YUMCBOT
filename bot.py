@@ -93,6 +93,16 @@ GAME_NAMES = {
 }
 SAND_NUMBER_CHOICES = [str(index) for index in range(1, 11)]
 SAND_PLAY_SECONDS = 600
+SAND_RULES_TEXT = (
+    "1. 각 참여자가 1~10 중 모래성이 무너질 횟수를 정합니다.\n"
+    "2. 실제 무너질 횟수는 정한 횟수끼리 뺀 값(두 수의 차이)으로 결정됩니다.\n"
+    "3. 참여자는 번갈아가며 `포기하기` 또는 `모래 덜기`를 결정합니다.\n\n"
+    "- 둘 다 포기 선택 시: 서로 -1점\n"
+    "- 한 명이 포기(A), 다른 한 명이 모래 덜기(B) 선택 시:\n"
+    "  - 덜기 성공: A는 -1점, B는 +2점\n"
+    "  - 무너짐: B는 -1점, A는 +1점\n"
+    "- 서로 덜기를 하다 무너진 경우: 그 턴의 사람이 -1점"
+)
 SAND_OUTCOME_LABELS = {
     "mutual_quit": "둘 다 포기",
     "quit_success": "포기 후 상대 덜기 성공",
@@ -368,6 +378,24 @@ def mention_list(user_ids: list[str], limit: int = 40) -> str:
     mentions = [f"<@{user_id}>" for user_id in user_ids[:limit]]
     suffix = f"\n외 {len(user_ids) - limit}명" if len(user_ids) > limit else ""
     return ", ".join(mentions) + suffix
+
+
+def format_score_message(display_name: str, total_score: int) -> str:
+    safe_name = discord.utils.escape_mentions(display_name)
+    return f"{safe_name} 현재 점수: **{total_score}점**"
+
+
+def fetch_ranking_rows(conn: sqlite3.Connection, current_bot_id: str) -> list[sqlite3.Row]:
+    return conn.execute(
+        """
+        SELECT user_id, display_name, total_score
+        FROM users
+        WHERE user_id != ?
+        ORDER BY total_score DESC, updated_at ASC
+        LIMIT 10
+        """,
+        (current_bot_id,),
+    ).fetchall()
 
 
 def field_text(lines: list[str], empty: str = "없음", limit: int = 1024) -> str:
@@ -1819,14 +1847,7 @@ def build_sand_registration_embed(round_id: int, title: str, registration_minute
     )
     embed.add_field(
         name="메인 규칙",
-        value=(
-            "이벤트 오픈 때 `참여하기`를 누른 유저가 자동으로 참가합니다. "
-            "각자 1~10 중 숫자 하나를 비공개로 정하고, 두 수의 차이가 실제 붕괴 횟수가 됩니다. "
-            "차이가 0이면 첫 모래 덜기에서 바로 무너집니다.\n"
-            "한 명이 포기하면 상대는 함께 포기하거나 마지막으로 모래를 덜 수 있습니다. "
-            "둘 다 포기하면 각 -1점, 마지막 덜기 성공 시 포기자 -1점·도전자 +2점, "
-            "마지막 덜기 중 붕괴 시 도전자 -1점·포기자 +1점입니다. 평소 덜기에서 무너지면 그 사람만 -1점입니다."
-        ),
+        value=SAND_RULES_TEXT,
         inline=False,
     )
     return embed
@@ -2183,11 +2204,6 @@ def close_round_record(
             "SELECT user_id, choice FROM votes WHERE round_id = ? ORDER BY updated_at ASC",
             (round_row["id"],),
         ).fetchall()
-        discussion_count = conn.execute(
-            "SELECT COUNT(*) AS count FROM discussion_posts WHERE round_id = ?",
-            (round_row["id"],),
-        ).fetchone()["count"]
-
         conn.execute(
             "UPDATE rounds SET status = 'closed', closed_at = ? WHERE id = ?",
             (now_text(), round_row["id"]),
@@ -2605,14 +2621,7 @@ def close_round_record(
             embed.add_field(name="결과", value=outcome, inline=False)
             embed.add_field(name="정산", value=settlement, inline=False)
 
-        duration = extra.get("duration_minutes")
-        close_at = extra.get("auto_close_at")
-        stats = [f"투표 참여: {len(votes)}명", f"토론 발언: {discussion_count}개", f"마감 방식: {closed_by}"]
-        if duration:
-            stats.append(f"진행 시간: {duration}분")
-        if close_at:
-            stats.append(f"예정 마감: {close_time_text(float(close_at))}")
-        embed.add_field(name="통계", value="\n".join(stats), inline=False)
+        embed.add_field(name="통계", value=f"투표 참여: {len(votes)}명", inline=False)
         planned_mini_game = str(extra.get("planned_mini_game") or "")
         if round_row["type"] in MAIN_GAME_TYPES and planned_mini_game in MINI_GAME_TYPES:
             embed.add_field(
@@ -2665,6 +2674,48 @@ def parse_range_int(value: str, name: str, minimum: int, maximum: int) -> int:
     if number < minimum or number > maximum:
         raise ValueError(f"{name}은 {minimum}부터 {maximum} 사이로 입력해주세요.")
     return number
+
+
+async def ensure_trust_thread_message_permission(interaction: discord.Interaction) -> bool:
+    guild = interaction.guild
+    interaction_channel = interaction.channel
+    parent_channel = interaction_channel.parent if isinstance(interaction_channel, discord.Thread) else interaction_channel
+    if guild is None or not isinstance(parent_channel, discord.TextChannel):
+        await interaction.response.send_message(
+            "신뢰 거래는 서버 텍스트 채널에서 시작해주세요.",
+            ephemeral=True,
+        )
+        return False
+
+    default_role = guild.default_role
+    overwrite = parent_channel.overwrites_for(default_role)
+    if overwrite.send_messages_in_threads is True:
+        return True
+
+    bot_member = guild.me
+    if bot_member is None or not parent_channel.permissions_for(bot_member).manage_roles:
+        await interaction.response.send_message(
+            "신뢰 거래 협상방을 열려면 봇에 `역할 관리(Manage Roles)` 권한이 필요합니다. "
+            "권한을 추가한 뒤 다시 시작해주세요.",
+            ephemeral=True,
+        )
+        return False
+
+    overwrite.send_messages_in_threads = True
+    try:
+        await parent_channel.set_permissions(
+            default_role,
+            overwrite=overwrite,
+            reason="신뢰 거래 공개 협상방 메시지 허용",
+        )
+    except (discord.Forbidden, discord.HTTPException):
+        await interaction.response.send_message(
+            "이벤트 채널의 `스레드에서 메시지 보내기` 권한을 설정하지 못했습니다. "
+            "봇의 역할 관리 권한과 역할 순서를 확인해주세요.",
+            ephemeral=True,
+        )
+        return False
+    return True
 
 
 class StartSetupModal(discord.ui.Modal):
@@ -2922,6 +2973,9 @@ async def create_round_from_setup(
 ) -> None:
     if not isinstance(interaction.channel, (discord.TextChannel, discord.Thread)):
         await interaction.response.send_message("서버 텍스트 채널에서만 사용할 수 있습니다.", ephemeral=True)
+        return
+
+    if 게임 == "trust" and not await ensure_trust_thread_message_permission(interaction):
         return
 
     close_at = time.time() + (int(진행시간분) * 60)
@@ -3268,14 +3322,25 @@ async def create_round_from_setup(
             if 게임 == "trust"
             else "매칭 후에는 비공개 숫자 선택과 1:1 진행 시간이 10분 주어집니다."
         )
-        embed.add_field(
-            name="랜덤 매칭 시작",
-            value=(
-                f"오늘의 이벤트 참가 명단으로 {진행시간분}분 후 랜덤 매칭을 시작합니다.\n예정 시각: {close_time_text(close_at)}\n"
-                f"{next_step}"
-            ),
-            inline=False,
-        )
+        if 게임 == "sand":
+            embed.add_field(
+                name="게임 준비 중",
+                value=(
+                    f"현재는 모든 참가자에게 공개되는 규칙 안내 단계입니다. "
+                    f"{진행시간분}분 후 자동으로 1:1 매칭과 실제 게임을 시작합니다.\n"
+                    f"실제 시작 예정: {close_time_text(close_at)}\n{next_step}"
+                ),
+                inline=False,
+            )
+        else:
+            embed.add_field(
+                name="랜덤 매칭 시작",
+                value=(
+                    f"오늘의 이벤트 참가 명단으로 {진행시간분}분 후 랜덤 매칭을 시작합니다.\n"
+                    f"예정 시각: {close_time_text(close_at)}\n{next_step}"
+                ),
+                inline=False,
+            )
         embed.add_field(
             name="선택한 미니게임",
             value=f"메인게임 정산 후 `{GAME_NAMES[str(예정_미니게임)]}` 설정 버튼이 표시됩니다.",
@@ -3473,23 +3538,28 @@ async def run_cutting(interaction: discord.Interaction) -> None:
 @app_commands.describe(사용자="확인할 사용자")
 async def show_score(interaction: discord.Interaction, 사용자: discord.Member | None = None) -> None:
     target = 사용자 or interaction.user
+    current_bot = interaction.client.user
+    if current_bot and target.id == current_bot.id:
+        await interaction.response.send_message(
+            "이 이벤트 봇의 점수는 조회할 수 없습니다.",
+            ephemeral=True,
+        )
+        return
     with db() as conn:
         ensure_user(conn, target)
         row = conn.execute("SELECT total_score FROM users WHERE user_id = ?", (str(target.id),)).fetchone()
-    await interaction.response.send_message(f"{target.mention} 현재 점수: **{row['total_score']}점**", ephemeral=True)
+    await interaction.response.send_message(
+        format_score_message(target.display_name, int(row["total_score"])),
+        ephemeral=True,
+        allowed_mentions=discord.AllowedMentions.none(),
+    )
 
 
 @bot.tree.command(name="랭킹", description="현재 누적 점수 랭킹을 확인합니다.")
 async def ranking(interaction: discord.Interaction) -> None:
+    current_bot_id = str(interaction.client.user.id) if interaction.client.user else ""
     with db() as conn:
-        rows = conn.execute(
-            """
-            SELECT user_id, display_name, total_score
-            FROM users
-            ORDER BY total_score DESC, updated_at ASC
-            LIMIT 10
-            """
-        ).fetchall()
+        rows = fetch_ranking_rows(conn, current_bot_id)
 
     if not rows:
         await interaction.response.send_message("아직 점수 기록이 없습니다.", ephemeral=True)
@@ -3500,22 +3570,7 @@ async def ranking(interaction: discord.Interaction) -> None:
         lines.append(f"{index}. <@{row['user_id']}> - **{row['total_score']}점**")
 
     embed = discord.Embed(title="현재 랭킹 TOP 10", description="\n".join(lines), color=discord.Color.gold())
-    await interaction.response.send_message(embed=embed)
-
-
-@bot.tree.command(name="점수수정", description="운영자가 특정 유저의 점수를 수정합니다.")
-@app_commands.default_permissions()
-@admin_only()
-@app_commands.describe(사용자="점수를 수정할 유저", 점수="더하거나 뺄 점수", 사유="기록에 남길 사유")
-async def adjust_score(
-    interaction: discord.Interaction,
-    사용자: discord.Member,
-    점수: int,
-    사유: str,
-) -> None:
-    with db() as conn:
-        add_score(conn, str(사용자.id), 사용자.display_name, 점수, f"운영자 수정: {사유}", None)
-    await interaction.response.send_message(f"{사용자.mention} 점수를 {점수:+d}점 수정했습니다. 사유: {사유}")
+    await interaction.response.send_message(embed=embed, allowed_mentions=discord.AllowedMentions.none())
 
 
 @bot.tree.command(name="데이터백업", description="SQLite 데이터베이스를 백업합니다.")
