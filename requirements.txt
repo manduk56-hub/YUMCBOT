@@ -1,2 +1,4 @@
-discord.py>=2.4.0,<3
-python-dotenv>=1.0.1,<2
+# 로컬과 서버의 버전 드리프트를 막기 위해 정확히 고정한다.
+# 올릴 때는 로컬에서 검증 후 develop -> main 흐름을 그대로 태울 것.
+discord.py==2.7.1
+python-dotenv==1.2.2

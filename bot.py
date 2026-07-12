@@ -5,7 +5,8 @@ import csv
 import json
 import os
 import random
-import shutil
+import signal
+import socket
 import sqlite3
 import time
 from contextlib import contextmanager
@@ -19,8 +20,13 @@ from dotenv import load_dotenv
 
 
 BASE_DIR = Path(__file__).resolve().parent
-DATA_DIR = BASE_DIR / "data"
-DB_PATH = DATA_DIR / "event_game.sqlite3"
+
+# 배포 환경(systemd)이 넘겨준 실제 환경변수가 우선이고, 없으면 로컬 .env로 채운다.
+load_dotenv(BASE_DIR / ".env")
+
+# 운영 서버는 DB를 코드 디렉터리 밖(/var/lib/yumcbot/data)에 두어 배포로 덮이지 않게 한다.
+DATA_DIR = Path(os.getenv("YUMCBOT_DATA_DIR") or (BASE_DIR / "data")).resolve()
+DB_PATH = DATA_DIR / (os.getenv("YUMCBOT_DB_NAME") or "event_game.sqlite3")
 KST_LABEL = "Asia/Seoul"
 DEFUSE_COLORS = [
     {"id": "red", "name": "빨강", "emoji": "🟥"},
@@ -123,10 +129,14 @@ def cutting_success_rate(current_level: int) -> float:
 
 @contextmanager
 def db() -> sqlite3.Connection:
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(DB_PATH)
+    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(DB_PATH, timeout=5.0)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
+    # WAL: 재시작/급종료 시 DB 손상 방지, /데이터백업 중에도 쓰기가 막히지 않는다.
+    conn.execute("PRAGMA journal_mode = WAL")
+    conn.execute("PRAGMA synchronous = NORMAL")
+    conn.execute("PRAGMA busy_timeout = 5000")
     try:
         yield conn
         conn.commit()
@@ -134,10 +144,10 @@ def db() -> sqlite3.Connection:
         conn.close()
 
 
-def init_db() -> None:
-    with db() as conn:
-        conn.executescript(
-            """
+# v1 베이스라인. 이 문자열은 절대 수정하지 않는다.
+# 스키마를 바꾸려면 SCHEMA_VERSION을 올리고 MIGRATIONS에 항목을 추가한다.
+# (여기를 고치면 새 DB와 기존 운영 DB의 스키마가 갈라진다.)
+BASE_SCHEMA = """
             CREATE TABLE IF NOT EXISTS users (
                 user_id TEXT PRIMARY KEY,
                 display_name TEXT NOT NULL,
@@ -228,11 +238,111 @@ def init_db() -> None:
                 created_at TEXT NOT NULL,
                 FOREIGN KEY (round_id) REFERENCES rounds(id) ON DELETE SET NULL
             );
-            """
+"""
+
+BASELINE_VERSION = 1
+
+# 스키마 변경은 전부 여기로. 예:
+#   MIGRATIONS = {2: ["ALTER TABLE rounds ADD COLUMN foo TEXT"]}
+# 롤백 가능하도록 반드시 '추가' 형태(ADD COLUMN 등)로만 작성한다.
+MIGRATIONS: dict[int, list[str]] = {}
+
+SCHEMA_VERSION = max([BASELINE_VERSION, *MIGRATIONS])
+
+
+def apply_baseline_schema(conn: sqlite3.Connection) -> None:
+    """v1 베이스라인 = BASE_SCHEMA + 아래 세 개의 멱등 보정.
+
+    user_version이 도입되기 전부터 굴러온 DB들은 매 부팅마다 이 보정을 거쳐 왔다.
+    따라서 이미 존재하는 모든 DB의 실제 스키마가 곧 v1이다. 여기에 ADD COLUMN을
+    새로 끼워 넣으면 기존 DB에서 'duplicate column' 으로 터지므로 손대지 말고,
+    앞으로의 변경은 MIGRATIONS(v2~)에 추가한다.
+    """
+    conn.executescript(BASE_SCHEMA)
+    migrate_round_type_check(conn)
+    ensure_event_session_schema(conn)
+    ensure_trust_pairing_schema(conn)
+
+
+def _schema_snapshot(conn: sqlite3.Connection) -> dict[str, set[str]]:
+    tables = [
+        row[0]
+        for row in conn.execute(
+            "SELECT name FROM sqlite_master "
+            "WHERE type = 'table' AND name NOT LIKE 'sqlite_%'"
         )
-        migrate_round_type_check(conn)
-        ensure_event_session_schema(conn)
-        ensure_trust_pairing_schema(conn)
+    ]
+    return {
+        table: {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+        for table in tables
+    }
+
+
+def canonical_schema() -> dict[str, set[str]]:
+    """베이스라인 + 모든 마이그레이션을 적용했을 때 나와야 하는 스키마."""
+    mem = sqlite3.connect(":memory:")
+    mem.row_factory = sqlite3.Row  # ensure_* 보정이 row["name"]으로 접근한다
+    try:
+        apply_baseline_schema(mem)
+        for version in range(BASELINE_VERSION + 1, SCHEMA_VERSION + 1):
+            for statement in MIGRATIONS[version]:
+                mem.execute(statement)
+        return _schema_snapshot(mem)
+    finally:
+        mem.close()
+
+
+def verify_schema() -> None:
+    """실제 DB가 코드가 기대하는 스키마를 만족하는지 확인한다.
+
+    마이그레이션을 빠뜨린 채 배포하면 봇은 정상 로그인까지 해버리고 게임 도중에
+    'no such column'으로 터진다. 부팅 시점에 미리 죽여서 배포 헬스체크가 잡아내게 한다.
+    구버전으로 롤백한 경우 DB에 모르는 컬럼이 더 있을 수 있는데, 그건 허용한다.
+    """
+    expected = canonical_schema()
+    with db() as conn:
+        actual = _schema_snapshot(conn)
+
+    problems: list[str] = []
+    for table, columns in sorted(expected.items()):
+        if table not in actual:
+            problems.append(f"테이블 누락: {table}")
+            continue
+        missing = columns - actual[table]
+        if missing:
+            problems.append(f"{table} 컬럼 누락: {', '.join(sorted(missing))}")
+
+    if problems:
+        detail = "\n  - ".join(problems)
+        raise RuntimeError(
+            f"DB 스키마가 코드와 일치하지 않습니다 (기대 v{SCHEMA_VERSION}):\n  - {detail}\n"
+            "MIGRATIONS에 변경분을 등록했는지 확인하세요."
+        )
+
+
+def init_db() -> None:
+    with db() as conn:
+        apply_baseline_schema(conn)
+
+        version = int(conn.execute("PRAGMA user_version").fetchone()[0])
+        if version == 0:
+            # 새로 만든 DB이거나, user_version 도입 이전부터 굴러온 기존 DB. 둘 다 v1이다.
+            version = BASELINE_VERSION
+            conn.execute(f"PRAGMA user_version = {BASELINE_VERSION}")
+
+        if version > SCHEMA_VERSION:
+            print(
+                f"경고: DB 스키마(v{version})가 코드(v{SCHEMA_VERSION})보다 최신입니다. "
+                "구버전으로 롤백된 상태일 수 있습니다.",
+                flush=True,
+            )
+            return
+
+        for target in range(version + 1, SCHEMA_VERSION + 1):
+            for statement in MIGRATIONS[target]:
+                conn.execute(statement)
+            conn.execute(f"PRAGMA user_version = {target}")
+            print(f"스키마 마이그레이션 적용: v{target}", flush=True)
 
 
 def migrate_round_type_check(conn: sqlite3.Connection) -> None:
@@ -1590,6 +1700,8 @@ class EventBot(discord.Client):
         if not self.auto_close_restored:
             self.auto_close_restored = True
             self.restore_auto_close_tasks()
+        # 로그인 + 진행 중이던 라운드 타이머 복구까지 끝나야 배포가 성공으로 처리된다.
+        sd_notify("READY=1")
 
     def schedule_auto_close(self, round_id: int, close_at: float) -> None:
         existing = self.auto_close_tasks.pop(round_id, None)
@@ -3963,6 +4075,23 @@ async def ranking(interaction: discord.Interaction) -> None:
     await interaction.response.send_message(embed=embed, allowed_mentions=discord.AllowedMentions.none())
 
 
+def backup_database(dest: Path) -> None:
+    """SQLite 온라인 백업 API로 DB를 복사한다.
+
+    WAL 모드에서는 최근 커밋이 아직 -wal 파일에만 있을 수 있어서 DB 파일만
+    단순 복사하면 그 내용이 빠진다. backup()은 WAL까지 반영한 일관된 스냅샷을
+    만들고, 봇이 돌고 있는 중에 호출해도 안전하다.
+    """
+    src = sqlite3.connect(DB_PATH, timeout=10.0)
+    dst = sqlite3.connect(dest)
+    try:
+        with dst:
+            src.backup(dst)
+    finally:
+        dst.close()
+        src.close()
+
+
 @bot.tree.command(name="데이터백업", description="SQLite 데이터베이스를 백업합니다.")
 @app_commands.default_permissions()
 @admin_only()
@@ -3976,7 +4105,7 @@ async def backup_data(interaction: discord.Interaction) -> None:
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     backup_path = backup_dir / f"event_game_{timestamp}.sqlite3"
     score_report_path = backup_dir / f"score_report_{timestamp}.csv"
-    shutil.copy2(DB_PATH, backup_path)
+    backup_database(backup_path)
     current_bot_id = str(interaction.client.user.id) if interaction.client.user else ""
     with db() as conn:
         score_rows = fetch_admin_score_rows(conn, current_bot_id)
@@ -3988,14 +4117,79 @@ async def backup_data(interaction: discord.Interaction) -> None:
     )
 
 
+def sd_notify(state: str) -> None:
+    """systemd에 상태를 알린다 (Type=notify).
+
+    on_ready에서 READY=1을 보내므로 `systemctl restart`는 봇이 실제로 디스코드
+    로그인을 마쳐야 성공으로 끝난다. 배포 스크립트는 이 종료 코드만 보면 된다.
+    NOTIFY_SOCKET이 없는 로컬 실행에서는 아무것도 하지 않는다.
+    """
+    address = os.getenv("NOTIFY_SOCKET")
+    if not address or not hasattr(socket, "AF_UNIX"):
+        return
+    if address.startswith("@"):
+        address = "\0" + address[1:]
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as sock:
+            sock.connect(address)
+            sock.sendall(state.encode())
+    except OSError as exc:
+        print(f"sd_notify 실패({state}): {exc}", flush=True)
+
+
+def _install_shutdown_handlers(loop: asyncio.AbstractEventLoop) -> None:
+    """systemd가 보내는 SIGTERM에 게이트웨이를 정상 종료시킨다.
+
+    discord.Client.run()은 SIGTERM을 잡지 않아 프로세스가 정리 없이 즉사하고,
+    처리 중이던 상호작용 응답과 커밋 직전 트랜잭션이 유실된다.
+    """
+    stopping = False
+
+    def request_stop(name: str) -> None:
+        nonlocal stopping
+        if stopping:
+            return
+        stopping = True
+        print(f"{name} 수신. 봇을 정상 종료합니다.", flush=True)
+        sd_notify("STOPPING=1")
+        loop.create_task(bot.close())
+
+    for name in ("SIGTERM", "SIGINT"):
+        sig = getattr(signal, name, None)
+        if sig is None:
+            continue
+        try:
+            loop.add_signal_handler(sig, request_stop, name)
+        except NotImplementedError:
+            # Windows 이벤트 루프는 add_signal_handler를 지원하지 않는다.
+            signal.signal(
+                sig,
+                lambda _sig, _frame, _name=name: loop.call_soon_threadsafe(
+                    request_stop, _name
+                ),
+            )
+
+
+async def run_bot(token: str) -> None:
+    _install_shutdown_handlers(asyncio.get_running_loop())
+    async with bot:
+        await bot.start(token)
+
+
 def main() -> None:
-    load_dotenv(BASE_DIR / ".env")
     token = os.getenv("DISCORD_TOKEN", "").strip()
     if not token:
-        raise RuntimeError(".env 파일에 DISCORD_TOKEN을 설정해주세요.")
+        raise RuntimeError(
+            "DISCORD_TOKEN이 없습니다. 로컬은 .env, 서버는 systemd EnvironmentFile을 확인하세요."
+        )
 
     init_db()
-    bot.run(token)
+    verify_schema()
+    print(f"DB: {DB_PATH} (schema v{SCHEMA_VERSION})", flush=True)
+
+    # bot.run()을 우회하므로 discord.py 로깅을 직접 켠다 (journald로 흘러간다).
+    discord.utils.setup_logging()
+    asyncio.run(run_bot(token))
 
 
 if __name__ == "__main__":

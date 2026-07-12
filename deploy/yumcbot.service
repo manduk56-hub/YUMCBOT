@@ -1,0 +1,50 @@
+[Unit]
+Description=YUMC Discord Event Bot
+Documentation=https://github.com/manduk56-hub/YUMCBOT
+After=network-online.target
+Wants=network-online.target
+# 3회 연속 기동 실패하면 재시작 루프를 포기하고 failed 상태로 간다.
+# 그래야 배포 스크립트가 실패를 감지하고 롤백할 수 있다.
+StartLimitIntervalSec=180
+StartLimitBurst=3
+
+[Service]
+# 봇이 디스코드 로그인을 마치고 sd_notify("READY=1")을 보내야 기동 성공으로 처리된다.
+# 덕분에 `systemctl restart`가 곧 헬스체크가 된다.
+Type=notify
+NotifyAccess=main
+TimeoutStartSec=90
+
+User=yumcbot
+Group=yumcbot
+WorkingDirectory=/opt/yumcbot/current
+EnvironmentFile=/etc/yumcbot/yumcbot.env
+ExecStart=/opt/yumcbot/current/.venv/bin/python -u /opt/yumcbot/current/bot.py
+
+Restart=always
+RestartSec=3
+
+# SIGTERM -> bot.close()로 게이트웨이 정상 종료. 20초 안에 안 끝나면 SIGKILL.
+KillSignal=SIGTERM
+TimeoutStopSec=20
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=yumcbot
+
+# --- 샌드박싱 ---
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+LockPersonality=true
+# DB와 /데이터백업 산출물이 여기 쓰인다. 그 외 파일시스템은 읽기 전용.
+ReadWritePaths=/var/lib/yumcbot
+
+[Install]
+WantedBy=multi-user.target
