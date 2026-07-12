@@ -76,9 +76,10 @@ TRUST_REGISTRATION_DEFAULT_MINUTES = 2
 TRUST_DECISION_SECONDS = 180
 TRUST_MATCH_HISTORY_ROUNDS = 3
 TRUST_OUTCOME_LABELS = {
-    "mutual": "상호 신뢰",
+    "mutual": "신뢰",
     "single": "단독 배신",
     "double": "동시 배신",
+    "incomplete": "미선택",
 }
 MAIN_GAME_TYPES = {"trust", "sand"}
 MINI_GAME_TYPES = {"balance", "defuse4", "grid", "cutting", "top3"}
@@ -210,6 +211,7 @@ def init_db() -> None:
                 round_id INTEGER NOT NULL,
                 user_a_id TEXT NOT NULL,
                 user_b_id TEXT NOT NULL,
+                discussion_thread_id TEXT,
                 created_at TEXT NOT NULL,
                 PRIMARY KEY (round_id, user_a_id),
                 UNIQUE (round_id, user_b_id),
@@ -229,6 +231,7 @@ def init_db() -> None:
         )
         migrate_round_type_check(conn)
         ensure_event_session_schema(conn)
+        ensure_trust_pairing_schema(conn)
 
 
 def migrate_round_type_check(conn: sqlite3.Connection) -> None:
@@ -279,6 +282,15 @@ def ensure_event_session_schema(conn: sqlite3.Connection) -> None:
     }
     if "event_session_id" not in columns:
         conn.execute("ALTER TABLE rounds ADD COLUMN event_session_id INTEGER")
+
+
+def ensure_trust_pairing_schema(conn: sqlite3.Connection) -> None:
+    columns = {
+        str(row["name"])
+        for row in conn.execute("PRAGMA table_info(trust_pairings)").fetchall()
+    }
+    if "discussion_thread_id" not in columns:
+        conn.execute("ALTER TABLE trust_pairings ADD COLUMN discussion_thread_id TEXT")
 
 
 def ensure_user(conn: sqlite3.Connection, user: discord.abc.User) -> None:
@@ -945,8 +957,11 @@ def start_trust_decision(round_id: int) -> dict[str, Any] | None:
             "state": "decision",
             "channel_id": str(round_row["channel_id"]),
             "message_id": str(round_row["message_id"] or ""),
+            "round_id": round_id,
+            "title": str(round_row["title"]),
+            "pairs": pairs,
             "embed": embed,
-            "view": trust_decision_view(round_id),
+            "view": None,
             "close_at": decision_close_at,
         }
 
@@ -964,6 +979,150 @@ async def update_trust_main_message(transition: dict[str, Any]) -> None:
             await channel.send(embed=transition["embed"], view=transition.get("view"))
     except discord.HTTPException:
         return
+
+
+async def create_trust_pair_threads(transition: dict[str, Any]) -> None:
+    if transition.get("state") != "decision":
+        return
+
+    channel = bot.get_channel(int(transition["channel_id"]))
+    if channel is None:
+        try:
+            channel = await bot.fetch_channel(int(transition["channel_id"]))
+        except discord.HTTPException:
+            return
+    if not isinstance(channel, discord.TextChannel):
+        return
+
+    round_id = int(transition["round_id"])
+    title = str(transition["title"])
+    failed_pairs = 0
+    for pair_number, pair in enumerate(transition.get("pairs", []), start=1):
+        user_a_id, user_b_id = (str(pair[0]), str(pair[1]))
+        try:
+            thread = await channel.create_thread(
+                name=f"{title} · {pair_number}세트"[:100],
+                type=discord.ChannelType.private_thread,
+                invitable=False,
+                auto_archive_duration=60,
+                reason=f"신뢰 거래 #{round_id} 세트별 비공개 협상방",
+            )
+            await thread.add_user(discord.Object(id=int(user_a_id)))
+            await thread.add_user(discord.Object(id=int(user_b_id)))
+            await thread.send(
+                (
+                    f"<@{user_a_id}>님과 <@{user_b_id}>님의 비공개 협상방입니다.\n"
+                    "서로 대화한 뒤 아래 버튼으로 `신뢰` 또는 `배신`을 한 번만 확정하세요. "
+                    "선택은 마감 전까지 상대에게 공개되지 않으며, 마감 후 이 방에서 함께 공개됩니다."
+                ),
+                view=trust_decision_view(round_id),
+            )
+            with db() as conn:
+                conn.execute(
+                    """
+                    UPDATE trust_pairings
+                    SET discussion_thread_id = ?
+                    WHERE round_id = ? AND user_a_id = ? AND user_b_id = ?
+                    """,
+                    (str(thread.id), round_id, user_a_id, user_b_id),
+                )
+        except (discord.Forbidden, discord.HTTPException, ValueError):
+            failed_pairs += 1
+
+    if failed_pairs:
+        try:
+            await channel.send(
+                f"신뢰 거래 #{round_id}의 비공개 협상방 {failed_pairs}개를 만들지 못했습니다. "
+                "봇의 비공개 스레드 생성·관리 권한을 확인해주세요."
+            )
+        except discord.HTTPException:
+            pass
+
+
+def build_trust_pair_result_embed(
+    title: str,
+    user_a_id: str,
+    user_b_id: str,
+    user_a_choice: str | None,
+    user_b_choice: str | None,
+) -> discord.Embed:
+    choice_labels = {"trust": "신뢰", "betray": "배신"}
+    if not user_a_choice or not user_b_choice:
+        outcome = "미선택 포함 · 점수 변동 없음"
+    elif user_a_choice == "trust" and user_b_choice == "trust":
+        outcome = "상호 신뢰 · 두 사람 모두 +1점"
+    elif user_a_choice == "betray" and user_b_choice == "betray":
+        outcome = "동시 배신 · 두 사람 모두 -1점"
+    else:
+        betrayer_id = user_a_id if user_a_choice == "betray" else user_b_id
+        outcome = f"단독 배신 · <@{betrayer_id}> +2점, 상대 0점"
+
+    embed = discord.Embed(
+        title=f"세트 결과 · {title}",
+        description="두 사람의 선택이 공개되었습니다.",
+        color=discord.Color.gold(),
+    )
+    embed.add_field(
+        name="서로의 선택",
+        value=(
+            f"<@{user_a_id}>: **{choice_labels.get(user_a_choice, '미선택')}**\n"
+            f"<@{user_b_id}>: **{choice_labels.get(user_b_choice, '미선택')}**"
+        ),
+        inline=False,
+    )
+    embed.add_field(name="세트 정산", value=outcome, inline=False)
+    return embed
+
+
+async def publish_trust_pair_results(round_id: int) -> None:
+    with db() as conn:
+        round_row = conn.execute(
+            "SELECT title FROM rounds WHERE id = ? AND type = 'trust'",
+            (round_id,),
+        ).fetchone()
+        if not round_row:
+            return
+        pairs = conn.execute(
+            """
+            SELECT user_a_id, user_b_id, discussion_thread_id
+            FROM trust_pairings
+            WHERE round_id = ? AND discussion_thread_id IS NOT NULL
+            ORDER BY created_at ASC
+            """,
+            (round_id,),
+        ).fetchall()
+        votes = conn.execute(
+            "SELECT user_id, choice FROM votes WHERE round_id = ?",
+            (round_id,),
+        ).fetchall()
+
+    vote_choices = {str(row["user_id"]): str(row["choice"]) for row in votes}
+    for pair in pairs:
+        thread_id = int(pair["discussion_thread_id"])
+        user_a_id = str(pair["user_a_id"])
+        user_b_id = str(pair["user_b_id"])
+        try:
+            thread = bot.get_channel(thread_id) or await bot.fetch_channel(thread_id)
+            if not isinstance(thread, discord.Thread):
+                continue
+            if thread.archived:
+                await thread.edit(archived=False, reason="신뢰 거래 세트 결과 공개")
+            await thread.send(
+                embed=build_trust_pair_result_embed(
+                    str(round_row["title"]),
+                    user_a_id,
+                    user_b_id,
+                    vote_choices.get(user_a_id),
+                    vote_choices.get(user_b_id),
+                )
+            )
+            await thread.edit(
+                archived=True,
+                locked=True,
+                reason="신뢰 거래 세트 결과 공개 완료",
+            )
+        except (discord.Forbidden, discord.HTTPException, ValueError):
+            continue
 
 
 async def handle_trust_join(interaction: discord.Interaction, round_id: int) -> None:
@@ -1019,12 +1178,22 @@ async def handle_trust_decision(
         pairing = conn.execute(
             """
             SELECT 1 FROM trust_pairings
-            WHERE round_id = ? AND (user_a_id = ? OR user_b_id = ?)
+            WHERE round_id = ?
+              AND (user_a_id = ? OR user_b_id = ?)
+              AND discussion_thread_id = ?
             """,
-            (round_id, str(interaction.user.id), str(interaction.user.id)),
+            (
+                round_id,
+                str(interaction.user.id),
+                str(interaction.user.id),
+                str(interaction.channel_id),
+            ),
         ).fetchone()
         if not pairing:
-            await interaction.response.send_message("랜덤 매칭된 참가자만 신뢰 또는 배신을 선택할 수 있습니다.", ephemeral=True)
+            await interaction.response.send_message(
+                "자신에게 배정된 비공개 협상방에서만 선택할 수 있습니다.",
+                ephemeral=True,
+            )
             return
 
         existing = conn.execute(
@@ -1448,6 +1617,7 @@ class EventBot(discord.Client):
                 transition = start_trust_decision(round_id)
                 if not transition:
                     return
+                await create_trust_pair_threads(transition)
                 await update_trust_main_message(transition)
                 if transition["state"] == "decision":
                     self.schedule_auto_close(round_id, float(transition["close_at"]))
@@ -1467,6 +1637,8 @@ class EventBot(discord.Client):
                 return
 
             _, embed = result
+            if row["type"] == "trust":
+                await publish_trust_pair_results(round_id)
             if hasattr(channel, "send"):
                 await channel.send(embed=embed, view=planned_mini_game_view(round_id))
         except asyncio.CancelledError:
@@ -1896,8 +2068,11 @@ def build_trust_decision_embed(
         description=title,
         color=discord.Color.gold(),
     )
-    pair_lines = [f"<@{user_a_id}> ↔ <@{user_b_id}>" for user_a_id, user_b_id in pairs]
-    embed.add_field(name="랜덤 매칭", value=field_text(pair_lines), inline=False)
+    embed.add_field(
+        name="랜덤 매칭 완료",
+        value=f"총 {len(pairs)}세트의 비공개 협상방을 열었습니다. 각자 초대된 방에서 대화와 선택을 진행하세요.",
+        inline=False,
+    )
     if unmatched_user_id:
         embed.add_field(
             name="매칭 대기",
@@ -1906,7 +2081,7 @@ def build_trust_decision_embed(
         )
     embed.add_field(
         name="선택 규칙 (3분)",
-        value="짝과 공개적으로 협상한 뒤, 아래 버튼으로 `신뢰` 또는 `배신`을 한 번만 확정하세요.",
+        value="비공개 협상방에서 짝과 대화한 뒤 `신뢰` 또는 `배신`을 한 번만 확정하세요. 서로의 선택은 마감 후 해당 방에서 공개됩니다.",
         inline=False,
     )
     return embed
@@ -2450,7 +2625,6 @@ def close_round_record(
                 (round_row["id"],),
             ).fetchall()
             outcome_counts = {choice: 0 for choice in TRUST_OUTCOME_LABELS}
-            result_lines: list[str] = []
 
             for pair in pairs:
                 user_a_id = str(pair["user_a_id"])
@@ -2458,7 +2632,7 @@ def close_round_record(
                 user_a_choice = vote_choices.get(user_a_id)
                 user_b_choice = vote_choices.get(user_b_id)
                 if not user_a_choice or not user_b_choice:
-                    result_lines.append(f"<@{user_a_id}> ↔ <@{user_b_id}>: 미선택 (0점)")
+                    outcome_counts["incomplete"] += 1
                     continue
 
                 if user_a_choice == "trust" and user_b_choice == "trust":
@@ -2472,7 +2646,6 @@ def close_round_record(
                             f"라운드 #{round_row['id']} 신뢰 거래 상호 신뢰",
                             round_row["id"],
                         )
-                    result_lines.append(f"<@{user_a_id}> ↔ <@{user_b_id}>: 상호 신뢰 (각 +1점)")
                 elif user_a_choice == "betray" and user_b_choice == "betray":
                     outcome = "double"
                     for user_id in (user_a_id, user_b_id):
@@ -2484,11 +2657,9 @@ def close_round_record(
                             f"라운드 #{round_row['id']} 신뢰 거래 동시 배신",
                             round_row["id"],
                         )
-                    result_lines.append(f"<@{user_a_id}> ↔ <@{user_b_id}>: 동시 배신 (각 -1점)")
                 else:
                     outcome = "single"
                     betrayer_id = user_a_id if user_a_choice == "betray" else user_b_id
-                    victim_id = user_b_id if betrayer_id == user_a_id else user_a_id
                     add_score(
                         conn,
                         betrayer_id,
@@ -2496,9 +2667,6 @@ def close_round_record(
                         2,
                         f"라운드 #{round_row['id']} 신뢰 거래 단독 배신",
                         round_row["id"],
-                    )
-                    result_lines.append(
-                        f"<@{betrayer_id}> → <@{victim_id}>: 단독 배신 (배신자 +2점, 상대 0점)"
                     )
                 outcome_counts[outcome] += 1
 
@@ -2512,12 +2680,19 @@ def close_round_record(
                 description=round_row["title"],
                 color=discord.Color.gold(),
             )
-            embed.add_field(name="짝별 결과", value=field_text(result_lines), inline=False)
             embed.add_field(
                 name="전체 결과 분포",
                 value=" · ".join(
-                    f"{TRUST_OUTCOME_LABELS[choice]} {count}쌍"
-                    for choice, count in outcome_counts.items()
+                    [
+                        f"신뢰 : {outcome_counts['mutual']}",
+                        f"단독 배신 : {outcome_counts['single']}",
+                        f"동시 배신 : {outcome_counts['double']}",
+                    ]
+                    + (
+                        [f"미선택 : {outcome_counts['incomplete']}"]
+                        if outcome_counts["incomplete"]
+                        else []
+                    )
                 ),
                 inline=False,
             )
@@ -2525,7 +2700,7 @@ def close_round_record(
             if unmatched_user_id:
                 embed.add_field(
                     name="매칭 대기",
-                    value=f"<@{unmatched_user_id}>님은 참여자가 홀수여서 이번 회차에 짝이 배정되지 않았습니다.",
+                    value="1명",
                     inline=False,
                 )
             embed.add_field(
@@ -2774,46 +2949,35 @@ def parse_range_int(value: str, name: str, minimum: int, maximum: int) -> int:
     return number
 
 
-async def ensure_trust_thread_message_permission(interaction: discord.Interaction) -> bool:
+async def ensure_trust_private_thread_permissions(interaction: discord.Interaction) -> bool:
     guild = interaction.guild
     interaction_channel = interaction.channel
-    parent_channel = interaction_channel.parent if isinstance(interaction_channel, discord.Thread) else interaction_channel
-    if guild is None or not isinstance(parent_channel, discord.TextChannel):
+    if guild is None or not isinstance(interaction_channel, discord.TextChannel):
         await interaction.response.send_message(
-            "신뢰 거래는 서버 텍스트 채널에서 시작해주세요.",
+            "신뢰 거래는 스레드가 아닌 서버 텍스트 채널에서 시작해주세요.",
             ephemeral=True,
         )
         return False
-
-    default_role = guild.default_role
-    overwrite = parent_channel.overwrites_for(default_role)
-    if overwrite.send_messages_in_threads is True:
-        return True
 
     bot_member = guild.me
-    if bot_member is None or not parent_channel.permissions_for(bot_member).manage_roles:
-        await interaction.response.send_message(
-            "신뢰 거래 협상방을 열려면 봇에 `역할 관리(Manage Roles)` 권한이 필요합니다. "
-            "권한을 추가한 뒤 다시 시작해주세요.",
-            ephemeral=True,
-        )
+    if bot_member is None:
+        await interaction.response.send_message("서버에서 봇 권한을 확인하지 못했습니다.", ephemeral=True)
         return False
 
-    overwrite.send_messages_in_threads = True
-    try:
-        await parent_channel.set_permissions(
-            default_role,
-            overwrite=overwrite,
-            reason="신뢰 거래 공개 협상방 메시지 허용",
-        )
-    except (discord.Forbidden, discord.HTTPException):
-        await interaction.response.send_message(
-            "이벤트 채널의 `스레드에서 메시지 보내기` 권한을 설정하지 못했습니다. "
-            "봇의 역할 관리 권한과 역할 순서를 확인해주세요.",
-            ephemeral=True,
-        )
-        return False
-    return True
+    permissions = interaction_channel.permissions_for(bot_member)
+    if (
+        permissions.create_private_threads
+        and permissions.send_messages_in_threads
+        and permissions.manage_threads
+    ):
+        return True
+
+    await interaction.response.send_message(
+        "신뢰 거래에는 봇의 `비공개 스레드 만들기`, `스레드에서 메시지 보내기`, "
+        "`스레드 관리` 권한이 필요합니다.",
+        ephemeral=True,
+    )
+    return False
 
 
 class StartSetupModal(discord.ui.Modal):
@@ -3073,7 +3237,7 @@ async def create_round_from_setup(
         await interaction.response.send_message("서버 텍스트 채널에서만 사용할 수 있습니다.", ephemeral=True)
         return
 
-    if 게임 == "trust" and not await ensure_trust_thread_message_permission(interaction):
+    if 게임 == "trust" and not await ensure_trust_private_thread_permissions(interaction):
         return
 
     close_at = time.time() + (int(진행시간분) * 60)
@@ -3454,22 +3618,11 @@ async def create_round_from_setup(
     message = await interaction.original_response()
 
     discussion_thread_id = None
-    if 게임 in {"balance", "grid", "defuse4", "trust"}:
+    if 게임 in {"balance", "grid", "defuse4"}:
         try:
             thread_name = f"{제목} | 토론방"[:100]
             thread = await message.create_thread(name=thread_name)
-            if 게임 == "trust":
-                await thread.send(
-                    "이곳은 작성자가 표시되는 공개 협상방입니다. 참여 등록과 랜덤 매칭이 끝나면 "
-                    "배정된 상대와 신뢰 또는 배신을 두고 협상하세요.",
-                )
-                notice_embed = build_thread_notice_embed(
-                    round_id,
-                    thread,
-                    "거래 협상방이 열렸습니다",
-                    "참여 등록 뒤 봇이 무작위로 둘씩 매칭합니다. 매칭 후 공개 협상방에서 상대와 대화할 수 있습니다.",
-                )
-            elif 게임 == "balance":
+            if 게임 == "balance":
                 await thread.send(
                     "아래 버튼으로 익명 발언을 남겨주세요. 일반 메시지는 익명 보호를 위해 삭제됩니다. "
                     "단, 한 사람당 한 번만 발언 가능합니다.",
@@ -3505,16 +3658,15 @@ async def create_round_from_setup(
                     "해체 토론방이 열렸습니다",
                     "버튼을 눌러 익명으로 관리자의 힌트를 해석해 안전 색을 추리해보세요. 블러핑과 역추리 모두 가능합니다.",
                 )
-            if 게임 != "trust":
-                try:
-                    await thread.edit(
-                        archived=True,
-                        locked=True,
-                        reason="익명 미니게임 토론방: 일반 채팅 차단",
-                    )
-                except discord.HTTPException:
-                    # 권한이 부족한 경우에도 on_message의 삭제 처리로 익명성을 최대한 보호합니다.
-                    pass
+            try:
+                await thread.edit(
+                    archived=True,
+                    locked=True,
+                    reason="익명 미니게임 토론방: 일반 채팅 차단",
+                )
+            except discord.HTTPException:
+                # 권한이 부족한 경우에도 on_message의 삭제 처리로 익명성을 최대한 보호합니다.
+                pass
             await interaction.followup.send(embed=notice_embed)
             discussion_thread_id = str(thread.id)
         except discord.HTTPException:
@@ -3544,19 +3696,21 @@ async def close_round(interaction: discord.Interaction) -> None:
         return
 
     if round_row["type"] == "trust" and round_extra(round_row).get("trust_phase") == "registration":
+        await interaction.response.defer(ephemeral=True)
         transition = start_trust_decision(int(round_row["id"]))
         if not transition:
-            await interaction.response.send_message("참여자 모집을 마감하지 못했습니다.", ephemeral=True)
+            await interaction.followup.send("참여자 모집을 마감하지 못했습니다.", ephemeral=True)
             return
         task = bot.auto_close_tasks.pop(int(round_row["id"]), None)
         if task:
             task.cancel()
+        await create_trust_pair_threads(transition)
         await update_trust_main_message(transition)
         if transition["state"] == "decision":
             bot.schedule_auto_close(int(round_row["id"]), float(transition["close_at"]))
-            await interaction.response.send_message("참여자 모집을 마감하고 랜덤 매칭 및 3분 선택을 시작했습니다.", ephemeral=True)
+            await interaction.followup.send("참여자 모집을 마감하고 랜덤 매칭 및 3분 선택을 시작했습니다.", ephemeral=True)
         else:
-            await interaction.response.send_message("참여자가 부족해 신뢰 거래를 취소했습니다.", ephemeral=True)
+            await interaction.followup.send("참여자가 부족해 신뢰 거래를 취소했습니다.", ephemeral=True)
         return
 
     if round_row["type"] == "sand" and round_extra(round_row).get("sand_phase") == "registration":
@@ -3575,9 +3729,19 @@ async def close_round(interaction: discord.Interaction) -> None:
             await interaction.response.send_message("참여자가 부족해 모래성 게임을 취소했습니다.", ephemeral=True)
         return
 
+    is_trust_decision = (
+        round_row["type"] == "trust"
+        and round_extra(round_row).get("trust_phase") == "decision"
+    )
+    if is_trust_decision:
+        await interaction.response.defer()
+
     result = close_round_record(int(round_row["id"]), interaction.guild)
     if not result:
-        await interaction.response.send_message("현재 열린 라운드가 없습니다.", ephemeral=True)
+        if is_trust_decision:
+            await interaction.edit_original_response(content="현재 열린 라운드가 없습니다.")
+        else:
+            await interaction.response.send_message("현재 열린 라운드가 없습니다.", ephemeral=True)
         return
 
     task = bot.auto_close_tasks.pop(int(round_row["id"]), None)
@@ -3585,10 +3749,17 @@ async def close_round(interaction: discord.Interaction) -> None:
         task.cancel()
 
     _, embed = result
-    await interaction.response.send_message(
-        embed=embed,
-        view=planned_mini_game_view(int(round_row["id"])),
-    )
+    if is_trust_decision:
+        await publish_trust_pair_results(int(round_row["id"]))
+        await interaction.edit_original_response(
+            embed=embed,
+            view=planned_mini_game_view(int(round_row["id"])),
+        )
+    else:
+        await interaction.response.send_message(
+            embed=embed,
+            view=planned_mini_game_view(int(round_row["id"])),
+        )
 
 
 @bot.tree.command(name="이벤트종료", description="개발 중인 현재 이벤트를 남은 게임과 관계없이 강제로 종료합니다.")
@@ -3634,6 +3805,28 @@ async def force_end_event(interaction: discord.Interaction) -> None:
                     )
             except (discord.HTTPException, ValueError):
                 pass
+
+        if round_row["type"] == "trust":
+            with db() as conn:
+                pair_threads = conn.execute(
+                    """
+                    SELECT discussion_thread_id FROM trust_pairings
+                    WHERE round_id = ? AND discussion_thread_id IS NOT NULL
+                    """,
+                    (int(round_row["id"]),),
+                ).fetchall()
+            for pair_thread in pair_threads:
+                try:
+                    pair_thread_id = int(pair_thread["discussion_thread_id"])
+                    thread = bot.get_channel(pair_thread_id) or await bot.fetch_channel(pair_thread_id)
+                    if isinstance(thread, discord.Thread):
+                        await thread.edit(
+                            archived=True,
+                            locked=True,
+                            reason="개발용 이벤트 강제 종료",
+                        )
+                except (discord.HTTPException, ValueError):
+                    pass
 
     if event_row["message_id"]:
         try:

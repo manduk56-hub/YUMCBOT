@@ -134,6 +134,57 @@ class BotRegressionTests(unittest.TestCase):
         for removed in ("토론 발언", "마감 방식", "진행 시간", "예정 마감"):
             self.assertNotIn(removed, rendered)
 
+    def test_trust_public_result_only_shows_aggregate_counts(self) -> None:
+        with bot.db() as conn:
+            cursor = conn.execute(
+                """
+                INSERT INTO rounds (type, title, question, status, channel_id, extra_json, created_at)
+                VALUES ('trust', '신뢰 테스트', '신뢰 테스트', 'open', '10', ?, '2026-01-01 00:00:00')
+                """,
+                (json.dumps({"trust_phase": "decision"}),),
+            )
+            round_id = int(cursor.lastrowid)
+            conn.execute(
+                """
+                INSERT INTO trust_pairings (round_id, user_a_id, user_b_id, created_at)
+                VALUES (?, '1', '2', '2026-01-01 00:00:00')
+                """,
+                (round_id,),
+            )
+            conn.executemany(
+                """
+                INSERT INTO votes (round_id, user_id, choice, created_at, updated_at)
+                VALUES (?, ?, ?, '2026-01-01 00:00:00', '2026-01-01 00:00:00')
+                """,
+                [(round_id, "1", "trust"), (round_id, "2", "betray")],
+            )
+
+        result = bot.close_round_record(round_id, None)
+
+        self.assertIsNotNone(result)
+        rendered = json.dumps(result[1].to_dict(), ensure_ascii=False)
+        self.assertIn("신뢰 : 0 · 단독 배신 : 1 · 동시 배신 : 0", rendered)
+        self.assertNotIn("쌍", rendered)
+        self.assertNotIn("짝별 결과", rendered)
+        self.assertNotIn("<@1>", rendered)
+        self.assertNotIn("<@2>", rendered)
+
+    def test_trust_private_result_reveals_both_choices(self) -> None:
+        embed = bot.build_trust_pair_result_embed("신뢰 테스트", "1", "2", "trust", "betray")
+        rendered = json.dumps(embed.to_dict(), ensure_ascii=False)
+
+        self.assertIn("<@1>: **신뢰**", rendered)
+        self.assertIn("<@2>: **배신**", rendered)
+        self.assertIn("단독 배신", rendered)
+
+    def test_trust_pairings_schema_stores_private_thread(self) -> None:
+        with bot.db() as conn:
+            columns = {
+                row["name"] for row in conn.execute("PRAGMA table_info(trust_pairings)").fetchall()
+            }
+
+        self.assertIn("discussion_thread_id", columns)
+
     def test_force_close_current_event_cancels_open_round_without_scoring(self) -> None:
         self.add_user("1", "참가자", 5)
         with bot.db() as conn:
