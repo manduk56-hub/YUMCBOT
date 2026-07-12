@@ -1143,7 +1143,7 @@ async def create_trust_pair_threads(transition: dict[str, Any]) -> None:
             await thread.send(
                 (
                     f"<@{user_a_id}>님과 <@{user_b_id}>님의 비공개 협상방입니다.\n"
-                    "서로 대화한 뒤 아래 버튼으로 `신뢰` 또는 `배신`을 한 번만 확정하세요. "
+                    "서로 마음껏 대화한 뒤 아래 버튼으로 `신뢰` 또는 `배신`을 선택하세요.(*한번 선택하면 되돌릴 수 없습니다!)\n"
                     "선택은 마감 전까지 상대에게 공개되지 않으며, 마감 후 이 방에서 함께 공개됩니다."
                 ),
                 view=trust_decision_view(round_id),
@@ -1281,7 +1281,7 @@ async def handle_trust_join(interaction: discord.Interaction, round_id: int) -> 
             (round_id, str(interaction.user.id)),
         ).fetchone()
         if existing:
-            await interaction.response.send_message("이미 오늘의 신뢰 거래에 참여 등록했습니다.", ephemeral=True)
+            await interaction.response.send_message("이미 오늘의 메인 게임에 참여 등록했습니다.", ephemeral=True)
             return
 
         ensure_user(conn, interaction.user)
@@ -1343,7 +1343,7 @@ async def handle_trust_decision(
             """,
             (round_id, str(interaction.user.id), choice, now_text(), now_text()),
         )
-    await interaction.response.send_message("선택을 비공개로 확정했습니다.", ephemeral=True)
+    await interaction.response.send_message("선택을 확정했습니다.", ephemeral=True)
 
 
 def start_sand_game(round_id: int) -> dict[str, Any] | None:
@@ -1558,9 +1558,9 @@ async def handle_sand_number(
     suffix = (
         f" 두 사람의 선택이 끝났습니다. {'내 차례입니다.' if current_user_id == user_id else f'<@{current_user_id}>님의 차례입니다.'}"
         if both_selected
-        else " 상대의 비공개 선택을 기다립니다."
+        else " 상대의 선택을 기다립니다."
     )
-    await refresh_or_finish_sand_round(interaction, round_id, f"`{number}`을 비공개로 확정했습니다.{suffix}")
+    await refresh_or_finish_sand_round(interaction, round_id, f"`{number}`을 확정했습니다.{suffix}")
 
 
 async def handle_sand_action(
@@ -1645,7 +1645,7 @@ async def handle_sand_action(
                             "raw_difference": raw_difference,
                         }
                     )
-                    private_message = "모래를 덜다가 무너졌습니다. 무너진 차례의 참가자는 -1점입니다."
+                    private_message = "모래를 덜다가 무너졌습니다. -1점입니다."
             elif phase == "awaiting_quit_response":
                 quitter_id = str(pair["quitter_id"])
                 pair.update(
@@ -2147,17 +2147,17 @@ def build_trust_registration_embed(round_id: int, title: str, registration_minut
         color=discord.Color.dark_gold(),
     )
     embed.add_field(
-        name="진행 순서",
-        value=(
-            f"매칭 준비 {registration_minutes}분 → 무작위 2인 1세트 매칭 → 신뢰/배신 선택 3분 → 점수 정산 → 미니게임"
-        ),
+        name="진행 게임",
+        value="신뢰 or 배신",
         inline=False,
     )
     embed.add_field(
         name="메인 규칙",
         value=(
-            "이벤트 오픈 때 `참여하기`를 누른 유저가 자동으로 참가합니다. 준비 시간이 끝나면 봇이 참가자를 무작위로 둘씩 매칭합니다.\n"
-            "참여자가 홀수면 한 명은 이번 회차 매칭 대기이며, 나머지만 2명씩 게임을 진행합니다. 상호 신뢰는 각 +1점, 단독 배신은 배신자 +2점·상대 0점, 동시 배신은 각 -1점입니다."
+            "무작위로 매칭된 두 명의 참가자가 신뢰와 배신을 선택합니다.\n"
+            "- 상호 신뢰 시 : 각 +1점\n"
+            "- 한명만 배신 시 : 배신자 +2점\n"
+            "- 동시 배신 시 : 각 -1점"
         ),
         inline=False,
     )
@@ -2209,12 +2209,15 @@ def build_trust_decision_embed(
     if unmatched_user_id:
         embed.add_field(
             name="매칭 대기",
-            value=f"<@{unmatched_user_id}>님은 참여자가 홀수여서 이번 회차에는 짝이 배정되지 않았습니다.",
+            value=f"<@{unmatched_user_id}>님, 참여자가 홀수이므로 새 참가자가 긴급 투입중입니다. 잠시만 기다려주세요!",
             inline=False,
         )
     embed.add_field(
         name="선택 규칙 (3분)",
-        value="비공개 협상방에서 짝과 대화한 뒤 `신뢰` 또는 `배신`을 한 번만 확정하세요. 서로의 선택은 마감 후 해당 방에서 공개됩니다.",
+        value=(
+            "비공개 협상방에서 매칭된 짝과 대화한 뒤 `신뢰` 또는 `배신`을 선택하세요. 서로의 선택은 마감 후 해당 방에서 공개됩니다.\n"
+            "*한번 선택하면 되돌릴 수 없습니다! 주의하세요."
+        ),
         inline=False,
     )
     return embed
@@ -2244,11 +2247,8 @@ def trust_decision_view(round_id: int) -> discord.ui.View:
 def build_sand_registration_embed(round_id: int, title: str, registration_minutes: int) -> discord.Embed:
     embed = discord.Embed(title=title, description=title, color=discord.Color.from_rgb(218, 165, 90))
     embed.add_field(
-        name="진행 순서",
-        value=(
-            f"매칭 준비 {registration_minutes}분 → 무작위 1:1 매칭 → 각자 비공개 숫자 선택 → "
-            "번갈아 포기/모래 덜기 → 정산 → 미니게임"
-        ),
+        name="진행 게임",
+        value="모래성 게임",
         inline=False,
     )
     embed.add_field(
@@ -2285,7 +2285,7 @@ def build_sand_play_embed(round_row: sqlite3.Row, extra: dict[str, Any]) -> disc
         phase = str(pair.get("phase"))
         if phase == "number_selection":
             selected = int(pair.get("number_a") is not None) + int(pair.get("number_b") is not None)
-            status = f"비공개 숫자 선택 {selected}/2"
+            status = f"숫자를 고르세요(번복 불가) : {selected}/2"
         elif phase == "active":
             status = (
                 f"<@{pair['current_user_id']}> 차례 · 성공한 모래 덜기 "
@@ -2301,7 +2301,7 @@ def build_sand_play_embed(round_row: sqlite3.Row, extra: dict[str, Any]) -> disc
     if unmatched_user_id:
         embed.add_field(
             name="매칭 대기",
-            value=f"<@{unmatched_user_id}>님은 참여자가 홀수여서 이번 회차에 짝이 배정되지 않았습니다.",
+            value=f"<@{unmatched_user_id}>님, 참여자가 홀수이므로 새 참가자가 긴급 투입중입니다. 잠시만 기다려주세요!",
             inline=False,
         )
     embed.add_field(
