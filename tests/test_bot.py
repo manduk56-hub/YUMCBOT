@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import csv
 import json
 import tempfile
 import unittest
@@ -87,6 +88,31 @@ class BotRegressionTests(unittest.TestCase):
         self.assertEqual([row["user_id"] for row in shuffled_rows], ["100", "300", "200", "400"])
         self.assertEqual([row["total_score"] for row in shuffled_rows], [9, 7, 7, 3])
         shuffle.assert_called_once()
+
+    def test_admin_score_report_records_user_names_and_scores(self) -> None:
+        report_path = Path(self.temp_dir.name) / "score_report.csv"
+        rows = [
+            {
+                "user_id": "200",
+                "display_name": "첫번째 참가자",
+                "total_score": 7,
+                "updated_at": "2026-01-01 00:00:00",
+            },
+            {
+                "user_id": "300",
+                "display_name": "두번째 참가자",
+                "total_score": 4,
+                "updated_at": "2026-01-01 00:00:01",
+            },
+        ]
+
+        bot.write_admin_score_report(report_path, rows)
+
+        with report_path.open("r", encoding="utf-8-sig", newline="") as report_file:
+            report_rows = list(csv.DictReader(report_file))
+        self.assertEqual(report_rows[0]["display_name"], "첫번째 참가자")
+        self.assertEqual(report_rows[0]["total_score"], "7")
+        self.assertEqual(report_rows[1]["user_id"], "300")
 
     def test_sand_registration_transitions_to_playing(self) -> None:
         self.add_user("1", "참가자1", 0)

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import csv
 import json
 import os
 import random
@@ -472,6 +473,26 @@ def fetch_ranking_rows(conn: sqlite3.Connection, current_bot_id: str) -> list[sq
         """,
         (current_bot_id,),
     ).fetchall()
+
+
+def fetch_admin_score_rows(conn: sqlite3.Connection, current_bot_id: str) -> list[sqlite3.Row]:
+    return conn.execute(
+        """
+        SELECT user_id, display_name, total_score, updated_at
+        FROM users
+        WHERE user_id != ?
+        ORDER BY total_score DESC, updated_at ASC
+        """,
+        (current_bot_id,),
+    ).fetchall()
+
+
+def write_admin_score_report(path: Path, rows: list[sqlite3.Row]) -> None:
+    with path.open("w", encoding="utf-8-sig", newline="") as report_file:
+        writer = csv.writer(report_file)
+        writer.writerow(["user_id", "display_name", "total_score", "updated_at"])
+        for row in rows:
+            writer.writerow([row["user_id"], row["display_name"], row["total_score"], row["updated_at"]])
 
 
 def shuffle_tied_ranking_rows(rows: list[sqlite3.Row]) -> list[sqlite3.Row]:
@@ -3952,9 +3973,19 @@ async def backup_data(interaction: discord.Interaction) -> None:
 
     backup_dir = DATA_DIR / "backups"
     backup_dir.mkdir(parents=True, exist_ok=True)
-    backup_path = backup_dir / f"event_game_{datetime.now().strftime('%Y%m%d_%H%M%S')}.sqlite3"
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    backup_path = backup_dir / f"event_game_{timestamp}.sqlite3"
+    score_report_path = backup_dir / f"score_report_{timestamp}.csv"
     shutil.copy2(DB_PATH, backup_path)
-    await interaction.response.send_message(f"백업 완료: `{backup_path.name}`", ephemeral=True)
+    current_bot_id = str(interaction.client.user.id) if interaction.client.user else ""
+    with db() as conn:
+        score_rows = fetch_admin_score_rows(conn, current_bot_id)
+    write_admin_score_report(score_report_path, score_rows)
+    await interaction.response.send_message(
+        f"백업 완료: `{backup_path.name}`\n관리자 점수 데이터: `{score_report_path.name}`",
+        file=discord.File(score_report_path, filename=score_report_path.name),
+        ephemeral=True,
+    )
 
 
 def main() -> None:
