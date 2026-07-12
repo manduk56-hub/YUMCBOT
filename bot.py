@@ -3489,7 +3489,7 @@ async def create_round_from_setup(
             )
             round_id = int(cursor.lastrowid)
             embed = build_trust_registration_embed(round_id, 제목, int(진행시간분))
-            view = None
+            view = discord.utils.MISSING
         elif 게임 == "sand":
             extra.update(
                 {
@@ -3514,7 +3514,7 @@ async def create_round_from_setup(
             )
             round_id = int(cursor.lastrowid)
             embed = build_sand_registration_embed(round_id, 제목, int(진행시간분))
-            view = None
+            view = discord.utils.MISSING
         elif 게임 == "top3":
             rows = conn.execute(
                 """
