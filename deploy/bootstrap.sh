@@ -22,7 +22,8 @@ if [[ $EUID -ne 0 ]]; then
 fi
 
 echo "==> 패키지 설치"
-dnf install -y "$PYTHON" "$PYTHON-devel" git rsync policycoreutils
+# libicu: GitHub Actions 러너가 .NET 기반이라 ICU가 없으면 config.sh가 실행되지 않는다.
+dnf install -y "$PYTHON" "$PYTHON-devel" git rsync policycoreutils curl tar libicu
 
 echo "==> 서비스 계정 $APP_USER"
 if ! id -u "$APP_USER" &>/dev/null; then
@@ -62,6 +63,7 @@ fi
 
 echo "==> 배포 스크립트 설치"
 install -o root -g root -m 755 "$HERE/deploy.sh" /usr/local/bin/yumcbot-deploy
+install -o root -g root -m 755 "$HERE/setup-runner.sh" /usr/local/bin/yumcbot-setup-runner
 
 echo "==> systemd 유닛"
 install -o root -g root -m 644 "$HERE/yumcbot.service" /etc/systemd/system/yumcbot.service
@@ -86,6 +88,13 @@ fi
 
 echo
 echo "완료. 다음 순서로 마무리하세요:"
-echo "  1) $ENV_FILE 에 DISCORD_TOKEN, GUILD_ID 입력"
-echo "  2) GitHub Actions self-hosted runner를 $APP_USER 계정으로 등록 (deploy/README.md 참고)"
+echo
+echo "  1) 운영 봇의 디스코드 토큰 입력"
+echo "       sudo vi $ENV_FILE          # DISCORD_TOKEN, GUILD_ID"
+echo
+echo "  2) GitHub Actions 러너 등록"
+echo "     GitHub 저장소 -> Settings -> Actions -> Runners -> New self-hosted runner"
+echo "     화면에 뜨는 등록 토큰(AXXXX..., 1시간 유효)을 복사해서:"
+echo "       sudo yumcbot-setup-runner <등록토큰>"
+echo
 echo "  3) main 브랜치에 push하면 자동 배포됩니다"

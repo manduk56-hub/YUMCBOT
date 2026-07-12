@@ -60,28 +60,33 @@ sudo vi /etc/yumcbot/yumcbot.env   # DISCORD_TOKEN(운영 봇), GUILD_ID 입력
 
 ### GitHub Actions self-hosted runner 등록
 
-서버가 GitHub로 아웃바운드 연결만 하므로 공인 IP나 포트 개방이 필요 없습니다.
+서버가 GitHub로 **아웃바운드 연결만** 합니다. 공인 IP도, 포트 개방도, SSH 키도,
+GitHub Secrets도 필요 없습니다. 워크플로우 어디에도 서버 주소가 들어가지 않습니다.
 
-GitHub 저장소 → Settings → Actions → Runners → New self-hosted runner (Linux x64)에서
-토큰을 받아 **`yumcbot` 계정으로** 등록합니다:
+1. GitHub 저장소 → Settings → Actions → Runners → **New self-hosted runner** → Linux x64
+2. 화면에 `AXXXX...` 형태의 **등록 토큰**이 표시됩니다 (유효기간 1시간)
+3. 서버에서:
 
 ```bash
-sudo -u yumcbot -H bash
-mkdir -p /opt/yumcbot/runner && cd /opt/yumcbot/runner
-curl -o actions-runner.tar.gz -L <페이지에 표시된 URL>
-tar xzf actions-runner.tar.gz
-./config.sh --url https://github.com/manduk56-hub/YUMCBOT \
-            --token <페이지에 표시된 토큰> \
-            --labels yumcbot-prod \
-            --unattended
-exit
-
-# 부팅 시 자동 시작
-sudo /opt/yumcbot/runner/svc.sh install yumcbot
-sudo /opt/yumcbot/runner/svc.sh start
+sudo yumcbot-setup-runner <등록토큰>
 ```
 
-라벨 `yumcbot-prod`가 `deploy.yml`의 `runs-on`과 일치해야 합니다.
+이 한 줄이 러너 다운로드 → `yumcbot` 계정으로 등록 → systemd 서비스 등록까지 처리합니다.
+끝나면 Runners 목록에 `Idle` 상태로 나타납니다.
+
+등록 토큰은 `config.sh`가 **영구 자격증명(`.credentials`)으로 교환**하는 순간 역할이
+끝납니다. 따로 보관할 필요가 없습니다.
+
+**러너를 봇과 같은 `yumcbot` 계정으로 돌리는 이유:** 배포 스크립트가 `/opt/yumcbot/releases`에
+릴리스를 쓰는데, 계정이 같으면 별도 권한이 필요 없습니다. 권한이 필요한 건 서비스 재시작뿐이고
+그것만 sudoers로 좁게 열어뒀습니다 (`systemctl restart yumcbot` 등).
+
+라벨 `yumcbot-prod`가 `deploy.yml`의 `runs-on`과 일치해야 합니다. 안 맞으면 deploy 잡이
+러너를 찾지 못하고 계속 대기합니다.
+
+```bash
+sudo /opt/yumcbot/runner/svc.sh status   # 러너 상태
+```
 
 ---
 
