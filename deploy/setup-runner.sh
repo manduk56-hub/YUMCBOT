@@ -52,9 +52,19 @@ rm -f "/tmp/$TARBALL"
 chown -R "$APP_USER:$APP_USER" "$RUNNER_DIR"
 
 echo "==> 러너 등록 (labels: $LABELS)"
+# config.sh와 svc.sh는 pwd를 러너 루트로 가정한다. cd 없이 절대 경로로 부르면
+# "Must run from runner root or install is corrupt" 로 실패한다.
+cd "$RUNNER_DIR"
+
 # 봇을 실행하는 계정과 동일하게 돌린다. 그래야 배포 스크립트가 /opt/yumcbot/releases 를
 # 별도 권한 없이 쓸 수 있다. 권한이 필요한 건 systemctl 재시작뿐이고, 그건 sudoers로 좁게 열어놨다.
-sudo -u "$APP_USER" "$RUNNER_DIR/config.sh" \
+#
+# PATH를 명시적으로 넘기는 이유: config.sh는 등록 시점의 PATH를 .path 파일에 굳혀두고
+# 러너가 잡을 실행할 때 그대로 쓴다. sudo의 secure_path(/usr/local/bin 없음)가 굳어버리면
+# 배포 잡에서 yumcbot-deploy를 찾지 못한다.
+sudo -u "$APP_USER" \
+    env "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
+    ./config.sh \
     --url "$REPO_URL" \
     --token "$TOKEN" \
     --labels "$LABELS" \
@@ -64,8 +74,8 @@ sudo -u "$APP_USER" "$RUNNER_DIR/config.sh" \
     --replace
 
 echo "==> systemd 서비스 등록 (재부팅 후 자동 시작)"
-"$RUNNER_DIR/svc.sh" install "$APP_USER"
-"$RUNNER_DIR/svc.sh" start
+./svc.sh install "$APP_USER"
+./svc.sh start
 
 echo
 echo "완료. GitHub 저장소 -> Settings -> Actions -> Runners 에서"

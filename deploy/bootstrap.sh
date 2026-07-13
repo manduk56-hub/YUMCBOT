@@ -109,6 +109,7 @@ echo
 echo "  2) GitHub Actions 러너 등록"
 echo "     GitHub 저장소 -> Settings -> Actions -> Runners -> New self-hosted runner"
 echo "     화면에 뜨는 등록 토큰(AXXXX..., 1시간 유효)을 복사해서:"
-echo "       sudo yumcbot-setup-runner <등록토큰>"
+echo "       sudo /usr/local/bin/yumcbot-setup-runner <등록토큰>"
+echo "     (전체 경로로 부를 것. RHEL 계열은 sudo의 secure_path에 /usr/local/bin이 없다)"
 echo
 echo "  3) main 브랜치에 push하면 자동 배포됩니다"

@@ -45,12 +45,14 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: 배포
+        # 절대 경로로 부른다. 러너의 PATH는 등록 시점의 .path 파일에 굳어 있어서
+        # /usr/local/bin 이 들어 있다는 보장이 없다 (sudo secure_path 로 등록되면 빠진다).
         run: |
           FORCE=""
           if [ "${{ inputs.force }}" = "true" ]; then
             FORCE="--force"
           fi
-          yumcbot-deploy "$GITHUB_SHA" "$GITHUB_WORKSPACE" $FORCE
+          /usr/local/bin/yumcbot-deploy "$GITHUB_SHA" "$GITHUB_WORKSPACE" $FORCE
 
       - name: 서비스 상태
         if: always()

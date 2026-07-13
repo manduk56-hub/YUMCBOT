@@ -94,11 +94,17 @@ GitHub Secrets도 필요 없습니다. 워크플로우 어디에도 서버 주�
 3. 서버에서:
 
 ```bash
-sudo yumcbot-setup-runner <등록토큰>
+sudo /usr/local/bin/yumcbot-setup-runner <등록토큰>
 ```
+
+**반드시 전체 경로로 부르세요.** RHEL 계열은 `sudo`의 `secure_path`에 `/usr/local/bin`이
+없어서 이름만 쓰면 `command not found`가 납니다.
 
 이 한 줄이 러너 다운로드 → `yumcbot` 계정으로 등록 → systemd 서비스 등록까지 처리합니다.
 끝나면 Runners 목록에 `Idle` 상태로 나타납니다.
+
+러너는 등록 시점의 PATH를 `/opt/yumcbot/runner/.path`에 굳혀두고 잡 실행에 그대로 씁니다.
+그래서 `deploy.yml`은 `yumcbot-deploy`를 **절대 경로로** 호출합니다.
 
 등록 토큰은 `config.sh`가 **영구 자격증명(`.credentials`)으로 교환**하는 순간 역할이
 끝납니다. 따로 보관할 필요가 없습니다.
