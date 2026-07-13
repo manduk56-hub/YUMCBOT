@@ -1,0 +1,119 @@
+# CLAUDE.md
+
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+
+방학 이벤트용 Discord 봇. 이벤트마다 **메인게임 1개 + 미니게임 1개**를 진행하고 점수를 SQLite에 누적한다.
+운영 봇은 Rocky Linux 서버에서 systemd로 24시간 돌고, `main` 머지 시 GitHub Actions가 자동 배포한다.
+
+## 명령어
+
+파이썬 **3.12** (운영 서버와 버전을 맞춘다).
+
+```powershell
+.\run.ps1                                   # 봇 실행 (.venv 없으면 자동 생성 + 의존성 설치)
+
+python -m unittest discover -s tests -v     # 전체 테스트
+python -m unittest tests.test_bot -v        # 파일 단위
+python -m unittest tests.test_bot.BotRegressionTests.test_sand_registration_transitions_to_playing   # 단일 테스트
+
+python -m compileall -q bot.py deploy/check_idle.py   # CI가 도는 문법 검사
+shellcheck deploy/*.sh                                # CI가 도는 배포 스크립트 검사
+```
+
+테스트는 `bot.DB_PATH`를 임시 디렉터리로 patch해서 돈다. 디스코드 연결 없이 순수 함수와 DB 로직만 검증한다.
+
+## 개발자마다 전용 Discord 앱이 필요하다
+
+같은 봇 토큰으로 두 프로세스를 띄우면 게이트웨이 세션이 둘 붙어서 **모든 버튼/명령이 두 번씩 처리된다**
+(점수 2배 지급, 라운드 두 번 정산). 길드가 달라도 마찬가지다. 운영 봇 토큰을 로컬 `.env`에 넣지 말 것.
+
+`.env`: `DISCORD_TOKEN`(본인 dev 봇), `GUILD_ID`(있으면 슬래시 명령어 즉시 동기화), `OPERATOR_ROLE_IDS`, `YUMCBOT_DATA_DIR`(선택).
+
+## 아키텍처
+
+전체 로직이 `bot.py` 한 파일(~4200줄)에 있다. 대략적인 구역 순서:
+
+상수/게임 설정 → 스키마·마이그레이션 → DB 헬퍼 → 게임별 상태 전이 함수 → `EventBot` 클래스 →
+embed/view 빌더 → `close_round_record`(정산) → 슬래시 명령어 → systemd 연동/엔트리포인트.
+
+### 상태는 전부 SQLite에 있다 (재시작 안전성)
+
+배포는 봇을 3~5초 재시작한다. 이게 안전한 이유가 곧 코드의 핵심 제약이다:
+
+- **버튼은 `discord.ui.View` 콜백이 아니라 `EventBot.on_interaction`에서 `custom_id`를 파싱해 처리한다.**
+  `custom_id` 형식은 `eventbot:<action>:<round_id>[:<choice>]`. 덕분에 이미 채널에 뿌려진 버튼이
+  재시작 후에도 그대로 동작한다. **새 버튼을 추가할 때 View 콜백(`@discord.ui.button`)에 로직을 넣지 말 것.**
+  뷰 빌더는 `custom_id`만 붙이고, 핸들러는 `on_interaction`의 디스패치에 등록한다.
+- 라운드 상태를 메모리에 들고 있지 않는다. 게임별 진행 상태는 `rounds.extra_json`(JSON)에 넣는다
+  (`trust_phase`, `sand_phase`, `auto_close_at`, `planned_mini_game` 등).
+- 자동 마감 타이머는 부팅 시 `EventBot.restore_auto_close_tasks()`가 `extra_json.auto_close_at`으로 DB에서 복구한다.
+
+### 이벤트/라운드 모델
+
+`event_sessions`(`recruiting` → `active` → `closed`)가 상위, `rounds`가 그 아래 게임 하나.
+`/오픈`으로 세션을 열고 `event_participants`에 참가자를 모은다. `can_join_round()`가
+**`참여하기`를 누른 유저만** 투표/토론할 수 있게 막는다. `/start` 시점에 명단이 마감된다.
+
+정산은 전부 `close_round_record()`의 타입별 분기에서 이뤄지고 `add_score()`가 `users.total_score`와
+`score_logs`를 함께 갱신한다.
+
+### 게임 타입 이름 주의
+
+`rounds.type` CHECK 제약은 `('balance','bomb','grid','cutting','top3','trust','sand')`인데, 실제 게임 목록과 다르다.
+
+- **미니게임 "4선 폭탄 해체"의 코드상 이름은 `defuse4`이고 DB에는 `bomb`으로 저장된다** (`extra_json.mode = "defuse4"`).
+- **`grid`(관리자 시점 타일)는 제거된 게임이다.** `BASE_SCHEMA`가 불변이라 CHECK 제약에서 뺄 수 없어 값만 남아 있다.
+  `close_round_record`의 마지막 `else`가 이런 옛 라운드를 점수 없이 마감한다.
+
+권위 있는 목록은 `MAIN_GAME_TYPES` / `MINI_GAME_TYPES` / `GAME_NAMES` 상수다. CHECK 제약이 아니다.
+
+### 스키마 변경
+
+**`BASE_SCHEMA`(v1)는 절대 수정하지 않는다.** `tests/test_schema.py`가 SHA256 체크섬으로 고정해두었다.
+수정하면 새로 만든 DB와 운영 DB의 스키마가 조용히 갈라진다.
+
+스키마 추가는 `MIGRATIONS`에 등록한다. `SCHEMA_VERSION`은 자동 계산되고, 부팅 시 `init_db()`가
+`PRAGMA user_version`을 보고 밀린 것만 적용한다. 현재 최신은 **v2**(`discussion_messages` 테이블).
+
+```python
+MIGRATIONS: dict[int, list[str]] = {
+    3: ["ALTER TABLE rounds ADD COLUMN memo TEXT"],
+}
+```
+
+롤백 가능해야 하므로 **반드시 추가 형태**(`ADD COLUMN`, `CREATE TABLE` 등)로만. 컬럼 삭제/이름 변경/
+제약 변경은 구버전 코드로 되돌아갈 수 없게 만든다. 마이그레이션을 빠뜨리면 `verify_schema()`가 부팅을
+막는다 — 이게 없으면 봇이 로그인까지 성공해놓고(배포 헬스체크 통과) 게임 도중 `no such column`으로 터진다.
+
+기존 테이블의 PK를 바꿔야 하는 변경은 불가능하다. `discussion_posts`(PK `(round_id, user_id)`)의
+1인 1회 제약을 풀 때 그 테이블을 고치는 대신 `discussion_messages`를 새로 만든 것이 그 사례다.
+`discussion_posts`는 과거 데이터를 위해 남아 있을 뿐 더 이상 쓰지 않는다.
+
+### systemd 연동
+
+서비스가 `Type=notify`라서, 봇이 디스코드 로그인 + 타이머 복구를 마치고 `on_ready`에서
+`sd_notify("READY=1")`을 보내야 `systemctl restart`가 성공으로 끝난다. **재시작 명령의 종료 코드가 곧 헬스체크다.**
+기동에 실패하면 배포 스크립트가 이전 릴리스로 자동 롤백한다.
+
+## DB 위치
+
+| | 경로 |
+|---|---|
+| 로컬 | `data/event_game.sqlite3` (gitignore) |
+| 운영 | `/var/lib/yumcbot/data/event_game.sqlite3` — 코드 트리(`/opt/yumcbot`) 밖이라 배포로 덮이지 않는다 |
+
+## 브랜치 / 배포
+
+```
+feature/*  각자 로컬에서 본인 dev 봇으로 개발
+develop    통합 브랜치. 배포 없음
+main       운영 봇. PR 머지 시 자동 배포
+```
+
+배포 전 `deploy/check_idle.py`가 **진행 중인 라운드/이벤트가 있으면 배포를 거부한다**
+(Actions에서 `force: true`로 무시 가능).
+
+`deploy/` 아래 스크립트와 `yumcbot.service`는 **배포로 갱신되지 않는다.** 배포가 갈아끼우는 건 앱 코드뿐이다.
+수정했다면 서버에서 `bootstrap.sh`를 다시 돌려야 한다. 서버 셋업/배포 동작 상세는 `deploy/README.md`.
+
+`.gitattributes`가 `*.sh` / `*.service` / `deploy/*.py`를 LF로 고정한다. CRLF로 체크아웃되면 shebang이 깨진다.

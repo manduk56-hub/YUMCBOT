@@ -31,10 +31,76 @@ class BotRegressionTests(unittest.TestCase):
                 (user_id, display_name, score),
             )
 
-    def test_score_message_uses_plain_display_name(self) -> None:
-        message = bot.format_score_message("테스터", 7)
-        self.assertEqual(message, "테스터 현재 점수: **7점**")
+    def test_my_score_message_shows_only_scores(self) -> None:
+        message = bot.format_my_score_message(7, 5)
+        self.assertEqual(message, "3등 점수: **7점**\n내 점수: **5점**")
         self.assertNotIn("<@", message)
+
+    def test_my_score_message_without_third_place(self) -> None:
+        self.assertIn("아직 없음", bot.format_my_score_message(None, 2))
+
+    def test_third_place_is_fixed_to_one_user_when_tied(self) -> None:
+        """3등이 동점이어도 항상 같은 한 명이 3등으로 뽑혀야 한다.
+
+        점수가 그대로인 한 몇 번을 조회해도 같은 유저·같은 점수가 나와야 하고,
+        그래야 '3등이 두 명이구나'를 유저가 눈치챌 수 없다.
+        """
+        self.add_user("100", "봇", 0)
+        self.add_user("200", "1등", 9)
+        self.add_user("300", "공동 3등 A", 4)
+        self.add_user("400", "2등", 7)
+        self.add_user("500", "공동 3등 B", 4)
+        with bot.db() as conn:
+            cursor = conn.execute(
+                """
+                INSERT INTO rounds (type, title, question, status, extra_json, created_at)
+                VALUES ('balance', '테스트', '선택', 'closed', '{}', '2026-01-01 00:00:00')
+                """
+            )
+            conn.executemany(
+                """
+                INSERT INTO votes (round_id, user_id, choice, created_at, updated_at)
+                VALUES (?, ?, 'A', '2026-01-01 00:00:00', '2026-01-01 00:00:00')
+                """,
+                [(int(cursor.lastrowid), user_id) for user_id in ("200", "300", "400", "500")],
+            )
+
+        thirds = []
+        for _ in range(5):
+            with bot.db() as conn:
+                rows = bot.fetch_ranking_rows(conn, "100")
+            thirds.append((rows[2]["user_id"], rows[2]["total_score"]))
+
+        self.assertEqual(thirds, [("300", 4)] * 5)
+
+    def test_third_place_stays_fixed_after_unrelated_score_change(self) -> None:
+        """동점자의 updated_at이 갱신돼도 3등이 다른 사람으로 바뀌면 안 된다."""
+        self.add_user("100", "봇", 0)
+        self.add_user("300", "공동 1등 A", 4)
+        self.add_user("500", "공동 1등 B", 4)
+        with bot.db() as conn:
+            cursor = conn.execute(
+                """
+                INSERT INTO rounds (type, title, question, status, extra_json, created_at)
+                VALUES ('balance', '테스트', '선택', 'closed', '{}', '2026-01-01 00:00:00')
+                """
+            )
+            round_id = int(cursor.lastrowid)
+            conn.executemany(
+                """
+                INSERT INTO votes (round_id, user_id, choice, created_at, updated_at)
+                VALUES (?, ?, 'A', '2026-01-01 00:00:00', '2026-01-01 00:00:00')
+                """,
+                [(round_id, user_id) for user_id in ("300", "500")],
+            )
+            before = [row["user_id"] for row in bot.fetch_ranking_rows(conn, "100")]
+
+            # 500번이 +1 되었다가 -1 되어 같은 점수로 돌아온다 (updated_at만 바뀐다).
+            bot.add_score(conn, "500", "공동 1등 B", 1, "테스트", round_id)
+            bot.add_score(conn, "500", "공동 1등 B", -1, "테스트", round_id)
+            after = [row["user_id"] for row in bot.fetch_ranking_rows(conn, "100")]
+
+        self.assertEqual(before, after)
 
     def test_ranking_includes_only_users_with_game_participation(self) -> None:
         self.add_user("100", "이벤트 봇", 99)
@@ -60,34 +126,10 @@ class BotRegressionTests(unittest.TestCase):
 
         self.assertEqual([row["user_id"] for row in rows], ["300"])
 
-    def test_ranking_lines_show_rank_and_score_without_users(self) -> None:
-        self.add_user("200", "첫번째 참가자", 7)
-        self.add_user("300", "두번째 참가자", 4)
-        with bot.db() as conn:
-            rows = conn.execute(
-                "SELECT user_id, display_name, total_score FROM users ORDER BY total_score DESC"
-            ).fetchall()
-
-        lines = bot.format_ranking_lines(rows)
-
-        self.assertEqual(lines, ["1등 - **7점**", "2등 - **4점**"])
-        self.assertNotIn("<@", "\n".join(lines))
-        self.assertNotIn("참가자", "\n".join(lines))
-
-    def test_ranking_randomizes_only_users_with_the_same_score(self) -> None:
-        rows = [
-            {"user_id": "100", "total_score": 9},
-            {"user_id": "200", "total_score": 7},
-            {"user_id": "300", "total_score": 7},
-            {"user_id": "400", "total_score": 3},
-        ]
-
-        with patch.object(bot.random, "shuffle", side_effect=lambda tied_rows: tied_rows.reverse()) as shuffle:
-            shuffled_rows = bot.shuffle_tied_ranking_rows(rows)
-
-        self.assertEqual([row["user_id"] for row in shuffled_rows], ["100", "300", "200", "400"])
-        self.assertEqual([row["total_score"] for row in shuffled_rows], [9, 7, 7, 3])
-        shuffle.assert_called_once()
+    def test_ranking_command_is_removed(self) -> None:
+        self.assertFalse(hasattr(bot, "shuffle_tied_ranking_rows"))
+        self.assertFalse(hasattr(bot, "format_ranking_lines"))
+        self.assertIsNone(bot.bot.tree.get_command("랭킹"))
 
     def test_admin_score_report_records_user_names_and_scores(self) -> None:
         report_path = Path(self.temp_dir.name) / "score_report.csv"
@@ -295,6 +337,360 @@ class BotRegressionTests(unittest.TestCase):
             "서로 덜기를 하다 무너진 경우: 그 턴의 사람이 -1점",
         ):
             self.assertIn(expected, rendered)
+
+    # --- 밸런스 -------------------------------------------------------------
+
+    def create_balance_round(self, votes: list[tuple[str, str]]) -> int:
+        with bot.db() as conn:
+            cursor = conn.execute(
+                """
+                INSERT INTO rounds
+                    (type, title, question, option_a, option_b, status, channel_id, extra_json, created_at)
+                VALUES ('balance', '밸런스', '선택', '짜장', '짬뽕', 'open', '10', '{}', '2026-01-01 00:00:00')
+                """
+            )
+            round_id = int(cursor.lastrowid)
+            conn.executemany(
+                """
+                INSERT INTO votes (round_id, user_id, choice, created_at, updated_at)
+                VALUES (?, ?, ?, '2026-01-01 00:00:00', '2026-01-01 00:00:00')
+                """,
+                [(round_id, user_id, choice) for user_id, choice in votes],
+            )
+        return round_id
+
+    def score_of(self, user_id: str) -> int:
+        with bot.db() as conn:
+            return int(
+                conn.execute(
+                    "SELECT total_score FROM users WHERE user_id = ?", (user_id,)
+                ).fetchone()["total_score"]
+            )
+
+    def test_balance_one_sided_vote_penalizes_every_voter(self) -> None:
+        for user_id in ("1", "2", "3"):
+            self.add_user(user_id, f"참가자{user_id}", 0)
+        round_id = self.create_balance_round([("1", "A"), ("2", "A"), ("3", "A")])
+
+        result = bot.close_round_record(round_id, None)
+
+        self.assertIsNotNone(result)
+        for user_id in ("1", "2", "3"):
+            self.assertEqual(self.score_of(user_id), -2)
+        self.assertIn("-2점", json.dumps(result[1].to_dict(), ensure_ascii=False))
+
+    def test_balance_majority_still_gets_one_point(self) -> None:
+        for user_id in ("1", "2", "3"):
+            self.add_user(user_id, f"참가자{user_id}", 0)
+        round_id = self.create_balance_round([("1", "A"), ("2", "A"), ("3", "B")])
+
+        bot.close_round_record(round_id, None)
+
+        self.assertEqual(self.score_of("1"), 1)
+        self.assertEqual(self.score_of("2"), 1)
+        self.assertEqual(self.score_of("3"), 0)
+
+    def test_balance_result_hides_who_voted_what(self) -> None:
+        for user_id in ("1", "2"):
+            self.add_user(user_id, f"참가자{user_id}", 0)
+        round_id = self.create_balance_round([("1", "A"), ("2", "B")])
+
+        result = bot.close_round_record(round_id, None)
+
+        rendered = json.dumps(result[1].to_dict(), ensure_ascii=False)
+        self.assertNotIn("<@", rendered)
+        self.assertIn("1명", rendered)
+
+    def test_balance_without_votes_scores_nothing(self) -> None:
+        self.add_user("1", "참가자", 3)
+        round_id = self.create_balance_round([])
+
+        bot.close_round_record(round_id, None)
+
+        self.assertEqual(self.score_of("1"), 3)
+
+    # --- 상위 3명 -----------------------------------------------------------
+
+    def create_top3_round(self, votes: list[tuple[str, str]]) -> int:
+        candidates = [
+            {"user_id": "1", "display_name": "1등", "score": 9},
+            {"user_id": "2", "display_name": "2등", "score": 8},
+            {"user_id": "3", "display_name": "3등", "score": 7},
+        ]
+        with bot.db() as conn:
+            cursor = conn.execute(
+                """
+                INSERT INTO rounds (type, title, question, status, channel_id, extra_json, created_at)
+                VALUES ('top3', '견제', '견제', 'open', '10', ?, '2026-01-01 00:00:00')
+                """,
+                (json.dumps({"candidates": candidates}),),
+            )
+            round_id = int(cursor.lastrowid)
+            conn.executemany(
+                """
+                INSERT INTO votes (round_id, user_id, choice, created_at, updated_at)
+                VALUES (?, ?, ?, '2026-01-01 00:00:00', '2026-01-01 00:00:00')
+                """,
+                [(round_id, user_id, choice) for user_id, choice in votes],
+            )
+        return round_id
+
+    def test_top3_without_votes_is_void(self) -> None:
+        for user_id in ("1", "2", "3"):
+            self.add_user(user_id, f"후보{user_id}", 9)
+        round_id = self.create_top3_round([])
+
+        result = bot.close_round_record(round_id, None)
+
+        for user_id in ("1", "2", "3"):
+            self.assertEqual(self.score_of(user_id), 9)
+        self.assertIn("무효", json.dumps(result[1].to_dict(), ensure_ascii=False))
+
+    def test_top3_none_choice_rewards_only_its_voters(self) -> None:
+        for user_id in ("1", "2", "3"):
+            self.add_user(user_id, f"후보{user_id}", 9)
+        for user_id in ("10", "11", "12", "13"):
+            self.add_user(user_id, f"참가자{user_id}", 0)
+        # 견제 2표 vs 후보 1표 -> 견제 성공.
+        # 후보에게 투표한 12번도, 아예 투표하지 않은 13번도 점수를 받지 못한다.
+        round_id = self.create_top3_round(
+            [("10", bot.TOP3_NONE_CHOICE), ("11", bot.TOP3_NONE_CHOICE), ("12", "1")]
+        )
+
+        bot.close_round_record(round_id, None)
+
+        self.assertEqual(self.score_of("10"), 1)
+        self.assertEqual(self.score_of("11"), 1)
+        self.assertEqual(self.score_of("12"), 0)
+        self.assertEqual(self.score_of("13"), 0)
+        self.assertEqual(self.score_of("1"), 9)
+
+    def test_top3_majority_hits_most_voted_candidate(self) -> None:
+        for user_id in ("1", "2", "3"):
+            self.add_user(user_id, f"후보{user_id}", 9)
+        self.add_user("10", "참가자", 0)
+        round_id = self.create_top3_round([("10", "2")])
+
+        bot.close_round_record(round_id, None)
+
+        self.assertEqual(self.score_of("2"), 8)
+        self.assertEqual(self.score_of("1"), 9)
+
+    # --- 신뢰 거래 ----------------------------------------------------------
+
+    def test_trust_assigns_random_choice_to_missing_votes(self) -> None:
+        for user_id in ("1", "2"):
+            self.add_user(user_id, f"참가자{user_id}", 0)
+        with bot.db() as conn:
+            cursor = conn.execute(
+                """
+                INSERT INTO rounds (type, title, question, status, channel_id, extra_json, created_at)
+                VALUES ('trust', '신뢰', '신뢰', 'open', '10', ?, '2026-01-01 00:00:00')
+                """,
+                (json.dumps({"trust_phase": "decision"}),),
+            )
+            round_id = int(cursor.lastrowid)
+            conn.execute(
+                """
+                INSERT INTO trust_pairings (round_id, user_a_id, user_b_id, created_at)
+                VALUES (?, '1', '2', '2026-01-01 00:00:00')
+                """,
+                (round_id,),
+            )
+            # 1번만 선택했고 2번은 미선택.
+            conn.execute(
+                """
+                INSERT INTO votes (round_id, user_id, choice, created_at, updated_at)
+                VALUES (?, '1', 'trust', '2026-01-01 00:00:00', '2026-01-01 00:00:00')
+                """,
+                (round_id,),
+            )
+
+        with patch.object(bot.random, "choice", return_value="betray"):
+            result = bot.close_round_record(round_id, None)
+
+        with bot.db() as conn:
+            choice = conn.execute(
+                "SELECT choice FROM votes WHERE round_id = ? AND user_id = '2'", (round_id,)
+            ).fetchone()["choice"]
+        self.assertEqual(choice, "betray")
+
+        rendered = json.dumps(result[1].to_dict(), ensure_ascii=False)
+        self.assertIn("미선택 랜덤 배정", rendered)
+        self.assertIn("단독 배신 : 1", rendered)
+        self.assertNotIn("미선택 : ", rendered)
+        # 랜덤 배정된 2번이 단독 배신자가 되어 +2점.
+        self.assertEqual(self.score_of("2"), 2)
+
+    # --- 모래성 -------------------------------------------------------------
+
+    @staticmethod
+    def sand_pair(number_a: int, number_b: int) -> dict:
+        return {
+            "user_a_id": "1",
+            "user_b_id": "2",
+            "number_a": number_a,
+            "number_b": number_b,
+            "phase": "active",
+            "current_user_id": "1",
+            "successful_removals": 0,
+        }
+
+    def test_sand_survives_difference_then_collapses(self) -> None:
+        """9와 7이면 차이가 2 -> 2번까지 성공하고 3번째에 무너진다."""
+        pair = self.sand_pair(9, 7)
+
+        bot.apply_sand_action(pair, "1", "remove")
+        self.assertEqual(pair["phase"], "active")
+        bot.apply_sand_action(pair, "2", "remove")
+        self.assertEqual(pair["phase"], "active")
+        self.assertEqual(pair["successful_removals"], 2)
+
+        bot.apply_sand_action(pair, "1", "remove")
+        self.assertEqual(pair["phase"], "resolved")
+        self.assertEqual(pair["outcome"], "plain_collapse")
+        self.assertEqual(pair["result"]["collapsed_user"], "1")
+
+    def test_sand_same_number_collapses_on_first_removal(self) -> None:
+        pair = self.sand_pair(5, 5)
+
+        bot.apply_sand_action(pair, "1", "remove")
+
+        self.assertEqual(pair["phase"], "resolved")
+        self.assertEqual(pair["outcome"], "plain_collapse")
+
+    def test_sand_autocomplete_resolves_pair_without_numbers(self) -> None:
+        pair = {
+            "user_a_id": "1",
+            "user_b_id": "2",
+            "number_a": None,
+            "number_b": None,
+            "phase": "number_selection",
+            "current_user_id": "1",
+            "successful_removals": 0,
+        }
+
+        bot.autocomplete_sand_pair(pair)
+
+        self.assertEqual(pair["phase"], "resolved")
+        self.assertTrue(pair["auto_completed"])
+        self.assertIn(pair["outcome"], bot.SAND_OUTCOME_LABELS)
+        self.assertIsNotNone(pair["number_a"])
+        self.assertIsNotNone(pair["number_b"])
+
+    def test_sand_close_autocompletes_unfinished_pairs(self) -> None:
+        for user_id in ("1", "2"):
+            self.add_user(user_id, f"참가자{user_id}", 0)
+        pair = self.sand_pair(9, 7)
+        with bot.db() as conn:
+            cursor = conn.execute(
+                """
+                INSERT INTO rounds (type, title, question, status, channel_id, extra_json, created_at)
+                VALUES ('sand', '모래성', '모래성', 'open', '10', ?, '2026-01-01 00:00:00')
+                """,
+                (json.dumps({"sand_phase": "playing", "sand_pairs": [pair]}),),
+            )
+            round_id = int(cursor.lastrowid)
+
+        result = bot.close_round_record(round_id, None)
+
+        with bot.db() as conn:
+            extra = json.loads(
+                conn.execute(
+                    "SELECT extra_json FROM rounds WHERE id = ?", (round_id,)
+                ).fetchone()["extra_json"]
+            )
+        self.assertEqual(extra["sand_pairs"][0]["phase"], "resolved")
+        self.assertTrue(extra["sand_pairs"][0]["auto_completed"])
+        rendered = json.dumps(result[1].to_dict(), ensure_ascii=False)
+        self.assertIn("자동 진행", rendered)
+        self.assertNotIn("미완료", rendered)
+
+    # --- 돌 세공 ------------------------------------------------------------
+
+    def test_cutting_tables_match_requested_values(self) -> None:
+        self.assertEqual(bot.CUTTING_SUCCESS_RATES[0], 0.9)
+        self.assertEqual(bot.CUTTING_SUCCESS_RATES[1], 0.9)
+        self.assertEqual(
+            bot.CUTTING_REWARD_POINTS, {0: 3, 1: 3, 2: 1, 3: 1, 4: 1, 5: 2, 6: 4}
+        )
+
+    def test_cutting_embed_text_is_generated_from_constants(self) -> None:
+        rendered = json.dumps(bot.build_cutting_embed(1, "세공").to_dict(), ensure_ascii=False)
+        self.assertIn("0→1·1→2 90%", rendered)
+        self.assertIn("0~1강화 +3점", rendered)
+        self.assertIn("2~4강화 +1점", rendered)
+
+        # 상수를 바꾸면 안내문도 따라 바뀌어야 한다 (하드코딩 재발 방지).
+        with patch.object(bot, "CUTTING_REWARD_POINTS", {0: 5, 1: 5, 2: 5, 3: 5, 4: 5, 5: 5, 6: 5}):
+            self.assertIn("0~6강화 +5점", bot.cutting_reward_text())
+
+    # --- 익명 발언 ----------------------------------------------------------
+
+    def test_anonymous_numbers_are_stable_per_user(self) -> None:
+        with bot.db() as conn:
+            cursor = conn.execute(
+                """
+                INSERT INTO rounds (type, title, question, status, extra_json, created_at)
+                VALUES ('balance', '밸런스', '선택', 'open', '{}', '2026-01-01 00:00:00')
+                """
+            )
+            round_id = int(cursor.lastrowid)
+
+            def post(user_id: str) -> int:
+                number = bot.assign_anonymous_number(conn, round_id, user_id)
+                conn.execute(
+                    """
+                    INSERT INTO discussion_messages
+                        (round_id, user_id, anon_number, message_id, content, created_at)
+                    VALUES (?, ?, ?, '1', '내용', '2026-01-01 00:00:00')
+                    """,
+                    (round_id, user_id, number),
+                )
+                return number
+
+            # 같은 유저가 여러 번 발언해도 번호가 유지되고, 다른 유저는 다음 번호를 받는다.
+            self.assertEqual(post("1"), 1)
+            self.assertEqual(post("2"), 2)
+            self.assertEqual(post("1"), 1)
+            self.assertEqual(post("3"), 3)
+
+            count = conn.execute(
+                "SELECT COUNT(*) AS c FROM discussion_messages WHERE round_id = ? AND user_id = '1'",
+                (round_id,),
+            ).fetchone()["c"]
+        self.assertEqual(count, 2)
+
+    # --- 제거된 게임 --------------------------------------------------------
+
+    def test_grid_game_is_removed(self) -> None:
+        self.assertNotIn("grid", bot.MINI_GAME_TYPES)
+        self.assertNotIn("grid", bot.GAME_NAMES)
+        self.assertFalse(hasattr(bot, "build_grid_embed"))
+
+    def test_legacy_grid_round_closes_without_scoring(self) -> None:
+        """CHECK 제약에 남아 있는 옛 grid 라운드가 열려 있어도 마감이 터지지 않아야 한다."""
+        self.add_user("1", "참가자", 5)
+        with bot.db() as conn:
+            cursor = conn.execute(
+                """
+                INSERT INTO rounds (type, title, question, status, channel_id, extra_json, created_at)
+                VALUES ('grid', '옛 타일', '옛 타일', 'open', '10', '{}', '2026-01-01 00:00:00')
+                """
+            )
+            round_id = int(cursor.lastrowid)
+            conn.execute(
+                """
+                INSERT INTO votes (round_id, user_id, choice, created_at, updated_at)
+                VALUES (?, '1', '5', '2026-01-01 00:00:00', '2026-01-01 00:00:00')
+                """,
+                (round_id,),
+            )
+
+        result = bot.close_round_record(round_id, None)
+
+        self.assertIsNotNone(result)
+        self.assertEqual(self.score_of("1"), 5)
 
 
 if __name__ == "__main__":
