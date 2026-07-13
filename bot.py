@@ -91,11 +91,11 @@ MAIN_GAME_TYPES = {"trust", "sand"}
 # (BASE_SCHEMA 불변) 새 라운드로는 만들 수 없다.
 MINI_GAME_TYPES = {"balance", "defuse4", "cutting", "top3"}
 GAME_NAMES = {
-    "balance": "일반 밸런스",
+    "balance": "밸런스 게임",
     "defuse4": "4선 폭탄 해체",
     "cutting": "돌 세공 예측",
     "top3": "상위 3명 견제",
-    "trust": "신뢰 거래",
+    "trust": "딜레마의 섬",
     "sand": "모래성 게임",
 }
 ANONYMOUS_GUIDE_TEXT = (
@@ -766,7 +766,7 @@ def build_event_open_embed() -> discord.Embed:
         name="진행 흐름",
         value=(
             "1. 지금 `참여하기` 버튼으로 오늘의 참가 등록\n"
-            "2. 메인게임 1개 진행 (신뢰 거래 또는 모래성 게임)\n"
+            "2. 메인게임 1개 진행 (딜레마의 섬 또는 모래성 게임)\n"
             "3. 메인게임 결과와 점수 정산\n"
             "4. 미니게임 1개 진행 후 결과와 점수 정산"
         ),
@@ -1214,7 +1214,7 @@ async def create_trust_pair_threads(transition: dict[str, Any]) -> None:
                 type=discord.ChannelType.private_thread,
                 invitable=False,
                 auto_archive_duration=60,
-                reason=f"신뢰 거래 #{round_id} 세트별 비공개 협상방",
+                reason=f"딜레마의 섬 #{round_id} 세트별 비공개 협상방",
             )
             await thread.add_user(discord.Object(id=int(user_a_id)))
             await thread.add_user(discord.Object(id=int(user_b_id)))
@@ -1242,7 +1242,7 @@ async def create_trust_pair_threads(transition: dict[str, Any]) -> None:
     if failed_pairs:
         try:
             await channel.send(
-                f"신뢰 거래 #{round_id}의 비공개 협상방 {failed_pairs}개를 만들지 못했습니다. "
+                f"딜레마의 섬 #{round_id}의 비공개 협상방 {failed_pairs}개를 만들지 못했습니다. "
                 "봇의 비공개 스레드 생성·관리 권한을 확인해주세요."
             )
         except discord.HTTPException:
@@ -1316,7 +1316,7 @@ async def publish_trust_pair_results(round_id: int) -> None:
             if not isinstance(thread, discord.Thread):
                 continue
             if thread.archived:
-                await thread.edit(archived=False, reason="신뢰 거래 세트 결과 공개")
+                await thread.edit(archived=False, reason="딜레마의 섬 세트 결과 공개")
             await thread.send(
                 embed=build_trust_pair_result_embed(
                     str(round_row["title"]),
@@ -1329,7 +1329,7 @@ async def publish_trust_pair_results(round_id: int) -> None:
             await thread.edit(
                 archived=True,
                 locked=True,
-                reason="신뢰 거래 세트 결과 공개 완료",
+                reason="딜레마의 섬 세트 결과 공개 완료",
             )
         except (discord.Forbidden, discord.HTTPException, ValueError):
             continue
@@ -1973,7 +1973,7 @@ class EventBot(discord.Client):
 
         if action == "trustdecision":
             if len(parts) != 4:
-                await interaction.response.send_message("잘못된 신뢰 거래 선택입니다.", ephemeral=True)
+                await interaction.response.send_message("잘못된 딜레마의 섬 선택입니다.", ephemeral=True)
                 return
             _, _, round_id_text, choice = parts
             try:
@@ -1989,21 +1989,21 @@ class EventBot(discord.Client):
 
         if action in {"contractaccept", "contractdecline"}:
             await interaction.response.send_message(
-                "거래 제안 방식은 랜덤 매칭 방식으로 변경되었습니다. 새 신뢰 거래에 참여해주세요.",
+                "거래 제안 방식은 랜덤 매칭 방식으로 변경되었습니다. 새 딜레마의 섬에 참여해주세요.",
                 ephemeral=True,
             )
             return
 
         if action == "trustcontract":
             await interaction.response.send_message(
-                "거래 제안 방식은 랜덤 매칭 방식으로 변경되었습니다. 새 신뢰 거래에 참여해주세요.",
+                "거래 제안 방식은 랜덤 매칭 방식으로 변경되었습니다. 새 딜레마의 섬에 참여해주세요.",
                 ephemeral=True,
             )
             return
 
         if action in {"trustself", "trust"}:
             await interaction.response.send_message(
-                "직접 점수 투표 방식은 랜덤 매칭 신뢰/배신 방식으로 변경되었습니다. 새 신뢰 거래에 참여해주세요.",
+                "직접 점수 투표 방식은 랜덤 매칭 신뢰/배신 방식으로 변경되었습니다. 새 딜레마의 섬에 참여해주세요.",
                 ephemeral=True,
             )
             return
@@ -2260,7 +2260,7 @@ def build_trust_registration_embed(round_id: int, title: str, registration_minut
     )
     embed.add_field(
         name="진행 게임",
-        value="신뢰 or 배신",
+        value="딜레마의 섬",
         inline=False,
     )
     embed.add_field(
@@ -2873,7 +2873,7 @@ def close_round_record(
                             user_id,
                             member_name(guild, user_id),
                             1,
-                            f"라운드 #{round_row['id']} 신뢰 거래 상호 신뢰",
+                            f"라운드 #{round_row['id']} 딜레마의 섬 상호 신뢰",
                             round_row["id"],
                         )
                 elif user_a_choice == "betray" and user_b_choice == "betray":
@@ -2884,7 +2884,7 @@ def close_round_record(
                             user_id,
                             member_name(guild, user_id),
                             -1,
-                            f"라운드 #{round_row['id']} 신뢰 거래 동시 배신",
+                            f"라운드 #{round_row['id']} 딜레마의 섬 동시 배신",
                             round_row["id"],
                         )
                 else:
@@ -2895,7 +2895,7 @@ def close_round_record(
                         betrayer_id,
                         member_name(guild, betrayer_id),
                         2,
-                        f"라운드 #{round_row['id']} 신뢰 거래 단독 배신",
+                        f"라운드 #{round_row['id']} 딜레마의 섬 단독 배신",
                         round_row["id"],
                     )
                 outcome_counts[outcome] += 1
@@ -3184,7 +3184,7 @@ async def ensure_trust_private_thread_permissions(interaction: discord.Interacti
     interaction_channel = interaction.channel
     if guild is None or not isinstance(interaction_channel, discord.TextChannel):
         await interaction.response.send_message(
-            "신뢰 거래는 스레드가 아닌 서버 텍스트 채널에서 시작해주세요.",
+            "딜레마의 섬은 스레드가 아닌 서버 텍스트 채널에서 시작해주세요.",
             ephemeral=True,
         )
         return False
@@ -3203,7 +3203,7 @@ async def ensure_trust_private_thread_permissions(interaction: discord.Interacti
         return True
 
     await interaction.response.send_message(
-        "신뢰 거래에는 봇의 `비공개 스레드 만들기`, `스레드에서 메시지 보내기`, "
+        "딜레마의 섬에는 봇의 `비공개 스레드 만들기`, `스레드에서 메시지 보내기`, "
         "`스레드 관리` 권한이 필요합니다.",
         ephemeral=True,
     )
@@ -3357,11 +3357,11 @@ async def open_event(interaction: discord.Interaction) -> None:
 @admin_only()
 @app_commands.choices(
     메인게임=[
-        app_commands.Choice(name="신뢰 거래", value="trust"),
+        app_commands.Choice(name="딜레마의 섬", value="trust"),
         app_commands.Choice(name="모래성 게임", value="sand"),
     ],
     미니게임=[
-        app_commands.Choice(name="일반 밸런스", value="balance"),
+        app_commands.Choice(name="밸런스 게임", value="balance"),
         app_commands.Choice(name="4선 폭탄 해체", value="defuse4"),
         app_commands.Choice(name="돌 세공 예측", value="cutting"),
         app_commands.Choice(name="상위 3명 견제", value="top3"),
@@ -3391,7 +3391,7 @@ async def start(interaction: discord.Interaction, 메인게임: str, 미니게�
 @admin_only()
 @app_commands.choices(
     게임=[
-        app_commands.Choice(name="일반 밸런스", value="balance"),
+        app_commands.Choice(name="밸런스 게임", value="balance"),
         app_commands.Choice(name="4선 폭탄 해체", value="defuse4"),
         app_commands.Choice(name="돌 세공 예측", value="cutting"),
         app_commands.Choice(name="상위 3명 견제", value="top3"),
@@ -3545,7 +3545,7 @@ async def create_round_from_setup(
         if 게임 == "balance":
             if not 선택_a or not 선택_b:
                 await interaction.response.send_message(
-                    "일반 밸런스 게임은 `선택_a`와 `선택_b`가 필요합니다.",
+                    "밸런스 게임은 `선택_a`와 `선택_b`가 필요합니다.",
                     ephemeral=True,
                 )
                 return
@@ -3557,7 +3557,7 @@ async def create_round_from_setup(
                 VALUES ('balance', ?, ?, ?, ?, 'open', ?, ?, ?)
                 """,
                 (
-                    "일반 밸런스 라운드",
+                    "밸런스 게임 라운드",
                     제목,
                     선택_a,
                     선택_b,
@@ -3868,7 +3868,7 @@ async def close_round(interaction: discord.Interaction) -> None:
             bot.schedule_auto_close(int(round_row["id"]), float(transition["close_at"]))
             await interaction.followup.send("참여자 모집을 마감하고 랜덤 매칭 및 3분 선택을 시작했습니다.", ephemeral=True)
         else:
-            await interaction.followup.send("참여자가 부족해 신뢰 거래를 취소했습니다.", ephemeral=True)
+            await interaction.followup.send("참여자가 부족해 딜레마의 섬을 취소했습니다.", ephemeral=True)
         return
 
     if round_row["type"] == "sand" and round_extra(round_row).get("sand_phase") == "registration":
