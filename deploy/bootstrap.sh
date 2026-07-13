@@ -38,6 +38,20 @@ install -d -o "$APP_USER" -g "$APP_USER" -m 755 "$APP_ROOT" "$APP_ROOT/releases"
 install -d -o "$APP_USER" -g "$APP_USER" -m 750 "$STATE_ROOT" "$STATE_ROOT/data" "$STATE_ROOT/backups"
 install -d -o root -g "$APP_USER" -m 750 "$CONF_DIR"
 
+echo "==> /home 이정표 심볼릭 링크"
+# 사람이 /home에서 다른 서비스들과 나란히 찾을 수 있게 하는 용도.
+# 봇 프로세스는 이 링크를 타지 않으므로 ProtectHome/SELinux 설정은 그대로 둔다.
+for pair in "/home/yumcbot-app:$APP_ROOT" "/home/yumcbot-data:$STATE_ROOT"; do
+    link="${pair%%:*}"
+    target="${pair#*:}"
+    if [[ -e "$link" && ! -L "$link" ]]; then
+        echo "    건너뜀 (심볼릭 링크가 아닌 항목이 이미 있음): $link"
+    else
+        ln -sfn "$target" "$link"
+        echo "    $link -> $target"
+    fi
+done
+
 echo "==> 환경변수 파일"
 if [[ -f "$ENV_FILE" ]]; then
     echo "    이미 있음. 건드리지 않습니다: $ENV_FILE"

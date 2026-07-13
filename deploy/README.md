@@ -39,10 +39,15 @@ Copy-Item .env.example .env
 ## 2. 서버 셋업 (Rocky Linux, 1회)
 
 ```bash
-git clone https://github.com/manduk56-hub/YUMCBOT.git /tmp/yumcbot
-sudo bash /tmp/yumcbot/deploy/bootstrap.sh
+sudo dnf install -y git
+sudo git clone -b main https://github.com/manduk56-hub/YUMCBOT.git /usr/local/src/YUMCBOT
+sudo bash /usr/local/src/YUMCBOT/deploy/bootstrap.sh
 sudo vi /etc/yumcbot/yumcbot.env   # DISCORD_TOKEN(운영 봇), GUILD_ID 입력
 ```
+
+이 clone은 **`bootstrap.sh`를 돌리기 위한 것일 뿐**이고 봇 실행과는 무관합니다.
+`/tmp`가 아니라 `/usr/local/src`에 두는 이유는, `deploy/`를 수정했을 때
+`git pull` 후 `bootstrap.sh`를 다시 돌려야 하기 때문입니다.
 
 `bootstrap.sh`가 만드는 것:
 
@@ -50,12 +55,33 @@ sudo vi /etc/yumcbot/yumcbot.env   # DISCORD_TOKEN(운영 봇), GUILD_ID 입력
 |---|---|
 | `/opt/yumcbot/releases/<sha>/` | 릴리스별 코드 + 전용 venv |
 | `/opt/yumcbot/current` | 현재 릴리스를 가리키는 심볼릭 링크 |
+| `/opt/yumcbot/runner/` | GitHub Actions self-hosted runner |
 | `/var/lib/yumcbot/data/` | **DB. 코드 디렉터리 밖이라 배포로 덮이지 않는다** |
 | `/var/lib/yumcbot/backups/` | 배포 직전 DB 백업 |
 | `/etc/yumcbot/yumcbot.env` | 운영 토큰 (root:yumcbot 0640) |
 | `/usr/local/bin/yumcbot-deploy` | 배포 스크립트 |
+| `/usr/local/bin/yumcbot-setup-runner` | 러너 등록 스크립트 |
+| `/home/yumcbot-app`, `/home/yumcbot-data` | 위 두 경로를 가리키는 이정표 링크 (사람용) |
 
-`deploy/` 아래 스크립트를 수정하면 서버에서 `bootstrap.sh`를 **다시 실행**해야 사본이 갱신됩니다.
+**코드(`/opt`) · 데이터(`/var/lib`) · 설정(`/etc`)을 분리**한 것이 핵심입니다.
+배포는 `/opt/yumcbot/releases/`에 새 디렉터리를 만들고 `current` 링크만 갈아끼웁니다.
+DB가 코드 트리 안에 있었다면 배포할 때마다 빈 DB로 시작하게 됩니다.
+
+`/home/yumcbot-*` 링크는 사람이 다른 서비스들과 나란히 찾으라고 둔 것입니다.
+봇 프로세스는 이 링크를 타지 않습니다 (systemd `ProtectHome=true`).
+
+> **백업 대상에 `/var/lib/yumcbot/data` 를 추가하세요.**
+> `/home`만 백업하는 정책이면 DB가 빠집니다.
+
+`deploy/` 아래 스크립트나 `yumcbot.service`를 수정하면, **배포로는 갱신되지 않습니다.**
+배포가 갈아끼우는 건 `/opt/yumcbot/releases/` 아래 앱 코드뿐입니다.
+서버에서 직접 갱신해야 합니다:
+
+```bash
+sudo git -C /usr/local/src/YUMCBOT pull
+sudo bash /usr/local/src/YUMCBOT/deploy/bootstrap.sh
+```
+
 (멱등하게 작성돼 있어 재실행해도 DB와 `.env`는 건드리지 않습니다.)
 
 ### GitHub Actions self-hosted runner 등록
