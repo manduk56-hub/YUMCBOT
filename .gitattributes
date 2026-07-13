@@ -1,0 +1,9 @@
+* text=auto eol=lf
+
+# 서버에서 실행되는 파일들. CRLF로 체크아웃되면 shebang이 깨져 실행 자체가 안 된다.
+*.sh            text eol=lf
+*.service       text eol=lf
+deploy/*.py     text eol=lf
+
+*.png           binary
+*.sqlite3       binary

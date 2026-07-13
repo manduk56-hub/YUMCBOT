@@ -5,7 +5,8 @@ import csv
 import json
 import os
 import random
-import shutil
+import signal
+import socket
 import sqlite3
 import time
 from contextlib import contextmanager
@@ -19,8 +20,13 @@ from dotenv import load_dotenv
 
 
 BASE_DIR = Path(__file__).resolve().parent
-DATA_DIR = BASE_DIR / "data"
-DB_PATH = DATA_DIR / "event_game.sqlite3"
+
+# 배포 환경(systemd)이 넘겨준 실제 환경변수가 우선이고, 없으면 로컬 .env로 채운다.
+load_dotenv(BASE_DIR / ".env")
+
+# 운영 서버는 DB를 코드 디렉터리 밖(/var/lib/yumcbot/data)에 두어 배포로 덮이지 않게 한다.
+DATA_DIR = Path(os.getenv("YUMCBOT_DATA_DIR") or (BASE_DIR / "data")).resolve()
+DB_PATH = DATA_DIR / (os.getenv("YUMCBOT_DB_NAME") or "event_game.sqlite3")
 KST_LABEL = "Asia/Seoul"
 DEFUSE_COLORS = [
     {"id": "red", "name": "빨강", "emoji": "🟥"},
@@ -123,10 +129,14 @@ def cutting_success_rate(current_level: int) -> float:
 
 @contextmanager
 def db() -> sqlite3.Connection:
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(DB_PATH)
+    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(DB_PATH, timeout=5.0)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
+    # WAL: 재시작/급종료 시 DB 손상 방지, /데이터백업 중에도 쓰기가 막히지 않는다.
+    conn.execute("PRAGMA journal_mode = WAL")
+    conn.execute("PRAGMA synchronous = NORMAL")
+    conn.execute("PRAGMA busy_timeout = 5000")
     try:
         yield conn
         conn.commit()
@@ -134,10 +144,10 @@ def db() -> sqlite3.Connection:
         conn.close()
 
 
-def init_db() -> None:
-    with db() as conn:
-        conn.executescript(
-            """
+# v1 베이스라인. 이 문자열은 절대 수정하지 않는다.
+# 스키마를 바꾸려면 SCHEMA_VERSION을 올리고 MIGRATIONS에 항목을 추가한다.
+# (여기를 고치면 새 DB와 기존 운영 DB의 스키마가 갈라진다.)
+BASE_SCHEMA = """
             CREATE TABLE IF NOT EXISTS users (
                 user_id TEXT PRIMARY KEY,
                 display_name TEXT NOT NULL,
@@ -228,11 +238,111 @@ def init_db() -> None:
                 created_at TEXT NOT NULL,
                 FOREIGN KEY (round_id) REFERENCES rounds(id) ON DELETE SET NULL
             );
-            """
+"""
+
+BASELINE_VERSION = 1
+
+# 스키마 변경은 전부 여기로. 예:
+#   MIGRATIONS = {2: ["ALTER TABLE rounds ADD COLUMN foo TEXT"]}
+# 롤백 가능하도록 반드시 '추가' 형태(ADD COLUMN 등)로만 작성한다.
+MIGRATIONS: dict[int, list[str]] = {}
+
+SCHEMA_VERSION = max([BASELINE_VERSION, *MIGRATIONS])
+
+
+def apply_baseline_schema(conn: sqlite3.Connection) -> None:
+    """v1 베이스라인 = BASE_SCHEMA + 아래 세 개의 멱등 보정.
+
+    user_version이 도입되기 전부터 굴러온 DB들은 매 부팅마다 이 보정을 거쳐 왔다.
+    따라서 이미 존재하는 모든 DB의 실제 스키마가 곧 v1이다. 여기에 ADD COLUMN을
+    새로 끼워 넣으면 기존 DB에서 'duplicate column' 으로 터지므로 손대지 말고,
+    앞으로의 변경은 MIGRATIONS(v2~)에 추가한다.
+    """
+    conn.executescript(BASE_SCHEMA)
+    migrate_round_type_check(conn)
+    ensure_event_session_schema(conn)
+    ensure_trust_pairing_schema(conn)
+
+
+def _schema_snapshot(conn: sqlite3.Connection) -> dict[str, set[str]]:
+    tables = [
+        row[0]
+        for row in conn.execute(
+            "SELECT name FROM sqlite_master "
+            "WHERE type = 'table' AND name NOT LIKE 'sqlite_%'"
         )
-        migrate_round_type_check(conn)
-        ensure_event_session_schema(conn)
-        ensure_trust_pairing_schema(conn)
+    ]
+    return {
+        table: {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+        for table in tables
+    }
+
+
+def canonical_schema() -> dict[str, set[str]]:
+    """베이스라인 + 모든 마이그레이션을 적용했을 때 나와야 하는 스키마."""
+    mem = sqlite3.connect(":memory:")
+    mem.row_factory = sqlite3.Row  # ensure_* 보정이 row["name"]으로 접근한다
+    try:
+        apply_baseline_schema(mem)
+        for version in range(BASELINE_VERSION + 1, SCHEMA_VERSION + 1):
+            for statement in MIGRATIONS[version]:
+                mem.execute(statement)
+        return _schema_snapshot(mem)
+    finally:
+        mem.close()
+
+
+def verify_schema() -> None:
+    """실제 DB가 코드가 기대하는 스키마를 만족하는지 확인한다.
+
+    마이그레이션을 빠뜨린 채 배포하면 봇은 정상 로그인까지 해버리고 게임 도중에
+    'no such column'으로 터진다. 부팅 시점에 미리 죽여서 배포 헬스체크가 잡아내게 한다.
+    구버전으로 롤백한 경우 DB에 모르는 컬럼이 더 있을 수 있는데, 그건 허용한다.
+    """
+    expected = canonical_schema()
+    with db() as conn:
+        actual = _schema_snapshot(conn)
+
+    problems: list[str] = []
+    for table, columns in sorted(expected.items()):
+        if table not in actual:
+            problems.append(f"테이블 누락: {table}")
+            continue
+        missing = columns - actual[table]
+        if missing:
+            problems.append(f"{table} 컬럼 누락: {', '.join(sorted(missing))}")
+
+    if problems:
+        detail = "\n  - ".join(problems)
+        raise RuntimeError(
+            f"DB 스키마가 코드와 일치하지 않습니다 (기대 v{SCHEMA_VERSION}):\n  - {detail}\n"
+            "MIGRATIONS에 변경분을 등록했는지 확인하세요."
+        )
+
+
+def init_db() -> None:
+    with db() as conn:
+        apply_baseline_schema(conn)
+
+        version = int(conn.execute("PRAGMA user_version").fetchone()[0])
+        if version == 0:
+            # 새로 만든 DB이거나, user_version 도입 이전부터 굴러온 기존 DB. 둘 다 v1이다.
+            version = BASELINE_VERSION
+            conn.execute(f"PRAGMA user_version = {BASELINE_VERSION}")
+
+        if version > SCHEMA_VERSION:
+            print(
+                f"경고: DB 스키마(v{version})가 코드(v{SCHEMA_VERSION})보다 최신입니다. "
+                "구버전으로 롤백된 상태일 수 있습니다.",
+                flush=True,
+            )
+            return
+
+        for target in range(version + 1, SCHEMA_VERSION + 1):
+            for statement in MIGRATIONS[target]:
+                conn.execute(statement)
+            conn.execute(f"PRAGMA user_version = {target}")
+            print(f"스키마 마이그레이션 적용: v{target}", flush=True)
 
 
 def migrate_round_type_check(conn: sqlite3.Connection) -> None:
@@ -1033,7 +1143,7 @@ async def create_trust_pair_threads(transition: dict[str, Any]) -> None:
             await thread.send(
                 (
                     f"<@{user_a_id}>님과 <@{user_b_id}>님의 비공개 협상방입니다.\n"
-                    "서로 대화한 뒤 아래 버튼으로 `신뢰` 또는 `배신`을 한 번만 확정하세요. "
+                    "서로 마음껏 대화한 뒤 아래 버튼으로 `신뢰` 또는 `배신`을 선택하세요.(*한번 선택하면 되돌릴 수 없습니다!)\n"
                     "선택은 마감 전까지 상대에게 공개되지 않으며, 마감 후 이 방에서 함께 공개됩니다."
                 ),
                 view=trust_decision_view(round_id),
@@ -1171,7 +1281,7 @@ async def handle_trust_join(interaction: discord.Interaction, round_id: int) -> 
             (round_id, str(interaction.user.id)),
         ).fetchone()
         if existing:
-            await interaction.response.send_message("이미 오늘의 신뢰 거래에 참여 등록했습니다.", ephemeral=True)
+            await interaction.response.send_message("이미 오늘의 메인 게임에 참여 등록했습니다.", ephemeral=True)
             return
 
         ensure_user(conn, interaction.user)
@@ -1233,7 +1343,7 @@ async def handle_trust_decision(
             """,
             (round_id, str(interaction.user.id), choice, now_text(), now_text()),
         )
-    await interaction.response.send_message("선택을 비공개로 확정했습니다.", ephemeral=True)
+    await interaction.response.send_message("선택을 확정했습니다.", ephemeral=True)
 
 
 def start_sand_game(round_id: int) -> dict[str, Any] | None:
@@ -1448,9 +1558,9 @@ async def handle_sand_number(
     suffix = (
         f" 두 사람의 선택이 끝났습니다. {'내 차례입니다.' if current_user_id == user_id else f'<@{current_user_id}>님의 차례입니다.'}"
         if both_selected
-        else " 상대의 비공개 선택을 기다립니다."
+        else " 상대의 선택을 기다립니다."
     )
-    await refresh_or_finish_sand_round(interaction, round_id, f"`{number}`을 비공개로 확정했습니다.{suffix}")
+    await refresh_or_finish_sand_round(interaction, round_id, f"`{number}`을 확정했습니다.{suffix}")
 
 
 async def handle_sand_action(
@@ -1535,7 +1645,7 @@ async def handle_sand_action(
                             "raw_difference": raw_difference,
                         }
                     )
-                    private_message = "모래를 덜다가 무너졌습니다. 무너진 차례의 참가자는 -1점입니다."
+                    private_message = "모래를 덜다가 무너졌습니다. -1점입니다."
             elif phase == "awaiting_quit_response":
                 quitter_id = str(pair["quitter_id"])
                 pair.update(
@@ -1590,6 +1700,8 @@ class EventBot(discord.Client):
         if not self.auto_close_restored:
             self.auto_close_restored = True
             self.restore_auto_close_tasks()
+        # 로그인 + 진행 중이던 라운드 타이머 복구까지 끝나야 배포가 성공으로 처리된다.
+        sd_notify("READY=1")
 
     def schedule_auto_close(self, round_id: int, close_at: float) -> None:
         existing = self.auto_close_tasks.pop(round_id, None)
@@ -2035,17 +2147,17 @@ def build_trust_registration_embed(round_id: int, title: str, registration_minut
         color=discord.Color.dark_gold(),
     )
     embed.add_field(
-        name="진행 순서",
-        value=(
-            f"매칭 준비 {registration_minutes}분 → 무작위 2인 1세트 매칭 → 신뢰/배신 선택 3분 → 점수 정산 → 미니게임"
-        ),
+        name="진행 게임",
+        value="신뢰 or 배신",
         inline=False,
     )
     embed.add_field(
         name="메인 규칙",
         value=(
-            "이벤트 오픈 때 `참여하기`를 누른 유저가 자동으로 참가합니다. 준비 시간이 끝나면 봇이 참가자를 무작위로 둘씩 매칭합니다.\n"
-            "참여자가 홀수면 한 명은 이번 회차 매칭 대기이며, 나머지만 2명씩 게임을 진행합니다. 상호 신뢰는 각 +1점, 단독 배신은 배신자 +2점·상대 0점, 동시 배신은 각 -1점입니다."
+            "무작위로 매칭된 두 명의 참가자가 신뢰와 배신을 선택합니다.\n"
+            "- 상호 신뢰 시 : 각 +1점\n"
+            "- 한명만 배신 시 : 배신자 +2점\n"
+            "- 동시 배신 시 : 각 -1점"
         ),
         inline=False,
     )
@@ -2097,12 +2209,15 @@ def build_trust_decision_embed(
     if unmatched_user_id:
         embed.add_field(
             name="매칭 대기",
-            value=f"<@{unmatched_user_id}>님은 참여자가 홀수여서 이번 회차에는 짝이 배정되지 않았습니다.",
+            value=f"<@{unmatched_user_id}>님, 참여자가 홀수이므로 새 참가자가 긴급 투입중입니다. 잠시만 기다려주세요!",
             inline=False,
         )
     embed.add_field(
         name="선택 규칙 (3분)",
-        value="비공개 협상방에서 짝과 대화한 뒤 `신뢰` 또는 `배신`을 한 번만 확정하세요. 서로의 선택은 마감 후 해당 방에서 공개됩니다.",
+        value=(
+            "비공개 협상방에서 매칭된 짝과 대화한 뒤 `신뢰` 또는 `배신`을 선택하세요. 서로의 선택은 마감 후 해당 방에서 공개됩니다.\n"
+            "*한번 선택하면 되돌릴 수 없습니다! 주의하세요."
+        ),
         inline=False,
     )
     return embed
@@ -2132,11 +2247,8 @@ def trust_decision_view(round_id: int) -> discord.ui.View:
 def build_sand_registration_embed(round_id: int, title: str, registration_minutes: int) -> discord.Embed:
     embed = discord.Embed(title=title, description=title, color=discord.Color.from_rgb(218, 165, 90))
     embed.add_field(
-        name="진행 순서",
-        value=(
-            f"매칭 준비 {registration_minutes}분 → 무작위 1:1 매칭 → 각자 비공개 숫자 선택 → "
-            "번갈아 포기/모래 덜기 → 정산 → 미니게임"
-        ),
+        name="진행 게임",
+        value="모래성 게임",
         inline=False,
     )
     embed.add_field(
@@ -2173,7 +2285,7 @@ def build_sand_play_embed(round_row: sqlite3.Row, extra: dict[str, Any]) -> disc
         phase = str(pair.get("phase"))
         if phase == "number_selection":
             selected = int(pair.get("number_a") is not None) + int(pair.get("number_b") is not None)
-            status = f"비공개 숫자 선택 {selected}/2"
+            status = f"숫자를 고르세요(번복 불가) : {selected}/2"
         elif phase == "active":
             status = (
                 f"<@{pair['current_user_id']}> 차례 · 성공한 모래 덜기 "
@@ -2189,7 +2301,7 @@ def build_sand_play_embed(round_row: sqlite3.Row, extra: dict[str, Any]) -> disc
     if unmatched_user_id:
         embed.add_field(
             name="매칭 대기",
-            value=f"<@{unmatched_user_id}>님은 참여자가 홀수여서 이번 회차에 짝이 배정되지 않았습니다.",
+            value=f"<@{unmatched_user_id}>님, 참여자가 홀수이므로 새 참가자가 긴급 투입중입니다. 잠시만 기다려주세요!",
             inline=False,
         )
     embed.add_field(
@@ -3963,6 +4075,23 @@ async def ranking(interaction: discord.Interaction) -> None:
     await interaction.response.send_message(embed=embed, allowed_mentions=discord.AllowedMentions.none())
 
 
+def backup_database(dest: Path) -> None:
+    """SQLite 온라인 백업 API로 DB를 복사한다.
+
+    WAL 모드에서는 최근 커밋이 아직 -wal 파일에만 있을 수 있어서 DB 파일만
+    단순 복사하면 그 내용이 빠진다. backup()은 WAL까지 반영한 일관된 스냅샷을
+    만들고, 봇이 돌고 있는 중에 호출해도 안전하다.
+    """
+    src = sqlite3.connect(DB_PATH, timeout=10.0)
+    dst = sqlite3.connect(dest)
+    try:
+        with dst:
+            src.backup(dst)
+    finally:
+        dst.close()
+        src.close()
+
+
 @bot.tree.command(name="데이터백업", description="SQLite 데이터베이스를 백업합니다.")
 @app_commands.default_permissions()
 @admin_only()
@@ -3976,7 +4105,7 @@ async def backup_data(interaction: discord.Interaction) -> None:
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     backup_path = backup_dir / f"event_game_{timestamp}.sqlite3"
     score_report_path = backup_dir / f"score_report_{timestamp}.csv"
-    shutil.copy2(DB_PATH, backup_path)
+    backup_database(backup_path)
     current_bot_id = str(interaction.client.user.id) if interaction.client.user else ""
     with db() as conn:
         score_rows = fetch_admin_score_rows(conn, current_bot_id)
@@ -3988,14 +4117,79 @@ async def backup_data(interaction: discord.Interaction) -> None:
     )
 
 
+def sd_notify(state: str) -> None:
+    """systemd에 상태를 알린다 (Type=notify).
+
+    on_ready에서 READY=1을 보내므로 `systemctl restart`는 봇이 실제로 디스코드
+    로그인을 마쳐야 성공으로 끝난다. 배포 스크립트는 이 종료 코드만 보면 된다.
+    NOTIFY_SOCKET이 없는 로컬 실행에서는 아무것도 하지 않는다.
+    """
+    address = os.getenv("NOTIFY_SOCKET")
+    if not address or not hasattr(socket, "AF_UNIX"):
+        return
+    if address.startswith("@"):
+        address = "\0" + address[1:]
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as sock:
+            sock.connect(address)
+            sock.sendall(state.encode())
+    except OSError as exc:
+        print(f"sd_notify 실패({state}): {exc}", flush=True)
+
+
+def _install_shutdown_handlers(loop: asyncio.AbstractEventLoop) -> None:
+    """systemd가 보내는 SIGTERM에 게이트웨이를 정상 종료시킨다.
+
+    discord.Client.run()은 SIGTERM을 잡지 않아 프로세스가 정리 없이 즉사하고,
+    처리 중이던 상호작용 응답과 커밋 직전 트랜잭션이 유실된다.
+    """
+    stopping = False
+
+    def request_stop(name: str) -> None:
+        nonlocal stopping
+        if stopping:
+            return
+        stopping = True
+        print(f"{name} 수신. 봇을 정상 종료합니다.", flush=True)
+        sd_notify("STOPPING=1")
+        loop.create_task(bot.close())
+
+    for name in ("SIGTERM", "SIGINT"):
+        sig = getattr(signal, name, None)
+        if sig is None:
+            continue
+        try:
+            loop.add_signal_handler(sig, request_stop, name)
+        except NotImplementedError:
+            # Windows 이벤트 루프는 add_signal_handler를 지원하지 않는다.
+            signal.signal(
+                sig,
+                lambda _sig, _frame, _name=name: loop.call_soon_threadsafe(
+                    request_stop, _name
+                ),
+            )
+
+
+async def run_bot(token: str) -> None:
+    _install_shutdown_handlers(asyncio.get_running_loop())
+    async with bot:
+        await bot.start(token)
+
+
 def main() -> None:
-    load_dotenv(BASE_DIR / ".env")
     token = os.getenv("DISCORD_TOKEN", "").strip()
     if not token:
-        raise RuntimeError(".env 파일에 DISCORD_TOKEN을 설정해주세요.")
+        raise RuntimeError(
+            "DISCORD_TOKEN이 없습니다. 로컬은 .env, 서버는 systemd EnvironmentFile을 확인하세요."
+        )
 
     init_db()
-    bot.run(token)
+    verify_schema()
+    print(f"DB: {DB_PATH} (schema v{SCHEMA_VERSION})", flush=True)
+
+    # bot.run()을 우회하므로 discord.py 로깅을 직접 켠다 (journald로 흘러간다).
+    discord.utils.setup_logging()
+    asyncio.run(run_bot(token))
 
 
 if __name__ == "__main__":

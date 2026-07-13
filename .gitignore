@@ -1,10 +1,31 @@
+# 시크릿
 .env
+.env.*
+!.env.example
+
+# 파이썬
 .venv/
+venv/
 __pycache__/
-*.pyc
+*.py[cod]
+
+# 로컬 데이터 (DB, 백업, /데이터백업 산출물)
+# 운영 서버 DB는 /var/lib/yumcbot/data 에 있고 저장소와 무관하다.
 data/
-data/backups/
+*.sqlite3
+*.sqlite3-wal
+*.sqlite3-shm
+
+# 로그. 운영 서버는 journald로 나가므로 저장소에 로그 파일이 있을 이유가 없다.
+*.log
 logs/
+
+# 에디터 / OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# 에이전트 툴
 .agents/
 .codex/
-56df2b91-9516-4cf5-a97b-1272df7df54b.png

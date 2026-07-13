@@ -1,0 +1,61 @@
+name: Deploy
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "진행 중인 이벤트를 무시하고 강제 배포"
+        type: boolean
+        default: false
+
+# 배포가 겹치면 심볼릭 링크와 서비스 재시작이 서로를 밟는다. 한 번에 하나만.
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: 의존성 설치
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: 문법 검사
+        run: python -m compileall -q bot.py deploy/check_idle.py
+
+      - name: 테스트
+        run: python -m unittest discover -s tests -v
+
+  deploy:
+    needs: test
+    # 서버컴에 yumcbot 계정으로 등록된 self-hosted runner
+    runs-on: [self-hosted, linux, yumcbot-prod]
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 배포
+        # 절대 경로로 부른다. 러너의 PATH는 등록 시점의 .path 파일에 굳어 있어서
+        # /usr/local/bin 이 들어 있다는 보장이 없다 (sudo secure_path 로 등록되면 빠진다).
+        run: |
+          FORCE=""
+          if [ "${{ inputs.force }}" = "true" ]; then
+            FORCE="--force"
+          fi
+          /usr/local/bin/yumcbot-deploy "$GITHUB_SHA" "$GITHUB_WORKSPACE" $FORCE
+
+      - name: 서비스 상태
+        if: always()
+        run: |
+          systemctl status yumcbot --no-pager || true
+          journalctl -u yumcbot -n 30 --no-pager || true

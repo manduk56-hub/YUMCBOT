@@ -1,6 +1,12 @@
 # Discord Event Bot
 
-방학 기간 동안 정해진 요일에 로컬 PC에서 켜서 운영하는 Discord 이벤트 봇입니다.
+방학 기간 동안 정해진 요일에 이벤트를 진행하는 Discord 봇입니다.
+운영 봇은 Rocky Linux 서버에서 systemd로 24시간 가동되며, `main` 브랜치에 push하면
+GitHub Actions가 자동 배포합니다.
+
+**개발 참여 전에 [`deploy/README.md`](deploy/README.md)를 먼저 읽으세요.**
+개발자마다 **자기 전용 Discord 앱**이 필요합니다. 같은 봇 토큰을 두 프로세스에서
+동시에 실행하면 모든 버튼과 명령이 두 번씩 처리되어 점수가 2배로 들어갑니다.
 
 ## 기능
 
@@ -12,7 +18,9 @@
 - SQLite 파일 기반 저장이라 별도 DB 서버 불필요
 - 로컬 PC에서 필요한 시간에만 실행 가능
 
-## 설치
+## 설치 (로컬 개발)
+
+파이썬 **3.12**를 사용합니다 (운영 서버와 버전을 맞춥니다).
 
 ```powershell
 python -m venv .venv
@@ -21,9 +29,10 @@ pip install -r requirements.txt
 Copy-Item .env.example .env
 ```
 
-`.env` 파일을 열어서 `DISCORD_TOKEN` 값을 넣으세요.
+`.env` 파일을 열어서 **본인 전용 dev 봇**의 `DISCORD_TOKEN`을 넣으세요.
+운영 봇 토큰이나 다른 개발자의 토큰을 넣으면 안 됩니다.
 
-빠른 슬래시 명령어 등록을 원하면 `GUILD_ID`도 넣으세요.
+빠른 슬래시 명령어 등록을 원하면 본인 테스트 서버의 `GUILD_ID`도 넣으세요.
 
 운영자 명령어를 특정 역할도 사용할 수 있게 하려면 `OPERATOR_ROLE_IDS`에 역할 ID를 넣으세요.
 여러 역할은 쉼표로 구분합니다.
@@ -56,6 +65,17 @@ OPERATOR_ROLE_IDS=123456789012345678,987654321098765432
 ```
 
 봇을 끄더라도 `data/event_game.sqlite3`에 점수와 기록이 남습니다.
+
+## 브랜치 / 배포
+
+```
+feature/*  → 각자 로컬에서 본인 dev 봇으로 개발
+develop    → 통합 브랜치. PR로 머지하고 각자 pull 받아 로컬 검증
+main       → 운영 봇. PR 머지 시 GitHub Actions가 서버에 자동 배포
+```
+
+이벤트가 진행 중이면 배포가 자동으로 보류됩니다.
+서버 셋업, 배포 동작, 스키마 변경 규칙은 [`deploy/README.md`](deploy/README.md)를 참고하세요.
 
 ## 명령어
 
