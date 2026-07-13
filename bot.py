@@ -58,21 +58,19 @@ DEFUSE_COLOR_ALIASES = {
     "흰": "white",
     "white": "white",
 }
-GRID_TILE_CHOICES = [str(index) for index in range(1, 10)]
-GRID_REWARD_POINTS = 3
 CUTTING_LEVEL_CHOICES = [str(index) for index in range(0, 7)]
 CUTTING_REWARD_POINTS = {
-    0: 1,
-    1: 1,
+    0: 3,
+    1: 3,
     2: 1,
-    3: 2,
-    4: 2,
-    5: 3,
+    3: 1,
+    4: 1,
+    5: 2,
     6: 4,
 }
 CUTTING_SUCCESS_RATES = {
-    0: 0.8,
-    1: 0.8,
+    0: 0.9,
+    1: 0.9,
     2: 0.6,
     3: 0.6,
     4: 0.5,
@@ -89,22 +87,29 @@ TRUST_OUTCOME_LABELS = {
     "incomplete": "미선택",
 }
 MAIN_GAME_TYPES = {"trust", "sand"}
-MINI_GAME_TYPES = {"balance", "defuse4", "grid", "cutting", "top3"}
+# 'grid'(관리자 시점 타일)는 제거된 미니게임이다. rounds.type CHECK 제약에는 남아 있지만
+# (BASE_SCHEMA 불변) 새 라운드로는 만들 수 없다.
+MINI_GAME_TYPES = {"balance", "defuse4", "cutting", "top3"}
 GAME_NAMES = {
     "balance": "일반 밸런스",
     "defuse4": "4선 폭탄 해체",
-    "grid": "관리자 시점 타일",
     "cutting": "돌 세공 예측",
     "top3": "상위 3명 견제",
     "trust": "신뢰 거래",
     "sand": "모래성 게임",
 }
+ANONYMOUS_GUIDE_TEXT = (
+    "아래 버튼으로 익명 발언을 남겨주세요. 일반 메시지는 익명 보호를 위해 삭제됩니다.\n"
+    "발언 횟수 제한은 없으며, 같은 라운드에서는 계속 같은 익명 번호로 표시됩니다."
+)
 SAND_NUMBER_CHOICES = [str(index) for index in range(1, 11)]
 SAND_PLAY_SECONDS = 600
 SAND_RULES_TEXT = (
     "1. 각 참여자가 1~10 중 모래성이 무너질 횟수를 정합니다.\n"
-    "2. 실제 무너질 횟수는 정한 횟수끼리 뺀 값(두 수의 차이)으로 결정됩니다.\n"
-    "3. 참여자는 번갈아가며 `포기하기` 또는 `모래 덜기`를 결정합니다.\n\n"
+    "2. 두 수의 차이만큼은 안전하게 덜 수 있고, 그 횟수를 초과해서 더는 순간 무너집니다. "
+    "(예: 9와 7이면 차이가 2 → 2번까지는 성공, 3번째에 붕괴. 차이가 0이면 첫 덜기에서 붕괴)\n"
+    "3. 참여자는 번갈아가며 `포기하기` 또는 `모래 덜기`를 결정합니다.\n"
+    "4. 숫자를 안 내거나 제한 시간 안에 끝내지 못하면 마감 때 랜덤으로 자동 진행됩니다.\n\n"
     "- 둘 다 포기 선택 시: 서로 -1점\n"
     "- 한 명이 포기(A), 다른 한 명이 모래 덜기(B) 선택 시:\n"
     "  - 덜기 성공: A는 -1점, B는 +2점\n"
@@ -125,6 +130,35 @@ def now_text() -> str:
 
 def cutting_success_rate(current_level: int) -> float:
     return CUTTING_SUCCESS_RATES[current_level]
+
+
+def _group_consecutive(values: dict[int, Any]) -> list[tuple[list[int], Any]]:
+    """연속하면서 값이 같은 단계들을 한 묶음으로 만든다. 안내문을 상수에서 생성하기 위한 것."""
+    groups: list[tuple[list[int], Any]] = []
+    for level in sorted(values):
+        if groups and groups[-1][1] == values[level] and groups[-1][0][-1] == level - 1:
+            groups[-1][0].append(level)
+        else:
+            groups.append(([level], values[level]))
+    return groups
+
+
+def cutting_success_rate_text() -> str:
+    """예: '0→1·1→2 90% | 2→3·3→4 60% | 4→5 50% | 5→6 30%'"""
+    parts = []
+    for levels, rate in _group_consecutive(CUTTING_SUCCESS_RATES):
+        steps = "·".join(f"{level}→{level + 1}" for level in levels)
+        parts.append(f"{steps} {rate * 100:.0f}%")
+    return " | ".join(parts)
+
+
+def cutting_reward_text() -> str:
+    """예: '0~1강화 +3점 | 2~4강화 +1점 | 5강화 +2점 | 6강화 +4점'"""
+    parts = []
+    for levels, points in _group_consecutive(CUTTING_REWARD_POINTS):
+        span = f"{levels[0]}강화" if len(levels) == 1 else f"{levels[0]}~{levels[-1]}강화"
+        parts.append(f"{span} +{points}점")
+    return " | ".join(parts)
 
 
 @contextmanager
@@ -245,7 +279,25 @@ BASELINE_VERSION = 1
 # 스키마 변경은 전부 여기로. 예:
 #   MIGRATIONS = {2: ["ALTER TABLE rounds ADD COLUMN foo TEXT"]}
 # 롤백 가능하도록 반드시 '추가' 형태(ADD COLUMN 등)로만 작성한다.
-MIGRATIONS: dict[int, list[str]] = {}
+MIGRATIONS: dict[int, list[str]] = {
+    # discussion_posts는 PK가 (round_id, user_id)라 유저당 한 건만 담을 수 있다.
+    # 발언 횟수 제한을 없애면서 익명 번호를 고정하려면 별도 테이블이 필요하다.
+    # (BASE_SCHEMA는 불변이므로 기존 테이블의 PK를 고칠 수 없다.)
+    2: [
+        """
+        CREATE TABLE IF NOT EXISTS discussion_messages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            round_id INTEGER NOT NULL,
+            user_id TEXT NOT NULL,
+            anon_number INTEGER NOT NULL,
+            message_id TEXT NOT NULL,
+            content TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY (round_id) REFERENCES rounds(id) ON DELETE CASCADE
+        )
+        """,
+    ],
+}
 
 SCHEMA_VERSION = max([BASELINE_VERSION, *MIGRATIONS])
 
@@ -404,6 +456,22 @@ def ensure_trust_pairing_schema(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE trust_pairings ADD COLUMN discussion_thread_id TEXT")
 
 
+def assign_anonymous_number(conn: sqlite3.Connection, round_id: int, user_id: str) -> int:
+    """라운드 안에서 유저에게 고정으로 붙는 익명 번호. 첫 발언 때 1부터 순서대로 발급한다."""
+    existing = conn.execute(
+        "SELECT anon_number FROM discussion_messages WHERE round_id = ? AND user_id = ? LIMIT 1",
+        (round_id, user_id),
+    ).fetchone()
+    if existing:
+        return int(existing["anon_number"])
+
+    row = conn.execute(
+        "SELECT COALESCE(MAX(anon_number), 0) + 1 AS next FROM discussion_messages WHERE round_id = ?",
+        (round_id,),
+    ).fetchone()
+    return int(row["next"])
+
+
 def ensure_user(conn: sqlite3.Connection, user: discord.abc.User) -> None:
     display_name = getattr(user, "display_name", None) or user.name
     ts = now_text()
@@ -558,12 +626,22 @@ def mention_list(user_ids: list[str], limit: int = 40) -> str:
     return ", ".join(mentions) + suffix
 
 
-def format_score_message(display_name: str, total_score: int) -> str:
-    safe_name = discord.utils.escape_mentions(display_name)
-    return f"{safe_name} 현재 점수: **{total_score}점**"
+def format_my_score_message(third_score: int | None, my_score: int) -> str:
+    """3등 점수와 내 점수만 알려준다. 이름은 넣지 않는다.
+
+    3등이 동점이어도 보여주는 값이 '점수'뿐이라, 누가 3등으로 뽑히든 결과가 같다.
+    (동점자가 몇 명인지 유저가 알 수 없어야 한다.)
+    """
+    third_text = f"**{third_score}점**" if third_score is not None else "아직 없음"
+    return f"3등 점수: {third_text}\n내 점수: **{my_score}점**"
 
 
 def fetch_ranking_rows(conn: sqlite3.Connection, current_bot_id: str) -> list[sqlite3.Row]:
+    """점수 순으로 줄 세운 참여자 명단. 게임 기록이 있는 사람만, 봇은 제외.
+
+    동점자는 user_id 순으로 고정한다. 점수가 그대로면 몇 번을 불러도 같은 사람이 3등으로
+    뽑혀야 하기 때문이다. (updated_at으로 정렬하면 add_score가 그 값을 건드려 순서가 흔들린다.)
+    """
     return conn.execute(
         """
         SELECT users.user_id, users.display_name, users.total_score
@@ -579,7 +657,7 @@ def fetch_ranking_rows(conn: sqlite3.Connection, current_bot_id: str) -> list[sq
                   WHERE trust_registrations.user_id = users.user_id
               )
           )
-        ORDER BY users.total_score DESC, users.updated_at ASC
+        ORDER BY users.total_score DESC, users.user_id ASC
         """,
         (current_bot_id,),
     ).fetchall()
@@ -603,26 +681,6 @@ def write_admin_score_report(path: Path, rows: list[sqlite3.Row]) -> None:
         writer.writerow(["user_id", "display_name", "total_score", "updated_at"])
         for row in rows:
             writer.writerow([row["user_id"], row["display_name"], row["total_score"], row["updated_at"]])
-
-
-def shuffle_tied_ranking_rows(rows: list[sqlite3.Row]) -> list[sqlite3.Row]:
-    shuffled_rows = list(rows)
-    group_start = 0
-    while group_start < len(shuffled_rows):
-        group_end = group_start + 1
-        score = shuffled_rows[group_start]["total_score"]
-        while group_end < len(shuffled_rows) and shuffled_rows[group_end]["total_score"] == score:
-            group_end += 1
-        if group_end - group_start > 1:
-            tied_rows = shuffled_rows[group_start:group_end]
-            random.shuffle(tied_rows)
-            shuffled_rows[group_start:group_end] = tied_rows
-        group_start = group_end
-    return shuffled_rows
-
-
-def format_ranking_lines(rows: list[sqlite3.Row]) -> list[str]:
-    return [f"{index}등 - **{row['total_score']}점**" for index, row in enumerate(rows, start=1)]
 
 
 async def current_guild_member(guild: discord.Guild, user_id: str) -> discord.Member | None:
@@ -886,51 +944,53 @@ class AnonymousDiscussionModal(discord.ui.Modal):
         self.add_item(self.content_input)
 
     async def on_submit(self, interaction: discord.Interaction) -> None:
+        # 스레드 잠금 해제 -> 발언 게시 -> 버튼 재게시 -> 재잠금까지 API 호출이 여러 번이라
+        # 모달의 3초 응답 제한을 넘긴다. 먼저 defer하고 followup으로 답한다.
+        await interaction.response.defer(ephemeral=True)
+
         if not isinstance(interaction.channel, discord.Thread):
-            await interaction.response.send_message("토론 스레드에서만 발언할 수 있습니다.", ephemeral=True)
+            await interaction.followup.send("토론 스레드에서만 발언할 수 있습니다.", ephemeral=True)
             return
 
         content = self.content_input.value.strip()
         if not content:
-            await interaction.response.send_message("발언 내용을 입력해주세요.", ephemeral=True)
+            await interaction.followup.send("발언 내용을 입력해주세요.", ephemeral=True)
             return
 
+        user_id = str(interaction.user.id)
         with db() as conn:
             round_row = conn.execute(
                 """
-                SELECT id FROM rounds
+                SELECT * FROM rounds
                 WHERE id = ? AND status = 'open' AND discussion_thread_id = ?
                 """,
                 (self.round_id, str(interaction.channel.id)),
             ).fetchone()
             if not round_row:
-                await interaction.response.send_message("이미 마감되었거나 유효하지 않은 토론방입니다.", ephemeral=True)
+                await interaction.followup.send("이미 마감되었거나 유효하지 않은 토론방입니다.", ephemeral=True)
                 return
-            if not can_join_round(conn, self.round_id, str(interaction.user.id)):
-                await interaction.response.send_message(
+            if not can_join_round(conn, self.round_id, user_id):
+                await interaction.followup.send(
                     "이번 이벤트에서 `참여하기`를 누른 유저만 토론에 참여할 수 있습니다.",
                     ephemeral=True,
                 )
                 return
 
-            already = conn.execute(
-                "SELECT 1 FROM discussion_posts WHERE round_id = ? AND user_id = ?",
-                (self.round_id, str(interaction.user.id)),
-            ).fetchone()
-            if already:
-                await interaction.response.send_message("이 라운드에는 이미 발언을 남겼습니다.", ephemeral=True)
-                return
-
             ensure_user(conn, interaction.user)
-            # Reserve the one allowed post before sending, so double-clicks cannot post twice.
-            conn.execute(
+            anon_number = assign_anonymous_number(conn, self.round_id, user_id)
+            # 게시 전에 행을 잡아둔다. 더블클릭해도 번호가 두 개로 갈리지 않는다.
+            cursor = conn.execute(
                 """
-                INSERT INTO discussion_posts (round_id, user_id, message_id, content, created_at)
-                VALUES (?, ?, 'pending', ?, ?)
+                INSERT INTO discussion_messages
+                    (round_id, user_id, anon_number, message_id, content, created_at)
+                VALUES (?, ?, ?, 'pending', ?, ?)
                 """,
-                (self.round_id, str(interaction.user.id), content, now_text()),
+                (self.round_id, user_id, anon_number, content, now_text()),
             )
+            post_id = int(cursor.lastrowid)
+            old_button_message_id = str(round_extra(round_row).get("anon_button_message_id") or "")
 
+        new_button_message_id = None
         try:
             # 익명 토론방은 평소 보관+잠금 상태여서 일반 유저의 채팅 입력이 막혀 있습니다.
             # 봇이 익명 발언을 올릴 때만 잠시 열고, 전송 직후 다시 닫습니다.
@@ -940,19 +1000,29 @@ class AnonymousDiscussionModal(discord.ui.Modal):
                 reason="익명 미니게임 발언 게시",
             )
             posted_message = await interaction.channel.send(
-                f"**익명 참가자**\n{content}",
+                f"**익명{anon_number}**\n{content}",
                 allowed_mentions=discord.AllowedMentions.none(),
             )
+            # 버튼이 발언에 밀려 위로 올라가지 않도록, 옛 버튼을 지우고 맨 아래에 다시 붙인다.
+            if old_button_message_id:
+                try:
+                    old_button = await interaction.channel.fetch_message(int(old_button_message_id))
+                    await old_button.delete()
+                except (discord.NotFound, discord.HTTPException, ValueError):
+                    pass
+            try:
+                new_button = await interaction.channel.send(
+                    ANONYMOUS_GUIDE_TEXT,
+                    view=anonymous_discussion_view(self.round_id),
+                )
+                new_button_message_id = str(new_button.id)
+            except discord.HTTPException:
+                # 버튼 재게시에 실패해도 발언 자체는 이미 올라갔다. 발언을 되돌리지는 않는다.
+                pass
         except discord.HTTPException:
             with db() as conn:
-                conn.execute(
-                    """
-                    DELETE FROM discussion_posts
-                    WHERE round_id = ? AND user_id = ? AND message_id = 'pending'
-                    """,
-                    (self.round_id, str(interaction.user.id)),
-                )
-            await interaction.response.send_message("익명 발언을 올리지 못했습니다. 다시 시도해주세요.", ephemeral=True)
+                conn.execute("DELETE FROM discussion_messages WHERE id = ?", (post_id,))
+            await interaction.followup.send("익명 발언을 올리지 못했습니다. 다시 시도해주세요.", ephemeral=True)
             return
         finally:
             try:
@@ -966,14 +1036,22 @@ class AnonymousDiscussionModal(discord.ui.Modal):
 
         with db() as conn:
             conn.execute(
-                """
-                UPDATE discussion_posts SET message_id = ?
-                WHERE round_id = ? AND user_id = ?
-                """,
-                (str(posted_message.id), self.round_id, str(interaction.user.id)),
+                "UPDATE discussion_messages SET message_id = ? WHERE id = ?",
+                (str(posted_message.id), post_id),
             )
+            if new_button_message_id:
+                fresh_row = conn.execute(
+                    "SELECT extra_json FROM rounds WHERE id = ?", (self.round_id,)
+                ).fetchone()
+                if fresh_row:
+                    extra = round_extra(fresh_row)
+                    extra["anon_button_message_id"] = new_button_message_id
+                    conn.execute(
+                        "UPDATE rounds SET extra_json = ? WHERE id = ?",
+                        (json.dumps(extra, ensure_ascii=False), self.round_id),
+                    )
 
-        await interaction.response.send_message("익명으로 발언을 올렸습니다.", ephemeral=True)
+        await interaction.followup.send(f"`익명{anon_number}`으로 발언을 올렸습니다.", ephemeral=True)
 
 
 def build_random_trust_pairs(
@@ -1143,8 +1221,9 @@ async def create_trust_pair_threads(transition: dict[str, Any]) -> None:
             await thread.send(
                 (
                     f"<@{user_a_id}>님과 <@{user_b_id}>님의 비공개 협상방입니다.\n"
-                    "서로 마음껏 대화한 뒤 아래 버튼으로 `신뢰` 또는 `배신`을 선택하세요.(*한번 선택하면 되돌릴 수 없습니다!)\n"
-                    "선택은 마감 전까지 상대에게 공개되지 않으며, 마감 후 이 방에서 함께 공개됩니다."
+                    "서로 마음껏 대화한 뒤 아래 버튼으로 `신뢰` 또는 `배신`을 선택하세요. (마감 전까지 몇 번이든 바꿀 수 있습니다)\n"
+                    "선택은 마감 전까지 상대에게 공개되지 않으며, 마감 후 이 방에서 함께 공개됩니다.\n"
+                    "*마감까지 고르지 않으면 `신뢰`/`배신` 중 하나가 랜덤으로 배정됩니다."
                 ),
                 view=trust_decision_view(round_id),
             )
@@ -1327,23 +1406,22 @@ async def handle_trust_decision(
             )
             return
 
-        existing = conn.execute(
-            "SELECT 1 FROM votes WHERE round_id = ? AND user_id = ?",
-            (round_id, str(interaction.user.id)),
-        ).fetchone()
-        if existing:
-            await interaction.response.send_message("선택을 이미 확정했습니다. 변경할 수 없습니다.", ephemeral=True)
-            return
-
         ensure_user(conn, interaction.user)
+        ts = now_text()
         conn.execute(
             """
             INSERT INTO votes (round_id, user_id, choice, created_at, updated_at)
             VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(round_id, user_id) DO UPDATE SET
+                choice = excluded.choice,
+                updated_at = excluded.updated_at
             """,
-            (round_id, str(interaction.user.id), choice, now_text(), now_text()),
+            (round_id, str(interaction.user.id), choice, ts, ts),
         )
-    await interaction.response.send_message("선택을 확정했습니다.", ephemeral=True)
+    await interaction.response.send_message(
+        "선택을 저장했습니다. 마감 전까지 다시 누르면 선택이 바뀝니다.",
+        ephemeral=True,
+    )
 
 
 def start_sand_game(round_id: int) -> dict[str, Any] | None:
@@ -1471,13 +1549,125 @@ def find_sand_pair(extra: dict[str, Any], user_id: str) -> dict[str, Any] | None
 
 
 def sand_pair_threshold(pair: dict[str, Any]) -> tuple[int, int]:
+    """(두 수의 차이, 무너지는 덜기 횟수).
+
+    차이만큼은 안전하게 덜 수 있고 그 횟수를 초과하는 순간 무너진다.
+    예: 9와 7이면 차이가 2 -> 2번까지 성공, 3번째에 붕괴.
+    차이가 0이면 첫 덜기에서 바로 무너진다.
+    """
     raw_difference = abs(int(pair["number_a"]) - int(pair["number_b"]))
-    return raw_difference, max(1, raw_difference)
+    return raw_difference, raw_difference + 1
 
 
 def sand_games_complete(extra: dict[str, Any]) -> bool:
     pairs = extra.get("sand_pairs", [])
     return bool(pairs) and all(pair.get("phase") == "resolved" for pair in pairs)
+
+
+def apply_sand_action(pair: dict[str, Any], user_id: str, action: str) -> str:
+    """모래성 한 수를 pair에 반영하고 행동한 사람에게 보여줄 문구를 돌려준다.
+
+    DB도 디스코드도 건드리지 않는 순수 함수라, 마감 시 랜덤 자동 진행에서도 그대로 재사용한다.
+    호출 전에 차례·단계 검증이 끝나 있어야 한다.
+    """
+    phase = str(pair.get("phase"))
+    user_a_id = str(pair["user_a_id"])
+    user_b_id = str(pair["user_b_id"])
+    other_user_id = user_b_id if user_id == user_a_id else user_a_id
+    raw_difference, collapse_attempt = sand_pair_threshold(pair)
+
+    if action == "quit":
+        if phase == "awaiting_quit_response":
+            quitter_id = str(pair["quitter_id"])
+            pair.update(
+                {
+                    "phase": "resolved",
+                    "outcome": "mutual_quit",
+                    "result": {"losers": [quitter_id, user_id]},
+                }
+            )
+            return "상대의 포기에 함께 포기했습니다. 두 사람 모두 -1점입니다."
+        pair.update(
+            {
+                "phase": "awaiting_quit_response",
+                "quitter_id": user_id,
+                "current_user_id": other_user_id,
+            }
+        )
+        return "포기했습니다. 상대가 포기할지, 마지막으로 모래를 덜지 결정합니다."
+
+    attempt = int(pair.get("successful_removals", 0)) + 1
+    collapsed = attempt >= collapse_attempt
+    if collapsed:
+        if phase == "awaiting_quit_response":
+            quitter_id = str(pair["quitter_id"])
+            pair.update(
+                {
+                    "phase": "resolved",
+                    "outcome": "quit_collapse",
+                    "result": {"winner": quitter_id, "collapsed_user": user_id},
+                    "collapse_attempt": attempt,
+                    "raw_difference": raw_difference,
+                }
+            )
+            return "모래를 덜다가 무너졌습니다. 나는 -1점, 먼저 포기한 상대는 +1점입니다."
+        pair.update(
+            {
+                "phase": "resolved",
+                "outcome": "plain_collapse",
+                "result": {"collapsed_user": user_id},
+                "collapse_attempt": attempt,
+                "raw_difference": raw_difference,
+            }
+        )
+        return "모래를 덜다가 무너졌습니다. -1점입니다."
+
+    if phase == "awaiting_quit_response":
+        quitter_id = str(pair["quitter_id"])
+        pair.update(
+            {
+                "phase": "resolved",
+                "outcome": "quit_success",
+                "successful_removals": attempt,
+                "result": {"winner": user_id, "quitter": quitter_id},
+                "raw_difference": raw_difference,
+            }
+        )
+        return "마지막 모래 덜기에 성공했습니다. 나는 +2점, 먼저 포기한 상대는 -1점입니다."
+
+    pair.update(
+        {
+            "successful_removals": attempt,
+            "current_user_id": other_user_id,
+        }
+    )
+    return f"모래 덜기 성공! 이제 <@{other_user_id}>님의 차례입니다."
+
+
+def autocomplete_sand_pair(pair: dict[str, Any]) -> None:
+    """마감 시점에 안 끝난 페어를 랜덤으로 끝까지 진행시킨다.
+
+    숫자를 안 낸 사람에게는 1~10을 무작위로 배정하고, 남은 턴은 포기/덜기를 무작위로 고른다.
+    미선택으로 0점이 되는 대신 어떤 식으로든 결과가 나오게 하는 것이 목적이다.
+    """
+    if str(pair.get("phase")) == "resolved":
+        return
+
+    for key in ("number_a", "number_b"):
+        if pair.get(key) is None:
+            pair[key] = random.randint(1, 10)
+    if str(pair.get("phase")) == "number_selection":
+        pair["phase"] = "active"
+    if not pair.get("current_user_id"):
+        pair["current_user_id"] = random.choice([pair["user_a_id"], pair["user_b_id"]])
+
+    # 차이는 최대 9라 붕괴까지 최대 10수 + 포기 응답 1수. 상한은 순수 안전장치다.
+    for _ in range(20):
+        if str(pair.get("phase")) == "resolved":
+            break
+        apply_sand_action(pair, str(pair["current_user_id"]), random.choice(["quit", "remove"]))
+
+    pair["auto_completed"] = True
 
 
 async def refresh_or_finish_sand_round(
@@ -1593,79 +1783,7 @@ async def handle_sand_action(
             await interaction.response.send_message("지금은 상대의 차례입니다.", ephemeral=True)
             return
 
-        user_a_id = str(pair["user_a_id"])
-        user_b_id = str(pair["user_b_id"])
-        other_user_id = user_b_id if user_id == user_a_id else user_a_id
-        raw_difference, collapse_attempt = sand_pair_threshold(pair)
-        private_message: str
-
-        if action == "quit":
-            if phase == "awaiting_quit_response":
-                quitter_id = str(pair["quitter_id"])
-                pair.update(
-                    {
-                        "phase": "resolved",
-                        "outcome": "mutual_quit",
-                        "result": {"losers": [quitter_id, user_id]},
-                    }
-                )
-                private_message = "상대의 포기에 함께 포기했습니다. 두 사람 모두 -1점입니다."
-            else:
-                pair.update(
-                    {
-                        "phase": "awaiting_quit_response",
-                        "quitter_id": user_id,
-                        "current_user_id": other_user_id,
-                    }
-                )
-                private_message = "포기했습니다. 상대가 포기할지, 마지막으로 모래를 덜지 결정합니다."
-        else:
-            attempt = int(pair.get("successful_removals", 0)) + 1
-            collapsed = attempt >= collapse_attempt
-            if collapsed:
-                if phase == "awaiting_quit_response":
-                    quitter_id = str(pair["quitter_id"])
-                    pair.update(
-                        {
-                            "phase": "resolved",
-                            "outcome": "quit_collapse",
-                            "result": {"winner": quitter_id, "collapsed_user": user_id},
-                            "collapse_attempt": attempt,
-                            "raw_difference": raw_difference,
-                        }
-                    )
-                    private_message = "모래를 덜다가 무너졌습니다. 나는 -1점, 먼저 포기한 상대는 +1점입니다."
-                else:
-                    pair.update(
-                        {
-                            "phase": "resolved",
-                            "outcome": "plain_collapse",
-                            "result": {"collapsed_user": user_id},
-                            "collapse_attempt": attempt,
-                            "raw_difference": raw_difference,
-                        }
-                    )
-                    private_message = "모래를 덜다가 무너졌습니다. -1점입니다."
-            elif phase == "awaiting_quit_response":
-                quitter_id = str(pair["quitter_id"])
-                pair.update(
-                    {
-                        "phase": "resolved",
-                        "outcome": "quit_success",
-                        "successful_removals": attempt,
-                        "result": {"winner": user_id, "quitter": quitter_id},
-                        "raw_difference": raw_difference,
-                    }
-                )
-                private_message = "마지막 모래 덜기에 성공했습니다. 나는 +2점, 먼저 포기한 상대는 -1점입니다."
-            else:
-                pair.update(
-                    {
-                        "successful_removals": attempt,
-                        "current_user_id": other_user_id,
-                    }
-                )
-                private_message = f"모래 덜기 성공! 이제 <@{other_user_id}>님의 차례입니다."
+        private_message = apply_sand_action(pair, user_id, action)
 
         conn.execute(
             "UPDATE rounds SET extra_json = ? WHERE id = ?",
@@ -1901,6 +2019,7 @@ class EventBot(discord.Client):
                 await interaction.response.send_message("토론 스레드에서만 사용할 수 있는 버튼입니다.", ephemeral=True)
                 return
 
+            # can_join_round는 반드시 with 블록 안에서 부른다. 밖으로 나가면 커넥션이 닫혀 있다.
             with db() as conn:
                 round_row = conn.execute(
                     """
@@ -1909,10 +2028,14 @@ class EventBot(discord.Client):
                     """,
                     (round_id, str(interaction.channel.id)),
                 ).fetchone()
+                joinable = bool(round_row) and can_join_round(
+                    conn, round_id, str(interaction.user.id)
+                )
+
             if not round_row:
                 await interaction.response.send_message("이미 마감되었거나 유효하지 않은 토론방입니다.", ephemeral=True)
                 return
-            if not can_join_round(conn, round_id, str(interaction.user.id)):
+            if not joinable:
                 await interaction.response.send_message(
                     "이번 이벤트에서 `참여하기`를 누른 유저만 토론에 참여할 수 있습니다.",
                     ephemeral=True,
@@ -1958,6 +2081,15 @@ class EventBot(discord.Client):
             if not can_join_round(conn, round_id, str(interaction.user.id)):
                 await interaction.response.send_message(
                     "이번 이벤트에서 `참여하기`를 누른 유저만 게임에 참여할 수 있습니다.",
+                    ephemeral=True,
+                )
+                return
+            if round_row["type"] == "top3" and str(interaction.user.id) in {
+                str(candidate["user_id"])
+                for candidate in round_extra(round_row).get("candidates", [])
+            }:
+                await interaction.response.send_message(
+                    "견제 대상인 상위 3명은 투표할 수 없습니다.",
                     ephemeral=True,
                 )
                 return
@@ -2026,8 +2158,9 @@ def build_balance_embed(round_id: int, question: str, option_a: str, option_b: s
         name="규칙",
         value=(
             "투표 현황은 마감 전까지 비공개입니다.\n"
-            "토론 스레드에서는 1인 1회만 발언할 수 있습니다.\n"
-            "마감 후 다수파 선택자에게 +1점이 지급됩니다."
+            "토론 스레드에서 익명으로 몇 번이든 발언할 수 있습니다.\n"
+            "마감 후 다수파 선택자에게 +1점이 지급됩니다.\n"
+            "단, 한쪽이 0명이면 밸런스가 성립하지 않으므로 고른 사람 전원 -2점입니다."
         ),
         inline=False,
     )
@@ -2051,32 +2184,8 @@ def build_defuse_embed(round_id: int, title: str, hint: str) -> discord.Embed:
         value=(
             "4개의 색 버튼 중 단 하나만 안전한 버튼입니다.\n"
             "관리자가 정한 안전 색은 마감 전까지 공개되지 않습니다.\n"
-            "해체 토론방에서 한 번씩 심리전과 블러핑을 할 수 있습니다.\n"
+            "해체 토론방에서 익명으로 몇 번이든 심리전과 블러핑을 할 수 있습니다.\n"
             "마감 후 안전한 버튼을 고른 사람에게만 +1점이 지급됩니다."
-        ),
-        inline=False,
-    )
-    return embed
-
-
-def build_grid_embed(round_id: int, title: str, admin_clue: str, reward_points: int) -> discord.Embed:
-    embed = discord.Embed(
-        title=title,
-        description=title,
-        color=discord.Color.purple(),
-    )
-    embed.add_field(name="관리자의 선택 이유", value=admin_clue, inline=False)
-    embed.add_field(
-        name="타일",
-        value="1 | 2 | 3\n4 | 5 | 6\n7 | 8 | 9",
-        inline=False,
-    )
-    embed.add_field(
-        name="규칙",
-        value=(
-            "관리자가 자기 관점에서 왜 그 칸을 골랐는지 추리하는 게임입니다.\n"
-            "토론방에서 한 번 의견을 남길 수 있으며, 분탕과 블러핑으로 다른 유저를 흔들 수 있습니다.\n"
-            f"마감 후 정답 칸을 고른 사람에게 +{reward_points}점이 지급됩니다."
         ),
         inline=False,
     )
@@ -2091,15 +2200,16 @@ def build_cutting_embed(round_id: int, title: str) -> discord.Embed:
     )
     embed.add_field(
         name="예측 단계",
-        value="0강화 | 1강화 | 2강화 | 3강화 | 4강화 | 5강화 | 6강화",
+        value=" | ".join(f"{level}강화" for level in CUTTING_LEVEL_CHOICES),
         inline=False,
     )
+    # 확률과 보상은 상수에서 만든다. 손으로 적어두면 상수를 바꿨을 때 안내문만 옛날 값으로 남는다.
     embed.add_field(
         name="규칙",
         value=(
-            "강화 성공 확률: 0→1·1→2 80% | 2→3·3→4 60% | 4→5 50% | 5→6 30%\n"
+            f"강화 성공 확률: {cutting_success_rate_text()}\n"
             "처음 실패하기 직전의 강화 단계를 맞히는 게임입니다.\n"
-            "정답 보상: 0~2강화 +1점 | 3~4강화 +2점 | 5강화 +3점 | 6강화 +4점\n"
+            f"정답 보상: {cutting_reward_text()}\n"
             "투표 집계가 끝나면 운영자가 `/세공진행`으로 직접 세공을 진행합니다."
         ),
         inline=False,
@@ -2132,8 +2242,10 @@ def build_top3_embed(round_id: int, title: str, candidates: list[dict[str, Any]]
         name="규칙",
         value=(
             "현재 점수가 가장 높은 3명과 `선택하지 않는다` 중 하나에 투표합니다.\n"
-            "`선택하지 않는다` 득표수가 세 후보 득표수 합보다 많으면 상위 3명을 제외한 모두가 +1점입니다.\n"
-            "그렇지 않으면 세 후보 중 가장 많이 선택된 1명이 -1점입니다."
+            "후보로 오른 3명은 투표할 수 없습니다.\n"
+            "`선택하지 않는다` 득표수가 세 후보 득표수 합보다 많으면 `선택하지 않는다`를 고른 사람 전원이 +1점입니다.\n"
+            "그렇지 않으면 세 후보 중 가장 많이 선택된 1명이 -1점입니다.\n"
+            "아무도 투표하지 않으면 이 라운드는 무효 처리됩니다."
         ),
         inline=False,
     )
@@ -2157,7 +2269,8 @@ def build_trust_registration_embed(round_id: int, title: str, registration_minut
             "무작위로 매칭된 두 명의 참가자가 신뢰와 배신을 선택합니다.\n"
             "- 상호 신뢰 시 : 각 +1점\n"
             "- 한명만 배신 시 : 배신자 +2점\n"
-            "- 동시 배신 시 : 각 -1점"
+            "- 동시 배신 시 : 각 -1점\n\n"
+            "선택은 마감 전까지 바꿀 수 있고, 끝까지 고르지 않으면 랜덤으로 배정됩니다."
         ),
         inline=False,
     )
@@ -2216,7 +2329,7 @@ def build_trust_decision_embed(
         name="선택 규칙 (3분)",
         value=(
             "비공개 협상방에서 매칭된 짝과 대화한 뒤 `신뢰` 또는 `배신`을 선택하세요. 서로의 선택은 마감 후 해당 방에서 공개됩니다.\n"
-            "*한번 선택하면 되돌릴 수 없습니다! 주의하세요."
+            "선택은 마감 전까지 몇 번이든 바꿀 수 있습니다. 끝까지 고르지 않으면 랜덤으로 배정됩니다."
         ),
         inline=False,
     )
@@ -2306,7 +2419,10 @@ def build_sand_play_embed(round_row: sqlite3.Row, extra: dict[str, Any]) -> disc
         )
     embed.add_field(
         name="선택 제한 시간",
-        value=f"10분 안에 모든 1:1 게임을 끝내주세요. 예정 마감: {close_time_text(extra.get('play_close_at'))}",
+        value=(
+            f"10분 안에 모든 1:1 게임을 끝내주세요. 예정 마감: {close_time_text(extra.get('play_close_at'))}\n"
+            "시간 안에 끝내지 못하면 남은 숫자와 행동이 랜덤으로 배정되어 자동으로 결과가 확정됩니다."
+        ),
         inline=False,
     )
     return embed
@@ -2407,21 +2523,6 @@ def cutting_action_view(round_id: int, disabled: bool = False) -> discord.ui.Vie
             disabled=disabled,
         )
     )
-    return view
-
-
-def grid_vote_view(round_id: int) -> discord.ui.View:
-    view = discord.ui.View(timeout=None)
-    for index, value in enumerate(GRID_TILE_CHOICES):
-        row = index // 3
-        view.add_item(
-            discord.ui.Button(
-                label=value,
-                style=discord.ButtonStyle.secondary,
-                custom_id=f"eventbot:vote:{round_id}:{value}",
-                row=row,
-            )
-        )
     return view
 
 
@@ -2620,16 +2721,32 @@ def close_round_record(
             a_users = [row["user_id"] for row in votes if row["choice"] == "A"]
             b_users = [row["user_id"] for row in votes if row["choice"] == "B"]
 
-            winner = None
-            winner_users: list[str] = []
-            if len(a_users) > len(b_users):
-                winner = "A"
-                winner_users = a_users
-            elif len(b_users) > len(a_users):
-                winner = "B"
-                winner_users = b_users
-
-            if winner:
+            scored = False
+            if not a_users and not b_users:
+                settlement = "투표가 없어 점수가 지급되지 않았습니다."
+            elif not a_users or not b_users:
+                # 한쪽으로 몰표. 밸런스가 성립하지 않았으므로 고른 사람 전원에게 패널티.
+                one_sided_users = a_users or b_users
+                one_sided_choice = "A" if a_users else "B"
+                for user_id in one_sided_users:
+                    add_score(
+                        conn,
+                        user_id,
+                        member_name(guild, user_id),
+                        -2,
+                        f"라운드 #{round_row['id']} 몰표 패널티",
+                        round_row["id"],
+                    )
+                scored = True
+                settlement = (
+                    f"모두 `{one_sided_choice}`만 골라 밸런스가 성립하지 않았습니다. "
+                    f"선택자 {len(one_sided_users)}명 전원 -2점"
+                )
+            elif len(a_users) == len(b_users):
+                settlement = "무승부라 점수가 지급되지 않았습니다."
+            else:
+                winner = "A" if len(a_users) > len(b_users) else "B"
+                winner_users = a_users if winner == "A" else b_users
                 for user_id in winner_users:
                     add_score(
                         conn,
@@ -2639,27 +2756,26 @@ def close_round_record(
                         f"라운드 #{round_row['id']} 다수파 선택",
                         round_row["id"],
                     )
+                scored = True
+                settlement = f"다수파 `{winner}` 선택자 전원 +1점"
 
             embed = discord.Embed(
                 title=f"결과 · {round_row['title']}",
                 description=round_row["question"],
-                color=discord.Color.green() if winner else discord.Color.light_grey(),
+                color=discord.Color.green() if scored else discord.Color.light_grey(),
             )
+            # 누가 무엇을 골랐는지는 공개하지 않는다. 인원수만.
             embed.add_field(
                 name=f"A. {round_row['option_a']}",
-                value=f"{len(a_users)}명\n{mention_list(a_users)}",
-                inline=False,
+                value=f"{len(a_users)}명",
+                inline=True,
             )
             embed.add_field(
                 name=f"B. {round_row['option_b']}",
-                value=f"{len(b_users)}명\n{mention_list(b_users)}",
-                inline=False,
+                value=f"{len(b_users)}명",
+                inline=True,
             )
-            embed.add_field(
-                name="정산",
-                value="무승부라 점수가 지급되지 않았습니다." if not winner else f"다수파 `{winner}` 선택자 전원 +1점",
-                inline=False,
-            )
+            embed.add_field(name="정산", value=settlement, inline=False)
         elif round_row["type"] == "bomb":
             wires: dict[str, str] = extra["wires"]
             safe_wire_ids = set(extra["safe_wire_ids"])
@@ -2706,47 +2822,6 @@ def close_round_record(
                 value=f"{'해체 성공자' if is_defuse else '안전선 선택자'} {len(safe_users)}명 전원 +1점",
                 inline=False,
             )
-        elif round_row["type"] == "grid":
-            target_tile = str(extra["target_tile"])
-            admin_clue = str(extra.get("admin_clue", round_row["question"]))
-            reward_points = int(extra.get("reward_points", GRID_REWARD_POINTS))
-            correct_users = [row["user_id"] for row in votes if row["choice"] == target_tile]
-
-            for user_id in correct_users:
-                add_score(
-                    conn,
-                    user_id,
-                    member_name(guild, user_id),
-                    reward_points,
-                    f"라운드 #{round_row['id']} 관리자 시점 타일 정답",
-                    round_row["id"],
-                )
-
-            grouped: dict[str, list[str]] = {}
-            for row in votes:
-                grouped.setdefault(row["choice"], []).append(row["user_id"])
-
-            grid_lines = []
-            for row_start in range(1, 10, 3):
-                cells = []
-                for tile in range(row_start, row_start + 3):
-                    tile_text = str(tile)
-                    count = len(grouped.get(tile_text, []))
-                    marker = "정답" if tile_text == target_tile else f"{count}명"
-                    cells.append(f"{tile_text}({marker})")
-                grid_lines.append(" | ".join(cells))
-
-            embed = discord.Embed(
-                title=f"결과 · {round_row['title']}",
-                description=round_row["title"],
-                color=discord.Color.green(),
-            )
-            embed.add_field(name="관리자의 선택 이유", value=admin_clue, inline=False)
-            embed.add_field(name="정답 칸", value=f"{target_tile}번", inline=True)
-            embed.add_field(name="정답자", value=f"{len(correct_users)}명", inline=True)
-            embed.add_field(name="타일별 선택", value="\n".join(grid_lines), inline=False)
-            embed.add_field(name="정답자 명단", value=mention_list(correct_users), inline=False)
-            embed.add_field(name="정산", value=f"정답자 {len(correct_users)}명 전원 +{reward_points}점", inline=False)
         elif round_row["type"] == "trust":
             vote_choices = {str(row["user_id"]): str(row["choice"]) for row in votes}
             pairs = conn.execute(
@@ -2758,6 +2833,28 @@ def close_round_record(
                 (round_row["id"],),
             ).fetchall()
             outcome_counts = {choice: 0 for choice in TRUST_OUTCOME_LABELS}
+
+            # 마감까지 안 고른 사람은 랜덤 배정한다. 미선택으로 짝 전체가 0점이 되는 일이 없도록.
+            # 협상방 결과 공개(publish_trust_pair_results)가 votes를 다시 읽으므로 DB에도 남긴다.
+            auto_assigned = 0
+            for pair in pairs:
+                for user_id in (str(pair["user_a_id"]), str(pair["user_b_id"])):
+                    if vote_choices.get(user_id):
+                        continue
+                    assigned = random.choice(["trust", "betray"])
+                    ts = now_text()
+                    conn.execute(
+                        """
+                        INSERT INTO votes (round_id, user_id, choice, created_at, updated_at)
+                        VALUES (?, ?, ?, ?, ?)
+                        ON CONFLICT(round_id, user_id) DO UPDATE SET
+                            choice = excluded.choice,
+                            updated_at = excluded.updated_at
+                        """,
+                        (round_row["id"], user_id, assigned, ts, ts),
+                    )
+                    vote_choices[user_id] = assigned
+                    auto_assigned += 1
 
             for pair in pairs:
                 user_a_id = str(pair["user_a_id"])
@@ -2829,6 +2926,12 @@ def close_round_record(
                 ),
                 inline=False,
             )
+            if auto_assigned:
+                embed.add_field(
+                    name="미선택 랜덤 배정",
+                    value=f"{auto_assigned}명",
+                    inline=False,
+                )
             unmatched_user_id = str(extra.get("unmatched_user_id") or "")
             if unmatched_user_id:
                 embed.add_field(
@@ -2844,6 +2947,13 @@ def close_round_record(
         elif round_row["type"] == "sand":
             result_lines: list[str] = []
             completed_count = 0
+            auto_completed_count = 0
+            # 마감 시점에 안 끝난 짝은 랜덤으로 끝까지 진행시킨다. 미완료 0점은 남기지 않는다.
+            for pair in extra.get("sand_pairs", []):
+                if str(pair.get("phase")) != "resolved":
+                    autocomplete_sand_pair(pair)
+                    auto_completed_count += 1
+
             for pair in extra.get("sand_pairs", []):
                 user_a_id = str(pair["user_a_id"])
                 user_b_id = str(pair["user_b_id"])
@@ -2902,9 +3012,10 @@ def close_round_record(
                     continue
 
                 completed_count += 1
+                auto_mark = " · 자동 진행" if pair.get("auto_completed") else ""
                 result_lines.append(
                     f"<@{user_a_id}> ↔ <@{user_b_id}>: {SAND_OUTCOME_LABELS[outcome]} "
-                    f"({number_text}) · {settlement}"
+                    f"({number_text}) · {settlement}{auto_mark}"
                 )
 
             extra.update({"sand_phase": "scored", "sand_scored_at": now_text()})
@@ -2918,11 +3029,12 @@ def close_round_record(
                 color=discord.Color.from_rgb(218, 165, 90),
             )
             embed.add_field(name="짝별 결과", value=field_text(result_lines), inline=False)
-            embed.add_field(
-                name="정산 완료",
-                value=f"완료된 1:1 게임 {completed_count}쌍의 점수를 반영했습니다.",
-                inline=False,
-            )
+            completion_text = f"완료된 1:1 게임 {completed_count}쌍의 점수를 반영했습니다."
+            if auto_completed_count:
+                completion_text += (
+                    f"\n제한 시간 내에 끝나지 않은 {auto_completed_count}쌍은 랜덤으로 자동 진행했습니다."
+                )
+            embed.add_field(name="정산 완료", value=completion_text, inline=False)
             unmatched_user_id = str(extra.get("unmatched_user_id") or "")
             if unmatched_user_id:
                 embed.add_field(
@@ -2951,14 +3063,15 @@ def close_round_record(
                 value="운영자가 `/세공진행`을 실행하면 관리자 전용 세공 버튼이 열립니다. 버튼을 눌러 실패할 때까지 진행하면 결과와 정산이 공개됩니다.",
                 inline=False,
             )
-        else:
+        elif round_row["type"] == "top3":
             candidates: list[dict[str, Any]] = extra["candidates"]
             candidate_ids = [str(candidate["user_id"]) for candidate in candidates]
             grouped: dict[str, list[str]] = {}
             for row in votes:
                 grouped.setdefault(row["choice"], []).append(row["user_id"])
 
-            none_votes = len(grouped.get(TOP3_NONE_CHOICE, []))
+            none_voters = grouped.get(TOP3_NONE_CHOICE, [])
+            none_votes = len(none_voters)
             candidate_vote_sum = sum(len(grouped.get(user_id, [])) for user_id in candidate_ids)
             candidate_lines = []
             for candidate in candidates:
@@ -2967,39 +3080,21 @@ def close_round_record(
                     f"<@{user_id}>: {len(grouped.get(user_id, []))}표"
                 )
 
-            if none_votes > candidate_vote_sum:
-                if round_row["event_session_id"] is None:
-                    winners = conn.execute(
-                        """
-                        SELECT user_id, display_name FROM users
-                        WHERE user_id NOT IN (?, ?, ?)
-                        ORDER BY total_score DESC, updated_at ASC
-                        """,
-                        tuple(candidate_ids),
-                    ).fetchall()
-                else:
-                    winners = conn.execute(
-                        """
-                        SELECT users.user_id, users.display_name
-                        FROM event_participants
-                        JOIN users ON users.user_id = event_participants.user_id
-                        WHERE event_participants.event_session_id = ?
-                          AND users.user_id NOT IN (?, ?, ?)
-                        ORDER BY users.total_score DESC, users.updated_at ASC
-                        """,
-                        (round_row["event_session_id"], *candidate_ids),
-                    ).fetchall()
-                for winner in winners:
+            if none_votes + candidate_vote_sum == 0:
+                outcome = "아무도 투표하지 않아 이번 라운드는 무효입니다."
+                settlement = "점수 변동 없음"
+            elif none_votes > candidate_vote_sum:
+                for user_id in none_voters:
                     add_score(
                         conn,
-                        str(winner["user_id"]),
-                        str(winner["display_name"]),
+                        user_id,
+                        member_name(guild, user_id),
                         1,
                         f"라운드 #{round_row['id']} 상위 3명 견제 성공",
                         round_row["id"],
                     )
                 outcome = "`선택하지 않는다`가 후보 득표 합보다 많았습니다."
-                settlement = f"상위 3명을 제외한 {len(winners)}명 전원 +1점"
+                settlement = f"`선택하지 않는다`를 고른 {none_votes}명 전원 +1점"
             else:
                 target = max(
                     candidates,
@@ -3026,6 +3121,18 @@ def close_round_record(
             embed.add_field(name="후보 득표 합", value=f"{candidate_vote_sum}표", inline=True)
             embed.add_field(name="결과", value=outcome, inline=False)
             embed.add_field(name="정산", value=settlement, inline=False)
+        else:
+            # 제거된 게임 타입(예: 과거의 'grid')이 열린 채 남아 있는 경우. 정산 없이 닫는다.
+            embed = discord.Embed(
+                title=f"결과 · {round_row['title']}",
+                description=round_row["title"],
+                color=discord.Color.light_grey(),
+            )
+            embed.add_field(
+                name="정산",
+                value="더 이상 지원하지 않는 게임이라 점수 없이 마감했습니다.",
+                inline=False,
+            )
 
         embed.add_field(name="통계", value=f"투표 참여: {len(votes)}명", inline=False)
         planned_mini_game = str(extra.get("planned_mini_game") or "")
@@ -3070,16 +3177,6 @@ def parse_defuse_color(value: str) -> str:
     if not color_id:
         raise ValueError("안전 색은 빨강, 파랑, 검정, 흰색 중 하나로 입력해주세요.")
     return color_id
-
-
-def parse_range_int(value: str, name: str, minimum: int, maximum: int) -> int:
-    value = value.strip()
-    if not value.isdigit():
-        raise ValueError(f"{name}은 숫자로 입력해주세요.")
-    number = int(value)
-    if number < minimum or number > maximum:
-        raise ValueError(f"{name}은 {minimum}부터 {maximum} 사이로 입력해주세요.")
-    return number
 
 
 async def ensure_trust_private_thread_permissions(interaction: discord.Interaction) -> bool:
@@ -3158,20 +3255,6 @@ class StartSetupModal(discord.ui.Modal):
             )
             self.add_item(self.safe_color)
             self.add_item(self.defuse_hint)
-        elif game == "grid":
-            self.target_tile = discord.ui.TextInput(
-                label="정답 칸",
-                placeholder="1~9",
-                max_length=1,
-            )
-            self.admin_clue = discord.ui.TextInput(
-                label="관리자의 선택 이유",
-                placeholder="나는 이런 이유로 이 칸을 골랐다",
-                style=discord.TextStyle.paragraph,
-                max_length=800,
-            )
-            self.add_item(self.target_tile)
-            self.add_item(self.admin_clue)
 
     async def on_submit(self, interaction: discord.Interaction) -> None:
         try:
@@ -3199,17 +3282,6 @@ class StartSetupModal(discord.ui.Modal):
                     title,
                     안전색=parse_defuse_color(str(self.safe_color.value)),
                     힌트=str(self.defuse_hint.value).strip(),
-                    예정_미니게임=self.planned_mini_game,
-                    단독_미니게임=self.standalone_mini_game,
-                )
-            elif self.game == "grid":
-                await create_round_from_setup(
-                    interaction,
-                    self.game,
-                    duration,
-                    title,
-                    정답칸=parse_range_int(str(self.target_tile.value), "정답 칸", 1, 9),
-                    관리자설명=str(self.admin_clue.value).strip(),
                     예정_미니게임=self.planned_mini_game,
                     단독_미니게임=self.standalone_mini_game,
                 )
@@ -3291,7 +3363,6 @@ async def open_event(interaction: discord.Interaction) -> None:
     미니게임=[
         app_commands.Choice(name="일반 밸런스", value="balance"),
         app_commands.Choice(name="4선 폭탄 해체", value="defuse4"),
-        app_commands.Choice(name="관리자 시점 타일", value="grid"),
         app_commands.Choice(name="돌 세공 예측", value="cutting"),
         app_commands.Choice(name="상위 3명 견제", value="top3"),
     ],
@@ -3322,7 +3393,6 @@ async def start(interaction: discord.Interaction, 메인게임: str, 미니게�
     게임=[
         app_commands.Choice(name="일반 밸런스", value="balance"),
         app_commands.Choice(name="4선 폭탄 해체", value="defuse4"),
-        app_commands.Choice(name="관리자 시점 타일", value="grid"),
         app_commands.Choice(name="돌 세공 예측", value="cutting"),
         app_commands.Choice(name="상위 3명 견제", value="top3"),
     ]
@@ -3361,8 +3431,6 @@ async def create_round_from_setup(
     안전선개수: int = 2,
     안전색: str | None = None,
     힌트: str | None = None,
-    정답칸: int | None = None,
-    관리자설명: str | None = None,
     예정_미니게임: str | None = None,
     단독_미니게임: bool = False,
 ) -> None:
@@ -3545,38 +3613,6 @@ async def create_round_from_setup(
             round_id = int(cursor.lastrowid)
             embed = build_defuse_embed(round_id, 제목, 힌트)
             view = defuse_vote_view(round_id)
-        elif 게임 == "grid":
-            if 정답칸 is None or not 관리자설명:
-                await interaction.response.send_message(
-                    "관리자 시점 타일 게임은 `정답칸`과 `관리자설명`이 필요합니다.",
-                    ephemeral=True,
-                )
-                return
-
-            extra.update(
-                {
-                    "target_tile": str(int(정답칸)),
-                    "admin_clue": 관리자설명,
-                    "reward_points": GRID_REWARD_POINTS,
-                }
-            )
-            cursor = conn.execute(
-                """
-                INSERT INTO rounds
-                    (type, title, question, status, channel_id, extra_json, created_at)
-                VALUES ('grid', ?, ?, 'open', ?, ?, ?)
-                """,
-                (
-                    제목,
-                    관리자설명,
-                    str(interaction.channel.id),
-                    json.dumps(extra, ensure_ascii=False),
-                    now_text(),
-                ),
-            )
-            round_id = int(cursor.lastrowid)
-            embed = build_grid_embed(round_id, 제목, 관리자설명, GRID_REWARD_POINTS)
-            view = grid_vote_view(round_id)
         elif 게임 == "trust":
             extra.update(
                 {
@@ -3751,40 +3787,24 @@ async def create_round_from_setup(
     message = await interaction.original_response()
 
     discussion_thread_id = None
-    if 게임 in {"balance", "grid", "defuse4"}:
+    if 게임 in {"balance", "defuse4"}:
         try:
             thread_name = f"{제목} | 토론방"[:100]
             thread = await message.create_thread(name=thread_name)
+            button_message = await thread.send(
+                ANONYMOUS_GUIDE_TEXT,
+                view=anonymous_discussion_view(round_id),
+            )
+            # 발언이 쌓여도 버튼이 항상 맨 아래에 오도록, 발언마다 이 메시지를 지우고 다시 보낸다.
+            extra["anon_button_message_id"] = str(button_message.id)
             if 게임 == "balance":
-                await thread.send(
-                    "아래 버튼으로 익명 발언을 남겨주세요. 일반 메시지는 익명 보호를 위해 삭제됩니다. "
-                    "단, 한 사람당 한 번만 발언 가능합니다.",
-                    view=anonymous_discussion_view(round_id),
-                )
                 notice_embed = build_thread_notice_embed(
                     round_id,
                     thread,
                     "토론방이 열렸습니다",
-                    "버튼을 눌러 익명으로 설득, 블러핑, 진실 말하기를 할 수 있습니다. 한 사람당 한 번만 발언 가능합니다.",
-                )
-            elif 게임 == "grid":
-                await thread.send(
-                    "아래 버튼으로 익명 의견을 남겨주세요. 일반 메시지는 익명 보호를 위해 삭제됩니다. "
-                    "단, 한 사람당 한 번만 의견을 남길 수 있습니다.",
-                    view=anonymous_discussion_view(round_id),
-                )
-                notice_embed = build_thread_notice_embed(
-                    round_id,
-                    thread,
-                    "타일 추리방이 열렸습니다",
-                    "버튼을 눌러 익명으로 관리자의 선택 이유를 해석해 정답 칸을 추리해보세요. 분탕, 블러핑, 역추리 모두 가능합니다.",
+                    "버튼을 눌러 익명으로 설득, 블러핑, 진실 말하기를 할 수 있습니다. 횟수 제한은 없습니다.",
                 )
             else:
-                await thread.send(
-                    "아래 버튼으로 익명 의견을 남겨주세요. 일반 메시지는 익명 보호를 위해 삭제됩니다. "
-                    "단, 한 사람당 한 번만 의견을 남길 수 있습니다.",
-                    view=anonymous_discussion_view(round_id),
-                )
                 notice_embed = build_thread_notice_embed(
                     round_id,
                     thread,
@@ -3809,10 +3829,15 @@ async def create_round_from_setup(
         conn.execute(
             """
             UPDATE rounds
-            SET message_id = ?, discussion_thread_id = ?
+            SET message_id = ?, discussion_thread_id = ?, extra_json = ?
             WHERE id = ?
             """,
-            (str(message.id), discussion_thread_id, round_id),
+            (
+                str(message.id),
+                discussion_thread_id,
+                json.dumps(extra, ensure_ascii=False),
+                round_id,
+            ),
         )
 
     bot.schedule_auto_close(round_id, close_at)
@@ -4020,59 +4045,44 @@ async def run_cutting(interaction: discord.Interaction) -> None:
     await interaction.response.send_message(embed=embed, view=cutting_action_view(int(round_row["id"])))
 
 
-@bot.tree.command(name="점수", description="내 점수 또는 특정 유저의 점수를 확인합니다.")
-@app_commands.describe(사용자="확인할 사용자")
-async def show_score(interaction: discord.Interaction, 사용자: discord.Member | None = None) -> None:
-    target = 사용자 or interaction.user
-    current_bot = interaction.client.user
-    if current_bot and target.id == current_bot.id:
-        await interaction.response.send_message(
-            "이 이벤트 봇의 점수는 조회할 수 없습니다.",
-            ephemeral=True,
-        )
-        return
-    with db() as conn:
-        ensure_user(conn, target)
-        row = conn.execute("SELECT total_score FROM users WHERE user_id = ?", (str(target.id),)).fetchone()
-    await interaction.response.send_message(
-        format_score_message(target.display_name, int(row["total_score"])),
-        ephemeral=True,
-        allowed_mentions=discord.AllowedMentions.none(),
-    )
-
-
-@bot.tree.command(name="랭킹", description="현재 누적 점수 랭킹을 확인합니다.")
-async def ranking(interaction: discord.Interaction) -> None:
+@bot.tree.command(name="점수", description="3등 점수와 내 점수를 확인합니다.")
+async def show_score(interaction: discord.Interaction) -> None:
     if interaction.guild is None:
-        await interaction.response.send_message("서버 안에서만 랭킹을 확인할 수 있습니다.", ephemeral=True)
+        await interaction.response.send_message("서버 안에서만 점수를 확인할 수 있습니다.", ephemeral=True)
         return
+
+    await interaction.response.defer(ephemeral=True)
 
     current_bot_id = str(interaction.client.user.id) if interaction.client.user else ""
     with db() as conn:
-        candidates = shuffle_tied_ranking_rows(fetch_ranking_rows(conn, current_bot_id))
+        ensure_user(conn, interaction.user)
+        my_row = conn.execute(
+            "SELECT total_score FROM users WHERE user_id = ?", (str(interaction.user.id),)
+        ).fetchone()
+        candidates = fetch_ranking_rows(conn, current_bot_id)
 
-    rows = []
+    third_score = None
     try:
+        found = 0
         for candidate in candidates:
             if await current_guild_member(interaction.guild, str(candidate["user_id"])) is None:
                 continue
-            rows.append(candidate)
-            if len(rows) == 10:
+            found += 1
+            if found == 3:
+                third_score = int(candidate["total_score"])
                 break
     except discord.HTTPException:
-        await interaction.response.send_message(
+        await interaction.followup.send(
             "현재 서버 멤버를 확인하지 못했습니다. 잠시 후 다시 시도해주세요.",
             ephemeral=True,
         )
         return
 
-    if not rows:
-        await interaction.response.send_message("현재 서버에 게임 참여 기록이 있는 유저가 없습니다.", ephemeral=True)
-        return
-
-    lines = format_ranking_lines(rows)
-    embed = discord.Embed(title="현재 랭킹 TOP 10", description="\n".join(lines), color=discord.Color.gold())
-    await interaction.response.send_message(embed=embed, allowed_mentions=discord.AllowedMentions.none())
+    await interaction.followup.send(
+        format_my_score_message(third_score, int(my_row["total_score"])),
+        ephemeral=True,
+        allowed_mentions=discord.AllowedMentions.none(),
+    )
 
 
 def backup_database(dest: Path) -> None:
