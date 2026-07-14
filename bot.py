@@ -98,6 +98,7 @@ GAME_NAMES = {
     "trust": "딜레마의 섬",
     "sand": "모래성 게임",
 }
+BALANCE_VOTE_CHOICES = [("A 선택", "A"), ("B 선택", "B")]
 ANONYMOUS_GUIDE_TEXT = (
     "아래 버튼으로 익명 발언을 남겨주세요. 일반 메시지는 익명 보호를 위해 삭제됩니다.\n"
     "발언 횟수 제한은 없으며, 같은 라운드에서는 계속 같은 익명 번호로 표시됩니다."
@@ -804,6 +805,30 @@ def anonymous_discussion_view(round_id: int) -> discord.ui.View:
     return view
 
 
+def round_game_key(round_row: sqlite3.Row) -> str:
+    """코드상 게임 이름. 4선 폭탄 해체는 DB에 type='bomb'으로 저장되고 extra.mode가 'defuse4'다."""
+    return str(round_extra(round_row).get("mode") or round_row["type"])
+
+
+def thread_discussion_view(round_id: int, game_key: str) -> discord.ui.View:
+    """토론방 맨 아래에 붙는 버튼 묶음: 선택지 + 익명 발언하기.
+
+    토론 스레드는 라운드 메시지에서 파생시키므로 그 메시지가 스레드의 시작 메시지가 되는데,
+    시작 메시지의 버튼은 스레드 안에서 누를 수 없다(실체가 부모 채널에 있는 메시지라 회색으로 뜬다).
+    그래서 같은 custom_id의 선택 버튼을 스레드 안에도 둔다. votes는 (round_id, user_id) upsert라
+    채널에서 누르든 스레드에서 누르든 마지막 선택 하나만 남는다.
+    """
+    view = discord.ui.View(timeout=None)
+    vote_buttons = (
+        vote_view(round_id, BALANCE_VOTE_CHOICES)
+        if game_key == "balance"
+        else defuse_vote_view(round_id)
+    )
+    for button in [*vote_buttons.children, *anonymous_discussion_view(round_id).children]:
+        view.add_item(button)
+    return view
+
+
 def count_discussion_messages(conn: sqlite3.Connection, round_id: int) -> int:
     row = conn.execute(
         """
@@ -820,6 +845,11 @@ def build_anonymous_guide_embed(post_count: int) -> discord.Embed:
         title="🕶️ 익명 토론방",
         description=ANONYMOUS_GUIDE_TEXT,
         color=discord.Color.dark_grey(),
+    )
+    embed.add_field(
+        name="투표",
+        value="아래 선택 버튼으로 이 방에서 바로 투표할 수 있습니다. 마감 전까지 몇 번이든 바꿀 수 있습니다.",
+        inline=False,
     )
     embed.add_field(name="누적 발언", value=f"{post_count}개", inline=False)
     return embed
@@ -1058,6 +1088,7 @@ class AnonymousDiscussionModal(discord.ui.Modal):
             )
             post_id = int(cursor.lastrowid)
             old_button_message_id = str(round_extra(round_row).get("anon_button_message_id") or "")
+            game_key = round_game_key(round_row)
 
         try:
             posted_message = await interaction.channel.send(
@@ -1087,7 +1118,7 @@ class AnonymousDiscussionModal(discord.ui.Modal):
         try:
             new_button = await interaction.channel.send(
                 embed=build_anonymous_guide_embed(post_count),
-                view=anonymous_discussion_view(self.round_id),
+                view=thread_discussion_view(self.round_id, game_key),
             )
         except discord.HTTPException:
             # 버튼 재게시에 실패해도 발언 자체는 이미 올라갔다. 발언을 되돌리지는 않는다.
@@ -4312,7 +4343,7 @@ async def create_round_from_setup(
             )
             round_id = int(cursor.lastrowid)
             embed = build_balance_embed(round_id, 제목, 선택_a, 선택_b)
-            view = vote_view(round_id, [("A 선택", "A"), ("B 선택", "B")])
+            view = vote_view(round_id, BALANCE_VOTE_CHOICES)
         elif 게임 == "defuse4":
             if not 안전색:
                 await interaction.response.send_message(
@@ -4533,7 +4564,7 @@ async def create_round_from_setup(
             thread = await message.create_thread(name=thread_name, auto_archive_duration=1440)
             button_message = await thread.send(
                 embed=build_anonymous_guide_embed(0),
-                view=anonymous_discussion_view(round_id),
+                view=thread_discussion_view(round_id, 게임),
             )
             # 발언이 쌓여도 버튼이 항상 맨 아래에 오도록, 발언마다 이 메시지를 지우고 다시 보낸다.
             extra["anon_button_message_id"] = str(button_message.id)
@@ -4827,8 +4858,7 @@ async def list_events(interaction: discord.Interaction) -> None:
     lines: list[str] = []
     for round_row in round_rows:
         extra = round_extra(round_row)
-        # 4선 폭탄 해체는 DB에 'bomb'으로 저장되므로 extra.mode를 먼저 본다.
-        game_key = str(extra.get("mode") or round_row["type"])
+        game_key = round_game_key(round_row)
         phase = extra.get("trust_phase") or extra.get("sand_phase")
         round_status = "진행 중" if round_row["status"] == "open" else "마감"
         lines.append(

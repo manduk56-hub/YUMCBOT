@@ -694,6 +694,48 @@ class BotRegressionTests(unittest.TestCase):
         self.assertIsNotNone(result)
         self.assertEqual(self.score_of("1"), 5)
 
+    def test_thread_view_carries_vote_buttons_with_the_channel_custom_ids(self) -> None:
+        """스레드의 시작 메시지 버튼은 눌리지 않는다. 스레드 안에도 같은 custom_id의 선택 버튼이 있어야 한다."""
+        channel_ids = {
+            button.custom_id for button in bot.vote_view(7, bot.BALANCE_VOTE_CHOICES).children
+        }
+        thread_ids = {button.custom_id for button in bot.thread_discussion_view(7, "balance").children}
+
+        self.assertEqual(channel_ids, {"eventbot:vote:7:A", "eventbot:vote:7:B"})
+        self.assertTrue(channel_ids < thread_ids)
+        self.assertIn("eventbot:anonymous:7", thread_ids)
+
+    def test_defuse_thread_view_fits_in_one_action_row(self) -> None:
+        """색 4개 + 익명 1개 = 5개. 한 줄에 5개가 상한이라 하나만 더 늘어도 터진다."""
+        buttons = bot.thread_discussion_view(7, "defuse4").children
+
+        self.assertEqual(len(buttons), 5)
+        self.assertEqual(
+            {button.custom_id for button in buttons if button.custom_id.startswith("eventbot:vote")},
+            {f"eventbot:vote:7:{color['id']}" for color in bot.DEFUSE_COLORS},
+        )
+
+    def test_round_game_key_maps_bomb_rows_back_to_defuse4(self) -> None:
+        with bot.db() as conn:
+            row = conn.execute(
+                """
+                INSERT INTO rounds (type, title, question, status, extra_json, created_at)
+                VALUES ('bomb', '폭탄', '폭탄', 'open', ?, '2026-01-01 00:00:00')
+                RETURNING *
+                """,
+                (json.dumps({"mode": "defuse4"}),),
+            ).fetchone()
+            balance_row = conn.execute(
+                """
+                INSERT INTO rounds (type, title, question, status, extra_json, created_at)
+                VALUES ('balance', '밸런스', '밸런스', 'open', '{}', '2026-01-01 00:00:00')
+                RETURNING *
+                """
+            ).fetchone()
+
+        self.assertEqual(bot.round_game_key(row), "defuse4")
+        self.assertEqual(bot.round_game_key(balance_row), "balance")
+
     def test_afk_coins_accumulate_and_are_spent_atomically(self) -> None:
         self.add_user("1", "참가자", 0)
         with bot.db() as conn:
