@@ -177,7 +177,9 @@ class BotRegressionTests(unittest.TestCase):
 
         self.assertIsNotNone(transition)
         self.assertEqual(transition["state"], "playing")
-        self.assertTrue(transition["view"].children)
+        self.assertEqual({tuple(sorted(pair)) for pair in transition["pairs"]}, {("1", "2")})
+        # 숫자·행동 버튼은 짝별 비공개 방 안에만 있다. 짝수 인원이라 긴급 투입 버튼도 없다.
+        self.assertIsNone(transition["view"])
         with bot.db() as conn:
             row = conn.execute("SELECT extra_json FROM rounds WHERE id = ?", (round_id,)).fetchone()
         self.assertEqual(json.loads(row["extra_json"])["sand_phase"], "playing")
@@ -691,6 +693,188 @@ class BotRegressionTests(unittest.TestCase):
 
         self.assertIsNotNone(result)
         self.assertEqual(self.score_of("1"), 5)
+
+    def test_thread_view_carries_vote_buttons_with_the_channel_custom_ids(self) -> None:
+        """스레드의 시작 메시지 버튼은 눌리지 않는다. 스레드 안에도 같은 custom_id의 선택 버튼이 있어야 한다."""
+        channel_ids = {
+            button.custom_id for button in bot.vote_view(7, bot.BALANCE_VOTE_CHOICES).children
+        }
+        thread_ids = {button.custom_id for button in bot.thread_discussion_view(7, "balance").children}
+
+        self.assertEqual(channel_ids, {"eventbot:vote:7:A", "eventbot:vote:7:B"})
+        self.assertTrue(channel_ids < thread_ids)
+        self.assertIn("eventbot:anonymous:7", thread_ids)
+
+    def test_defuse_thread_view_fits_in_one_action_row(self) -> None:
+        """색 4개 + 익명 1개 = 5개. 한 줄에 5개가 상한이라 하나만 더 늘어도 터진다."""
+        buttons = bot.thread_discussion_view(7, "defuse4").children
+
+        self.assertEqual(len(buttons), 5)
+        self.assertEqual(
+            {button.custom_id for button in buttons if button.custom_id.startswith("eventbot:vote")},
+            {f"eventbot:vote:7:{color['id']}" for color in bot.DEFUSE_COLORS},
+        )
+
+    def test_round_game_key_maps_bomb_rows_back_to_defuse4(self) -> None:
+        with bot.db() as conn:
+            row = conn.execute(
+                """
+                INSERT INTO rounds (type, title, question, status, extra_json, created_at)
+                VALUES ('bomb', '폭탄', '폭탄', 'open', ?, '2026-01-01 00:00:00')
+                RETURNING *
+                """,
+                (json.dumps({"mode": "defuse4"}),),
+            ).fetchone()
+            balance_row = conn.execute(
+                """
+                INSERT INTO rounds (type, title, question, status, extra_json, created_at)
+                VALUES ('balance', '밸런스', '밸런스', 'open', '{}', '2026-01-01 00:00:00')
+                RETURNING *
+                """
+            ).fetchone()
+
+        self.assertEqual(bot.round_game_key(row), "defuse4")
+        self.assertEqual(bot.round_game_key(balance_row), "balance")
+
+    def test_afk_coins_accumulate_and_are_spent_atomically(self) -> None:
+        self.add_user("1", "참가자", 0)
+        with bot.db() as conn:
+            for _ in range(3):
+                bot.grant_afk_coins(conn, "1", bot.AFK_COIN_PER_TICK)
+            self.assertEqual(bot.get_afk_coins(conn, "1"), 3)
+
+            # 잔액이 모자라면 차감하지 않고 False를 돌려줘야 한다.
+            self.assertFalse(bot.spend_afk_coins(conn, "1", bot.SCORE_REVEAL_COST))
+            self.assertEqual(bot.get_afk_coins(conn, "1"), 3)
+
+            bot.grant_afk_coins(conn, "1", bot.SCORE_REVEAL_COST)
+            self.assertTrue(bot.spend_afk_coins(conn, "1", bot.SCORE_REVEAL_COST))
+            self.assertEqual(bot.get_afk_coins(conn, "1"), 3)
+
+    def test_spending_afk_coins_without_any_row_fails(self) -> None:
+        self.add_user("1", "참가자", 0)
+        with bot.db() as conn:
+            self.assertFalse(bot.spend_afk_coins(conn, "1", bot.SCORE_REVEAL_COST))
+            self.assertEqual(bot.get_afk_coins(conn, "1"), 0)
+
+    def test_odd_participants_leave_one_user_unmatched(self) -> None:
+        pairs, unmatched_user_id = bot.build_random_trust_pairs(["1", "2", "3"], set())
+
+        self.assertEqual(len(pairs), 1)
+        self.assertIsNotNone(unmatched_user_id)
+        paired = {user_id for pair in pairs for user_id in pair}
+        self.assertNotIn(unmatched_user_id, paired)
+
+    def test_emergency_join_pairs_waiting_user_and_extends_deadline(self) -> None:
+        extra = {
+            "sand_phase": "playing",
+            "sand_pairs": [{"user_a_id": "1", "user_b_id": "2", "phase": "active"}],
+            "unmatched_user_id": "3",
+            "auto_close_at": 1000.0,
+            "play_close_at": 1000.0,
+        }
+
+        applied = bot.apply_emergency_join(extra, "sand", "4")
+
+        self.assertIsNotNone(applied)
+        self.assertEqual(applied["user_a_id"], "3")
+        self.assertEqual(applied["user_b_id"], "4")
+        self.assertIsNone(extra["unmatched_user_id"])
+
+        expected_close_at = 1000.0 + bot.EMERGENCY_EXTENSION_SECONDS
+        self.assertEqual(applied["close_at"], expected_close_at)
+        self.assertEqual(extra["auto_close_at"], expected_close_at)
+        self.assertEqual(extra["play_close_at"], expected_close_at)
+
+        new_pair = extra["sand_pairs"][-1]
+        self.assertEqual(new_pair["phase"], "number_selection")
+        self.assertEqual({new_pair["user_a_id"], new_pair["user_b_id"]}, {"3", "4"})
+        self.assertIn(new_pair["current_user_id"], {"3", "4"})
+
+    def test_emergency_join_for_trust_extends_decision_deadline_only(self) -> None:
+        extra = {
+            "trust_phase": "decision",
+            "unmatched_user_id": "3",
+            "auto_close_at": 500.0,
+            "decision_close_at": 500.0,
+        }
+
+        applied = bot.apply_emergency_join(extra, "trust", "4")
+
+        expected_close_at = 500.0 + bot.EMERGENCY_EXTENSION_SECONDS
+        self.assertEqual(applied["close_at"], expected_close_at)
+        self.assertEqual(extra["decision_close_at"], expected_close_at)
+        # 딜레마의 섬은 짝을 trust_pairings에서만 읽는다. extra에 sand_pairs를 만들면 안 된다.
+        self.assertNotIn("sand_pairs", extra)
+
+    def test_emergency_join_is_rejected_when_seat_already_taken(self) -> None:
+        """두 사람이 동시에 눌러도 한 명만 들어가야 한다. (자리를 비운 뒤에는 항상 None)"""
+        extra = {"sand_phase": "playing", "unmatched_user_id": "3", "auto_close_at": 1000.0}
+
+        self.assertIsNotNone(bot.apply_emergency_join(extra, "sand", "4"))
+        self.assertIsNone(bot.apply_emergency_join(extra, "sand", "5"))
+        self.assertEqual(extra["auto_close_at"], 1000.0 + bot.EMERGENCY_EXTENSION_SECONDS)
+
+    def test_emergency_join_rejects_the_waiting_user_themselves(self) -> None:
+        extra = {"sand_phase": "playing", "unmatched_user_id": "3", "auto_close_at": 1000.0}
+
+        self.assertIsNone(bot.apply_emergency_join(extra, "sand", "3"))
+        self.assertEqual(extra["unmatched_user_id"], "3")
+
+    def test_emergency_join_name_is_shown_on_the_main_board_only(self) -> None:
+        """투입자 이름은 메인 채널에만 뜬다. 각 방에는 시간 연장 사실만 알린다."""
+        with bot.db() as conn:
+            round_row = conn.execute(
+                """
+                INSERT INTO rounds (type, title, question, status, channel_id, extra_json, created_at)
+                VALUES ('sand', '모래성', '모래성', 'open', '10', ?, '2026-01-01 00:00:00')
+                RETURNING *
+                """,
+                (
+                    json.dumps(
+                        {
+                            "sand_phase": "playing",
+                            "emergency_user_id": "4",
+                            "sand_pairs": [
+                                {"user_a_id": "3", "user_b_id": "4", "phase": "number_selection"}
+                            ],
+                        }
+                    ),
+                ),
+            ).fetchone()
+
+        board = bot.build_sand_play_embed(round_row, bot.round_extra(round_row))
+        self.assertIn("<@4>", json.dumps(board.to_dict(), ensure_ascii=False))
+
+        self.assertNotIn("<@4>", bot.emergency_thread_notice(1000.0))
+        self.assertNotIn("4", bot.emergency_thread_notice(1000.0).split("새 마감")[0])
+
+    def test_sand_buttons_only_work_in_the_pair_thread(self) -> None:
+        pair = {"user_a_id": "1", "user_b_id": "2", "thread_id": "777"}
+
+        self.assertTrue(bot.sand_pair_thread_matches(pair, 777))
+        self.assertFalse(bot.sand_pair_thread_matches(pair, 888))
+
+    def test_sand_pair_without_thread_stays_playable_anywhere(self) -> None:
+        """이 기능 이전에 시작된 라운드는 방이 없으므로 종전처럼 메인 채널에서 진행돼야 한다."""
+        self.assertTrue(bot.sand_pair_thread_matches({"user_a_id": "1", "user_b_id": "2"}, 999))
+
+    def test_sand_pair_embed_hides_other_pairs(self) -> None:
+        extra = {
+            "play_close_at": 1000.0,
+            "sand_pairs": [
+                {"user_a_id": "1", "user_b_id": "2", "phase": "active", "current_user_id": "1"},
+                {"user_a_id": "3", "user_b_id": "4", "phase": "active", "current_user_id": "3"},
+            ],
+        }
+
+        embed = bot.build_sand_pair_embed("모래성", extra["sand_pairs"][0], extra)
+        rendered = json.dumps(embed.to_dict(), ensure_ascii=False)
+
+        self.assertIn("<@1>", rendered)
+        self.assertIn("<@2>", rendered)
+        self.assertNotIn("<@3>", rendered)
+        self.assertNotIn("<@4>", rendered)
 
 
 if __name__ == "__main__":

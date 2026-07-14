@@ -57,6 +57,46 @@ embed/view 빌더 → `close_round_record`(정산) → 슬래시 명령어 → s
 정산은 전부 `close_round_record()`의 타입별 분기에서 이뤄지고 `add_score()`가 `users.total_score`와
 `score_logs`를 함께 갱신한다.
 
+### 스레드를 잠그지 말 것 (버튼이 죽는다)
+
+**`archived` 또는 `locked` 상태의 스레드에서는 `스레드 관리` 권한이 없는 유저의 버튼 클릭을 디스코드가 막는다.**
+익명 토론방을 잠가두었더니 "관리자만 익명 발언이 된다 / 스레드 안 버튼이 안 눌린다"는 버그가 났었다.
+스레드는 채널 권한을 상속해서 개별 권한 덮어쓰기가 불가능하므로, 일반 채팅 차단은 **`on_message`의 메시지 삭제로만** 한다.
+잠그는 건 라운드가 끝나 버튼이 더 필요 없을 때뿐이다 (`publish_trust_pair_results` / `publish_sand_pair_results`).
+
+진행 중에 자동 보관돼도 같은 문제가 나므로 스레드 생성 시 `auto_archive_duration=1440`을 명시한다.
+
+### 스레드 시작 메시지의 버튼은 눌리지 않는다
+
+토론 스레드는 라운드 메시지에서 파생시키므로(`message.create_thread`) 그 메시지가 스레드의 **시작 메시지**가 된다.
+시작 메시지의 실체는 부모 채널에 있어서, 스레드 안에서는 그 버튼이 회색으로 뜨고 눌리지 않는다.
+그래서 밸런스·4선 폭탄 해체는 **같은 `custom_id`의 선택 버튼을 스레드 안에도 따로 보낸다**
+(`thread_discussion_view()` — 선택지 + 익명 발언하기, 발언마다 맨 아래로 재게시).
+`votes`는 `(round_id, user_id)` upsert라 채널에서 누르든 스레드에서 누르든 마지막 선택 하나만 남는다.
+버튼은 한 줄에 5개가 상한이다 — 4선 폭탄 해체가 색 4 + 익명 1로 이미 꽉 찼다.
+
+### 1:1 비공개 방 (딜레마의 섬 · 모래성)
+
+두 메인게임 모두 짝마다 비공개 스레드를 열고 그 안에 게임 버튼을 둔다. 공용 헬퍼는 `create_pair_thread()`다.
+
+**방에 초대하는 것은 짝 두 사람뿐이다. 운영자를 참관용으로 넣지 말 것.** 운영자도 게임에 참여할 수 있어서
+모든 방에 넣으면 1:1이 성립하지 않는다. 운영자는 `스레드 관리` 권한으로 스레드 목록에서 필요한 방만 골라 본다
+(디스코드 서버 설정에서 운영자 역할에 그 권한을 준다 — 코드가 아니다).
+
+버튼 핸들러는 누른 곳이 본인 짝의 방인지 반드시 검증한다 (`handle_trust_decision`, `sand_pair_thread_matches`).
+방 안에서 누른 버튼의 `interaction.followup`은 그 방으로 들어가므로, **라운드 결과는 메인 채널로 직접 보내야 한다.**
+
+버튼을 누를 때마다 개인 응답(ephemeral)이 방에 쌓여 버튼이 달린 진행판을 위로 밀어낸다. 그래서 모래성은
+상호작용마다 방의 진행판을 지우고 맨 아래에 다시 붙인다(`refresh_sand_pair_board`, 현재 id는
+`sand_pairs[].play_message_id`). 숫자 선택은 두 사람이 동시에 누를 수 있어 `interaction.message`가 이미
+사라진 옛 진행판일 수 있으므로, `EventBot.sand_board_lock(thread_id)`을 잡고 DB에서 id를 다시 읽는다.
+
+참가자가 홀수면 `build_random_trust_pairs()`가 한 명을 `extra_json.unmatched_user_id`로 남긴다.
+그 사람에게는 메인 메시지에 **긴급 투입** 버튼이 붙고, 게임에 참여하지 않은 아무나 눌러 짝이 될 수 있다
+(`apply_emergency_join`). 누른 사람은 `event_participants`에 자동 등록되고, 전체 마감이 1분 밀린다.
+**누가 투입됐는지는 메인 채널에만 공개한다.** 각 방에는 시간 연장 사실만 알린다 — 방마다 상대가 누구인지가
+게임의 일부이므로 다른 방에 이름이 새면 안 된다.
+
 ### 게임 타입 이름 주의
 
 `rounds.type` CHECK 제약은 `('balance','bomb','grid','cutting','top3','trust','sand')`인데, 실제 게임 목록과 다르다.
@@ -73,11 +113,11 @@ embed/view 빌더 → `close_round_record`(정산) → 슬래시 명령어 → s
 수정하면 새로 만든 DB와 운영 DB의 스키마가 조용히 갈라진다.
 
 스키마 추가는 `MIGRATIONS`에 등록한다. `SCHEMA_VERSION`은 자동 계산되고, 부팅 시 `init_db()`가
-`PRAGMA user_version`을 보고 밀린 것만 적용한다. 현재 최신은 **v2**(`discussion_messages` 테이블).
+`PRAGMA user_version`을 보고 밀린 것만 적용한다. 현재 최신은 **v3**(`afk_coins` 테이블).
 
 ```python
 MIGRATIONS: dict[int, list[str]] = {
-    3: ["ALTER TABLE rounds ADD COLUMN memo TEXT"],
+    4: ["ALTER TABLE rounds ADD COLUMN memo TEXT"],
 }
 ```
 

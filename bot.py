@@ -98,6 +98,7 @@ GAME_NAMES = {
     "trust": "딜레마의 섬",
     "sand": "모래성 게임",
 }
+BALANCE_VOTE_CHOICES = [("A 선택", "A"), ("B 선택", "B")]
 ANONYMOUS_GUIDE_TEXT = (
     "아래 버튼으로 익명 발언을 남겨주세요. 일반 메시지는 익명 보호를 위해 삭제됩니다.\n"
     "발언 횟수 제한은 없으며, 같은 라운드에서는 계속 같은 익명 번호로 표시됩니다."
@@ -122,6 +123,16 @@ SAND_OUTCOME_LABELS = {
     "quit_collapse": "포기 후 상대 모래성 붕괴",
     "plain_collapse": "일반 모래성 붕괴",
 }
+EVENT_STATUS_LABELS = {
+    "recruiting": "참가 모집 중",
+    "active": "게임 진행 중",
+    "closed": "종료",
+}
+# 참가자가 홀수라 짝이 없는 사람이 생겼을 때, 새 참가자가 긴급 투입되면 전체 마감이 이만큼 밀린다.
+EMERGENCY_EXTENSION_SECONDS = 60
+AFK_TICK_SECONDS = 60
+AFK_COIN_PER_TICK = 1
+SCORE_REVEAL_COST = 30
 
 
 def now_text() -> str:
@@ -294,6 +305,17 @@ MIGRATIONS: dict[int, list[str]] = {
             content TEXT NOT NULL,
             created_at TEXT NOT NULL,
             FOREIGN KEY (round_id) REFERENCES rounds(id) ON DELETE CASCADE
+        )
+        """,
+    ],
+    # 음성채널 체류로 쌓이는 잠수 코인. /지목으로 소모한다.
+    3: [
+        """
+        CREATE TABLE IF NOT EXISTS afk_coins (
+            user_id TEXT PRIMARY KEY,
+            coins INTEGER NOT NULL DEFAULT 0,
+            updated_at TEXT NOT NULL,
+            FOREIGN KEY (user_id) REFERENCES users(user_id) ON DELETE CASCADE
         )
         """,
     ],
@@ -517,6 +539,33 @@ def add_score(
         """,
         (round_id, user_id, delta, reason, ts),
     )
+
+
+def get_afk_coins(conn: sqlite3.Connection, user_id: str) -> int:
+    row = conn.execute("SELECT coins FROM afk_coins WHERE user_id = ?", (user_id,)).fetchone()
+    return int(row["coins"]) if row else 0
+
+
+def grant_afk_coins(conn: sqlite3.Connection, user_id: str, amount: int) -> None:
+    conn.execute(
+        """
+        INSERT INTO afk_coins (user_id, coins, updated_at)
+        VALUES (?, ?, ?)
+        ON CONFLICT(user_id) DO UPDATE SET
+            coins = coins + excluded.coins,
+            updated_at = excluded.updated_at
+        """,
+        (user_id, amount, now_text()),
+    )
+
+
+def spend_afk_coins(conn: sqlite3.Connection, user_id: str, cost: int) -> bool:
+    """잔액이 충분할 때만 차감한다. 동시 호출에도 잔액이 음수로 내려가지 않도록 조건부 UPDATE로 처리한다."""
+    cursor = conn.execute(
+        "UPDATE afk_coins SET coins = coins - ?, updated_at = ? WHERE user_id = ? AND coins >= ?",
+        (cost, now_text(), user_id, cost),
+    )
+    return cursor.rowcount == 1
 
 
 def get_open_round(conn: sqlite3.Connection) -> sqlite3.Row | None:
@@ -756,6 +805,56 @@ def anonymous_discussion_view(round_id: int) -> discord.ui.View:
     return view
 
 
+def round_game_key(round_row: sqlite3.Row) -> str:
+    """코드상 게임 이름. 4선 폭탄 해체는 DB에 type='bomb'으로 저장되고 extra.mode가 'defuse4'다."""
+    return str(round_extra(round_row).get("mode") or round_row["type"])
+
+
+def thread_discussion_view(round_id: int, game_key: str) -> discord.ui.View:
+    """토론방 맨 아래에 붙는 버튼 묶음: 선택지 + 익명 발언하기.
+
+    토론 스레드는 라운드 메시지에서 파생시키므로 그 메시지가 스레드의 시작 메시지가 되는데,
+    시작 메시지의 버튼은 스레드 안에서 누를 수 없다(실체가 부모 채널에 있는 메시지라 회색으로 뜬다).
+    그래서 같은 custom_id의 선택 버튼을 스레드 안에도 둔다. votes는 (round_id, user_id) upsert라
+    채널에서 누르든 스레드에서 누르든 마지막 선택 하나만 남는다.
+    """
+    view = discord.ui.View(timeout=None)
+    vote_buttons = (
+        vote_view(round_id, BALANCE_VOTE_CHOICES)
+        if game_key == "balance"
+        else defuse_vote_view(round_id)
+    )
+    for button in [*vote_buttons.children, *anonymous_discussion_view(round_id).children]:
+        view.add_item(button)
+    return view
+
+
+def count_discussion_messages(conn: sqlite3.Connection, round_id: int) -> int:
+    row = conn.execute(
+        """
+        SELECT COUNT(*) AS count FROM discussion_messages
+        WHERE round_id = ? AND message_id != 'pending'
+        """,
+        (round_id,),
+    ).fetchone()
+    return int(row["count"]) if row else 0
+
+
+def build_anonymous_guide_embed(post_count: int) -> discord.Embed:
+    embed = discord.Embed(
+        title="🕶️ 익명 토론방",
+        description=ANONYMOUS_GUIDE_TEXT,
+        color=discord.Color.dark_grey(),
+    )
+    embed.add_field(
+        name="투표",
+        value="아래 선택 버튼으로 이 방에서 바로 투표할 수 있습니다. 마감 전까지 몇 번이든 바꿀 수 있습니다.",
+        inline=False,
+    )
+    embed.add_field(name="누적 발언", value=f"{post_count}개", inline=False)
+    return embed
+
+
 def build_event_open_embed() -> discord.Embed:
     embed = discord.Embed(
         title="오늘의 이벤트가 열렸습니다!",
@@ -944,8 +1043,8 @@ class AnonymousDiscussionModal(discord.ui.Modal):
         self.add_item(self.content_input)
 
     async def on_submit(self, interaction: discord.Interaction) -> None:
-        # 스레드 잠금 해제 -> 발언 게시 -> 버튼 재게시 -> 재잠금까지 API 호출이 여러 번이라
-        # 모달의 3초 응답 제한을 넘긴다. 먼저 defer하고 followup으로 답한다.
+        # 발언 게시 -> 옛 버튼 삭제 -> 버튼 재게시까지 API 호출이 여러 번이라 모달의 3초 응답
+        # 제한을 넘긴다. 먼저 defer하고, 성공하면 그 ephemeral을 지워서 흔적을 남기지 않는다.
         await interaction.response.defer(ephemeral=True)
 
         if not isinstance(interaction.channel, discord.Thread):
@@ -989,69 +1088,60 @@ class AnonymousDiscussionModal(discord.ui.Modal):
             )
             post_id = int(cursor.lastrowid)
             old_button_message_id = str(round_extra(round_row).get("anon_button_message_id") or "")
+            game_key = round_game_key(round_row)
 
-        new_button_message_id = None
         try:
-            # 익명 토론방은 평소 보관+잠금 상태여서 일반 유저의 채팅 입력이 막혀 있습니다.
-            # 봇이 익명 발언을 올릴 때만 잠시 열고, 전송 직후 다시 닫습니다.
-            await interaction.channel.edit(
-                archived=False,
-                locked=False,
-                reason="익명 미니게임 발언 게시",
-            )
             posted_message = await interaction.channel.send(
                 f"**익명{anon_number}**\n{content}",
                 allowed_mentions=discord.AllowedMentions.none(),
             )
-            # 버튼이 발언에 밀려 위로 올라가지 않도록, 옛 버튼을 지우고 맨 아래에 다시 붙인다.
-            if old_button_message_id:
-                try:
-                    old_button = await interaction.channel.fetch_message(int(old_button_message_id))
-                    await old_button.delete()
-                except (discord.NotFound, discord.HTTPException, ValueError):
-                    pass
-            try:
-                new_button = await interaction.channel.send(
-                    ANONYMOUS_GUIDE_TEXT,
-                    view=anonymous_discussion_view(self.round_id),
-                )
-                new_button_message_id = str(new_button.id)
-            except discord.HTTPException:
-                # 버튼 재게시에 실패해도 발언 자체는 이미 올라갔다. 발언을 되돌리지는 않는다.
-                pass
         except discord.HTTPException:
             with db() as conn:
                 conn.execute("DELETE FROM discussion_messages WHERE id = ?", (post_id,))
             await interaction.followup.send("익명 발언을 올리지 못했습니다. 다시 시도해주세요.", ephemeral=True)
             return
-        finally:
-            try:
-                await interaction.channel.edit(
-                    archived=True,
-                    locked=True,
-                    reason="익명 미니게임 토론방: 일반 채팅 차단",
-                )
-            except discord.HTTPException:
-                pass
 
         with db() as conn:
             conn.execute(
                 "UPDATE discussion_messages SET message_id = ? WHERE id = ?",
                 (str(posted_message.id), post_id),
             )
-            if new_button_message_id:
+            post_count = count_discussion_messages(conn, self.round_id)
+
+        # 버튼이 발언에 밀려 위로 올라가지 않도록, 옛 버튼을 지우고 맨 아래에 다시 붙인다.
+        if old_button_message_id:
+            try:
+                old_button = await interaction.channel.fetch_message(int(old_button_message_id))
+                await old_button.delete()
+            except (discord.NotFound, discord.HTTPException, ValueError):
+                pass
+        try:
+            new_button = await interaction.channel.send(
+                embed=build_anonymous_guide_embed(post_count),
+                view=thread_discussion_view(self.round_id, game_key),
+            )
+        except discord.HTTPException:
+            # 버튼 재게시에 실패해도 발언 자체는 이미 올라갔다. 발언을 되돌리지는 않는다.
+            new_button = None
+
+        if new_button:
+            with db() as conn:
                 fresh_row = conn.execute(
                     "SELECT extra_json FROM rounds WHERE id = ?", (self.round_id,)
                 ).fetchone()
                 if fresh_row:
                     extra = round_extra(fresh_row)
-                    extra["anon_button_message_id"] = new_button_message_id
+                    extra["anon_button_message_id"] = str(new_button.id)
                     conn.execute(
                         "UPDATE rounds SET extra_json = ? WHERE id = ?",
                         (json.dumps(extra, ensure_ascii=False), self.round_id),
                     )
 
-        await interaction.followup.send(f"`익명{anon_number}`으로 발언을 올렸습니다.", ephemeral=True)
+        # 발언자를 드러내지 않도록 확인 문구를 남기지 않고 defer한 ephemeral만 조용히 지운다.
+        try:
+            await interaction.delete_original_response()
+        except discord.HTTPException:
+            pass
 
 
 def build_random_trust_pairs(
@@ -1170,7 +1260,7 @@ def start_trust_decision(round_id: int) -> dict[str, Any] | None:
             "title": str(round_row["title"]),
             "pairs": pairs,
             "embed": embed,
-            "view": None,
+            "view": emergency_join_view(round_id) if unmatched_user_id else None,
             "close_at": decision_close_at,
         }
 
@@ -1190,17 +1280,96 @@ async def update_trust_main_message(transition: dict[str, Any]) -> None:
         return
 
 
+async def resolve_text_channel(channel_id: str) -> discord.TextChannel | None:
+    channel = bot.get_channel(int(channel_id))
+    if channel is None:
+        try:
+            channel = await bot.fetch_channel(int(channel_id))
+        except (discord.HTTPException, ValueError):
+            return None
+    return channel if isinstance(channel, discord.TextChannel) else None
+
+
+async def create_pair_thread(
+    channel: discord.TextChannel,
+    thread_name: str,
+    member_ids: list[str],
+    reason: str,
+    view: discord.ui.View,
+    content: str | None = None,
+    embed: discord.Embed | None = None,
+) -> tuple[discord.Thread, discord.Message] | None:
+    """짝 하나를 위한 비공개 스레드를 열고 첫 메시지를 올린다. 실패하면 None.
+
+    딜레마의 섬 · 모래성 · 긴급투입이 모두 이 헬퍼를 쓴다.
+    보관되면 `스레드 관리` 권한이 없는 유저의 버튼 클릭이 막히므로 보관 시간을 넉넉히 잡는다.
+
+    초대는 짝 두 사람뿐이다. 운영자도 게임에 참여할 수 있으므로 참관용으로 방에 넣지 않는다.
+    운영자는 `스레드 관리` 권한으로 스레드 목록에서 필요한 방만 골라 보면 된다.
+    """
+    try:
+        thread = await channel.create_thread(
+            name=thread_name[:100],
+            type=discord.ChannelType.private_thread,
+            invitable=False,
+            auto_archive_duration=1440,
+            reason=reason,
+        )
+    except (discord.Forbidden, discord.HTTPException):
+        return None
+
+    for user_id in member_ids:
+        try:
+            await thread.add_user(discord.Object(id=int(user_id)))
+        except (discord.HTTPException, ValueError):
+            pass
+
+    try:
+        message = await thread.send(content=content, embed=embed, view=view)
+    except discord.HTTPException:
+        return None
+    return thread, message
+
+
+def save_pair_thread_id(round_id: int, user_a_id: str, user_b_id: str, thread_id: str) -> None:
+    with db() as conn:
+        conn.execute(
+            """
+            UPDATE trust_pairings
+            SET discussion_thread_id = ?
+            WHERE round_id = ? AND user_a_id = ? AND user_b_id = ?
+            """,
+            (thread_id, round_id, user_a_id, user_b_id),
+        )
+
+
+async def warn_failed_pair_threads(channel: discord.TextChannel, round_id: int, failed: int) -> None:
+    if not failed:
+        return
+    try:
+        await channel.send(
+            f"라운드 #{round_id}의 비공개 방 {failed}개를 만들지 못했습니다. "
+            "봇의 비공개 스레드 생성·관리 권한을 확인해주세요."
+        )
+    except discord.HTTPException:
+        pass
+
+
+def trust_pair_intro(user_a_id: str, user_b_id: str) -> str:
+    return (
+        f"<@{user_a_id}>님과 <@{user_b_id}>님의 비공개 협상방입니다.\n"
+        "서로 마음껏 대화한 뒤 아래 버튼으로 `신뢰` 또는 `배신`을 선택하세요. (마감 전까지 몇 번이든 바꿀 수 있습니다)\n"
+        "선택은 마감 전까지 상대에게 공개되지 않으며, 마감 후 이 방에서 함께 공개됩니다.\n"
+        "*마감까지 고르지 않으면 `신뢰`/`배신` 중 하나가 랜덤으로 배정됩니다."
+    )
+
+
 async def create_trust_pair_threads(transition: dict[str, Any]) -> None:
     if transition.get("state") != "decision":
         return
 
-    channel = bot.get_channel(int(transition["channel_id"]))
+    channel = await resolve_text_channel(str(transition["channel_id"]))
     if channel is None:
-        try:
-            channel = await bot.fetch_channel(int(transition["channel_id"]))
-        except discord.HTTPException:
-            return
-    if not isinstance(channel, discord.TextChannel):
         return
 
     round_id = int(transition["round_id"])
@@ -1208,45 +1377,21 @@ async def create_trust_pair_threads(transition: dict[str, Any]) -> None:
     failed_pairs = 0
     for pair_number, pair in enumerate(transition.get("pairs", []), start=1):
         user_a_id, user_b_id = (str(pair[0]), str(pair[1]))
-        try:
-            thread = await channel.create_thread(
-                name=f"{title} · {pair_number}세트"[:100],
-                type=discord.ChannelType.private_thread,
-                invitable=False,
-                auto_archive_duration=60,
-                reason=f"딜레마의 섬 #{round_id} 세트별 비공개 협상방",
-            )
-            await thread.add_user(discord.Object(id=int(user_a_id)))
-            await thread.add_user(discord.Object(id=int(user_b_id)))
-            await thread.send(
-                (
-                    f"<@{user_a_id}>님과 <@{user_b_id}>님의 비공개 협상방입니다.\n"
-                    "서로 마음껏 대화한 뒤 아래 버튼으로 `신뢰` 또는 `배신`을 선택하세요. (마감 전까지 몇 번이든 바꿀 수 있습니다)\n"
-                    "선택은 마감 전까지 상대에게 공개되지 않으며, 마감 후 이 방에서 함께 공개됩니다.\n"
-                    "*마감까지 고르지 않으면 `신뢰`/`배신` 중 하나가 랜덤으로 배정됩니다."
-                ),
-                view=trust_decision_view(round_id),
-            )
-            with db() as conn:
-                conn.execute(
-                    """
-                    UPDATE trust_pairings
-                    SET discussion_thread_id = ?
-                    WHERE round_id = ? AND user_a_id = ? AND user_b_id = ?
-                    """,
-                    (str(thread.id), round_id, user_a_id, user_b_id),
-                )
-        except (discord.Forbidden, discord.HTTPException, ValueError):
+        created = await create_pair_thread(
+            channel,
+            f"{title} · {pair_number}세트",
+            [user_a_id, user_b_id],
+            f"딜레마의 섬 #{round_id} 세트별 비공개 협상방",
+            trust_decision_view(round_id),
+            content=trust_pair_intro(user_a_id, user_b_id),
+        )
+        if created is None:
             failed_pairs += 1
+            continue
+        thread, _ = created
+        save_pair_thread_id(round_id, user_a_id, user_b_id, str(thread.id))
 
-    if failed_pairs:
-        try:
-            await channel.send(
-                f"딜레마의 섬 #{round_id}의 비공개 협상방 {failed_pairs}개를 만들지 못했습니다. "
-                "봇의 비공개 스레드 생성·관리 권한을 확인해주세요."
-            )
-        except discord.HTTPException:
-            pass
+    await warn_failed_pair_threads(channel, round_id, failed_pairs)
 
 
 def build_trust_pair_result_embed(
@@ -1502,10 +1647,369 @@ def start_sand_game(round_id: int) -> dict[str, Any] | None:
             "state": "playing",
             "channel_id": str(round_row["channel_id"]),
             "message_id": str(round_row["message_id"] or ""),
+            "round_id": round_id,
+            "title": str(round_row["title"]),
+            "pairs": pairs,
             "embed": build_sand_play_embed(updated_row, extra),
-            "view": sand_play_view(round_id),
+            # 숫자·행동 버튼은 짝별 비공개 방 안에만 둔다. 메인 메시지는 진행판 역할만 한다.
+            "view": emergency_join_view(round_id) if unmatched_user_id else None,
             "close_at": play_close_at,
         }
+
+
+def sand_pair_intro(user_a_id: str, user_b_id: str) -> str:
+    return (
+        f"<@{user_a_id}>님과 <@{user_b_id}>님의 1:1 모래성 방입니다.\n"
+        "먼저 각자 1~10 중 하나를 고르세요. (번복 불가, 마감까지 상대에게 공개되지 않습니다)\n"
+        "두 사람이 모두 고르면 번갈아가며 `포기하기` 또는 `모래 덜기`를 선택합니다."
+    )
+
+
+def sand_pair_settlement_text(pair: dict[str, Any]) -> str:
+    """짝 하나의 정산 문구. 라운드 결과 요약과 방별 결과 공개가 같은 문구를 쓰도록 한 곳에 모은다."""
+    outcome = str(pair.get("outcome") or "")
+    result = pair.get("result", {})
+    if outcome == "mutual_quit":
+        return "각 -1점"
+    if outcome == "quit_success":
+        return f"<@{result['winner']}> +2점 · <@{result['quitter']}> -1점"
+    if outcome == "quit_collapse":
+        return f"<@{result['winner']}> +1점 · <@{result['collapsed_user']}> -1점"
+    if outcome == "plain_collapse":
+        return f"<@{result['collapsed_user']}> -1점"
+    return "점수 변동 없음"
+
+
+async def create_sand_pair_threads(transition: dict[str, Any]) -> None:
+    """짝마다 비공개 방을 열고 그 안에 숫자·행동 버튼을 둔다. (딜레마의 섬과 같은 방식)"""
+    if transition.get("state") != "playing":
+        return
+
+    channel = await resolve_text_channel(str(transition["channel_id"]))
+    if channel is None:
+        return
+
+    round_id = int(transition["round_id"])
+    title = str(transition["title"])
+
+    with db() as conn:
+        round_row = conn.execute("SELECT * FROM rounds WHERE id = ?", (round_id,)).fetchone()
+    if not round_row:
+        return
+    extra = round_extra(round_row)
+
+    created_threads: dict[tuple[str, str], tuple[str, str]] = {}
+    failed_pairs = 0
+    for pair_number, pair in enumerate(extra.get("sand_pairs", []), start=1):
+        user_a_id = str(pair["user_a_id"])
+        user_b_id = str(pair["user_b_id"])
+        created = await create_pair_thread(
+            channel,
+            f"{title} · {pair_number}번 모래성",
+            [user_a_id, user_b_id],
+            f"모래성 게임 #{round_id} 1:1 비공개 방",
+            sand_play_view(round_id),
+            content=sand_pair_intro(user_a_id, user_b_id),
+            embed=build_sand_pair_embed(title, pair, extra),
+        )
+        if created is None:
+            failed_pairs += 1
+            continue
+        thread, message = created
+        save_pair_thread_id(round_id, user_a_id, user_b_id, str(thread.id))
+        created_threads[(user_a_id, user_b_id)] = (str(thread.id), str(message.id))
+
+    if created_threads:
+        store_sand_thread_ids(round_id, created_threads)
+    await warn_failed_pair_threads(channel, round_id, failed_pairs)
+
+
+def store_sand_thread_ids(
+    round_id: int,
+    created_threads: dict[tuple[str, str], tuple[str, str]],
+) -> None:
+    """스레드/메시지 id를 sand_pairs에 심는다. 재시작 후에도 방별 진행판을 갱신할 수 있어야 한다."""
+    with db() as conn:
+        round_row = conn.execute("SELECT * FROM rounds WHERE id = ?", (round_id,)).fetchone()
+        if not round_row:
+            return
+        extra = round_extra(round_row)
+        for pair in extra.get("sand_pairs", []):
+            key = (str(pair["user_a_id"]), str(pair["user_b_id"]))
+            if key in created_threads:
+                pair["thread_id"], pair["play_message_id"] = created_threads[key]
+        conn.execute(
+            "UPDATE rounds SET extra_json = ? WHERE id = ?",
+            (json.dumps(extra, ensure_ascii=False), round_id),
+        )
+
+
+async def publish_sand_pair_results(round_id: int) -> None:
+    with db() as conn:
+        round_row = conn.execute(
+            "SELECT * FROM rounds WHERE id = ? AND type = 'sand'",
+            (round_id,),
+        ).fetchone()
+    if not round_row:
+        return
+
+    title = str(round_row["title"])
+    extra = round_extra(round_row)
+    for pair in extra.get("sand_pairs", []):
+        thread_id = str(pair.get("thread_id") or "")
+        if not thread_id:
+            continue
+        try:
+            bot.sand_board_locks.pop(int(thread_id), None)
+            thread = bot.get_channel(int(thread_id)) or await bot.fetch_channel(int(thread_id))
+            if not isinstance(thread, discord.Thread):
+                continue
+            if thread.archived:
+                await thread.edit(archived=False, reason="모래성 게임 결과 공개")
+            await thread.send(embed=build_sand_pair_result_embed(title, pair))
+            await thread.edit(
+                archived=True,
+                locked=True,
+                reason="모래성 게임 결과 공개 완료",
+            )
+        except (discord.Forbidden, discord.HTTPException, ValueError):
+            continue
+
+
+def apply_emergency_join(
+    extra: dict[str, Any],
+    round_type: str,
+    new_user_id: str,
+) -> dict[str, Any] | None:
+    """긴급 투입을 extra에 반영한다. 짝 없는 대기자가 없으면 None.
+
+    DB도 디스코드도 건드리지 않는 순수 함수라 테스트에서 그대로 쓴다.
+    호출 전에 라운드 상태·중복 참여 검증이 끝나 있어야 한다.
+    """
+    unmatched_user_id = str(extra.get("unmatched_user_id") or "")
+    if not unmatched_user_id or unmatched_user_id == new_user_id:
+        return None
+
+    pair = {
+        "user_a_id": unmatched_user_id,
+        "user_b_id": new_user_id,
+        "number_a": None,
+        "number_b": None,
+        "phase": "number_selection",
+        "current_user_id": random.choice([unmatched_user_id, new_user_id]),
+        "successful_removals": 0,
+    }
+    if round_type == "sand":
+        extra.setdefault("sand_pairs", []).append(pair)
+
+    extra["unmatched_user_id"] = None
+    extra["emergency_user_id"] = new_user_id
+
+    # 늦게 합류한 짝도 게임을 끝낼 시간이 필요하다. 전체 마감을 1분 미룬다.
+    close_at = float(extra.get("auto_close_at") or time.time()) + EMERGENCY_EXTENSION_SECONDS
+    extra["auto_close_at"] = close_at
+    extra["decision_close_at" if round_type == "trust" else "play_close_at"] = close_at
+
+    return {
+        "user_a_id": unmatched_user_id,
+        "user_b_id": new_user_id,
+        "pair": pair,
+        "close_at": close_at,
+    }
+
+
+def emergency_thread_notice(close_at: float) -> str:
+    """비공개 방에 나가는 공지. 투입자가 누구인지는 절대 넣지 않는다.
+
+    방마다 상대가 누구인지가 게임의 일부다. 투입자 이름은 메인 채널의 진행판에서만 공개한다.
+    """
+    return (
+        "🚨 새 참가자가 긴급 투입되어 전체 진행 시간이 1분 연장됩니다.\n"
+        f"새 마감: {close_time_text(close_at)}"
+    )
+
+
+async def announce_emergency_join(round_id: int, close_at: float) -> None:
+    with db() as conn:
+        rows = conn.execute(
+            """
+            SELECT discussion_thread_id FROM trust_pairings
+            WHERE round_id = ? AND discussion_thread_id IS NOT NULL
+            """,
+            (round_id,),
+        ).fetchall()
+
+    notice = emergency_thread_notice(close_at)
+    for row in rows:
+        thread_id = str(row["discussion_thread_id"])
+        try:
+            thread = bot.get_channel(int(thread_id)) or await bot.fetch_channel(int(thread_id))
+            if isinstance(thread, discord.Thread):
+                await thread.send(notice)
+        except (discord.HTTPException, ValueError):
+            continue
+
+
+async def refresh_main_trust_board(round_id: int) -> None:
+    with db() as conn:
+        round_row = conn.execute("SELECT * FROM rounds WHERE id = ?", (round_id,)).fetchone()
+        if not round_row or not round_row["message_id"]:
+            return
+        pair_rows = conn.execute(
+            """
+            SELECT user_a_id, user_b_id FROM trust_pairings
+            WHERE round_id = ? ORDER BY created_at ASC
+            """,
+            (round_id,),
+        ).fetchall()
+
+    extra = round_extra(round_row)
+    channel = await resolve_text_channel(str(round_row["channel_id"]))
+    if channel is None:
+        return
+
+    pairs = [(str(row["user_a_id"]), str(row["user_b_id"])) for row in pair_rows]
+    unmatched_user_id = str(extra.get("unmatched_user_id") or "") or None
+    try:
+        message = await channel.fetch_message(int(round_row["message_id"]))
+        await message.edit(
+            embed=build_trust_decision_embed(
+                round_id,
+                str(round_row["title"]),
+                pairs,
+                unmatched_user_id,
+                str(extra.get("emergency_user_id") or "") or None,
+            ),
+            view=emergency_join_view(round_id) if unmatched_user_id else None,
+        )
+    except (discord.HTTPException, ValueError):
+        pass
+
+
+async def handle_emergency_join(interaction: discord.Interaction, round_id: int) -> None:
+    if interaction.user.bot:
+        await interaction.response.send_message("봇 계정은 긴급 투입할 수 없습니다.", ephemeral=True)
+        return
+
+    user_id = str(interaction.user.id)
+    # 방 생성 + 전체 공지까지 API 호출이 여러 번이라 3초 응답 제한을 넘긴다.
+    await interaction.response.defer(ephemeral=True)
+
+    with db() as conn:
+        round_row = conn.execute(
+            "SELECT * FROM rounds WHERE id = ? AND status = 'open' AND type IN ('trust', 'sand')",
+            (round_id,),
+        ).fetchone()
+        if not round_row:
+            await interaction.followup.send("이미 끝난 라운드입니다.", ephemeral=True)
+            return
+
+        round_type = str(round_row["type"])
+        extra = round_extra(round_row)
+        phase = extra.get("trust_phase") if round_type == "trust" else extra.get("sand_phase")
+        if phase not in {"decision", "playing"}:
+            await interaction.followup.send("지금은 긴급 투입할 수 없습니다.", ephemeral=True)
+            return
+
+        registered = conn.execute(
+            "SELECT 1 FROM trust_registrations WHERE round_id = ? AND user_id = ?",
+            (round_id, user_id),
+        ).fetchone()
+        if registered:
+            await interaction.followup.send(
+                "이미 이 게임에 참여 중입니다. 긴급 투입은 게임에 참여하지 않은 사람만 할 수 있습니다.",
+                ephemeral=True,
+            )
+            return
+
+        # 동시 클릭 방어: 대기자를 읽고 비우는 것까지 한 트랜잭션 안에서 끝낸다.
+        applied = apply_emergency_join(extra, round_type, user_id)
+        if not applied:
+            await interaction.followup.send("긴급 투입 자리가 이미 채워졌습니다.", ephemeral=True)
+            return
+
+        # 서버 아무나 누를 수 있다. can_join_round와 정산이 통과하도록 이벤트 명단에도 넣는다.
+        ensure_user(conn, interaction.user)
+        if round_row["event_session_id"] is not None:
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO event_participants (event_session_id, user_id, joined_at)
+                VALUES (?, ?, ?)
+                """,
+                (int(round_row["event_session_id"]), user_id, now_text()),
+            )
+        conn.execute(
+            "INSERT INTO trust_registrations (round_id, user_id, registered_at) VALUES (?, ?, ?)",
+            (round_id, user_id, now_text()),
+        )
+        conn.execute(
+            """
+            INSERT INTO trust_pairings (round_id, user_a_id, user_b_id, created_at)
+            VALUES (?, ?, ?, ?)
+            """,
+            (round_id, applied["user_a_id"], applied["user_b_id"], now_text()),
+        )
+        conn.execute(
+            "UPDATE rounds SET extra_json = ? WHERE id = ?",
+            (json.dumps(extra, ensure_ascii=False), round_id),
+        )
+        title = str(round_row["title"])
+        channel_id = str(round_row["channel_id"])
+
+    close_at = float(applied["close_at"])
+    bot.schedule_auto_close(round_id, close_at)
+
+    channel = await resolve_text_channel(channel_id)
+    if channel is None:
+        await interaction.followup.send("긴급 투입했지만 채널을 찾지 못해 방을 열지 못했습니다.", ephemeral=True)
+        return
+
+    # 새 방을 만들기 전에 알린다. 갓 투입된 짝에게 자기 자신에 대한 공지가 가지 않는다.
+    await announce_emergency_join(round_id, close_at)
+
+    user_a_id = str(applied["user_a_id"])
+    user_b_id = str(applied["user_b_id"])
+    if round_type == "trust":
+        created = await create_pair_thread(
+            channel,
+            f"{title} · 긴급 투입 세트",
+            [user_a_id, user_b_id],
+            f"딜레마의 섬 #{round_id} 긴급 투입 협상방",
+            trust_decision_view(round_id),
+            content=trust_pair_intro(user_a_id, user_b_id),
+        )
+    else:
+        created = await create_pair_thread(
+            channel,
+            f"{title} · 긴급 투입 모래성",
+            [user_a_id, user_b_id],
+            f"모래성 게임 #{round_id} 긴급 투입 방",
+            sand_play_view(round_id),
+            content=sand_pair_intro(user_a_id, user_b_id),
+            embed=build_sand_pair_embed(title, applied["pair"], extra),
+        )
+
+    if created is None:
+        await interaction.followup.send(
+            "긴급 투입은 됐지만 비공개 방을 열지 못했습니다. 운영자에게 알려주세요.",
+            ephemeral=True,
+        )
+    else:
+        thread, message = created
+        save_pair_thread_id(round_id, user_a_id, user_b_id, str(thread.id))
+        if round_type == "sand":
+            store_sand_thread_ids(
+                round_id, {(user_a_id, user_b_id): (str(thread.id), str(message.id))}
+            )
+        await interaction.followup.send(
+            f"긴급 투입 완료! <@{user_a_id}>님과의 방이 열렸습니다.",
+            ephemeral=True,
+        )
+
+    if round_type == "sand":
+        await refresh_main_sand_board(round_id)
+    else:
+        await refresh_main_trust_board(round_id)
 
 
 async def handle_sand_join(interaction: discord.Interaction, round_id: int) -> None:
@@ -1670,6 +2174,110 @@ def autocomplete_sand_pair(pair: dict[str, Any]) -> None:
     pair["auto_completed"] = True
 
 
+def sand_pair_thread_matches(pair: dict[str, Any], channel_id: int | None) -> bool:
+    """누른 곳이 본인 짝의 비공개 방인지 확인한다.
+
+    thread_id가 없는 짝은 이 기능 이전에 시작된 라운드이므로, 종전처럼 어디서든 진행할 수 있게 둔다.
+    """
+    thread_id = str(pair.get("thread_id") or "")
+    if not thread_id:
+        return True
+    return thread_id == str(channel_id)
+
+
+async def refresh_main_sand_board(round_id: int) -> None:
+    """메인 채널의 실시간 진행판을 다시 그린다. 게임 버튼은 각 비공개 방에만 있다."""
+    with db() as conn:
+        round_row = conn.execute("SELECT * FROM rounds WHERE id = ?", (round_id,)).fetchone()
+    if not round_row or not round_row["message_id"]:
+        return
+
+    extra = round_extra(round_row)
+    channel = await resolve_text_channel(str(round_row["channel_id"]))
+    if channel is None:
+        return
+    try:
+        message = await channel.fetch_message(int(round_row["message_id"]))
+        await message.edit(
+            embed=build_sand_play_embed(round_row, extra),
+            view=emergency_join_view(round_id) if extra.get("unmatched_user_id") else None,
+        )
+    except (discord.HTTPException, ValueError):
+        pass
+
+
+def save_sand_pair_message_id(round_id: int, pair: dict[str, Any], message_id: str) -> None:
+    with db() as conn:
+        round_row = conn.execute("SELECT * FROM rounds WHERE id = ?", (round_id,)).fetchone()
+        if not round_row:
+            return
+        extra = round_extra(round_row)
+        target = find_sand_pair(extra, str(pair["user_a_id"]))
+        if not target:
+            return
+        target["play_message_id"] = message_id
+        conn.execute(
+            "UPDATE rounds SET extra_json = ? WHERE id = ?",
+            (json.dumps(extra, ensure_ascii=False), round_id),
+        )
+
+
+async def refresh_sand_pair_board(interaction: discord.Interaction, round_id: int) -> None:
+    """누른 사람의 방 진행판을 다시 그린다.
+
+    버튼을 누를 때마다 개인 응답(ephemeral)이 방에 쌓여서 버튼이 달린 진행판이 위로 밀려 올라간다.
+    그러면 다음 차례에 버튼을 누르려고 스크롤을 올려야 한다. 그래서 진행 중인 짝은 진행판을 지우고
+    맨 아래에 다시 붙인다. 끝난 짝은 더 누를 버튼이 없으므로 제자리에서 비활성화만 한다.
+
+    숫자 선택은 두 사람이 동시에 누를 수 있다. 그때 `interaction.message`는 상대가 이미 재게시해서
+    사라진 옛 메시지일 수 있으므로, 락을 잡고 DB에서 현재 진행판 id를 다시 읽어야 방이 두 개로 갈리지 않는다.
+    """
+    channel = interaction.channel
+    if channel is None:
+        return
+
+    async with bot.sand_board_lock(channel.id):
+        with db() as conn:
+            round_row = conn.execute("SELECT * FROM rounds WHERE id = ?", (round_id,)).fetchone()
+        if not round_row:
+            return
+
+        extra = round_extra(round_row)
+        pair = find_sand_pair(extra, str(interaction.user.id))
+        if not pair:
+            return
+
+        resolved = str(pair.get("phase")) == "resolved"
+        embed = build_sand_pair_embed(str(round_row["title"]), pair, extra)
+        view = sand_play_view(round_id, disabled=resolved)
+
+        board_message_id = str(pair.get("play_message_id") or "")
+        if not board_message_id and interaction.message:
+            board_message_id = str(interaction.message.id)
+
+        # 방이 없는 옛 라운드(메인 채널 진행)나 이미 끝난 짝은 제자리에서 갱신한다.
+        if resolved or not isinstance(channel, discord.Thread):
+            if board_message_id:
+                try:
+                    message = await channel.fetch_message(int(board_message_id))
+                    await message.edit(embed=embed, view=view)
+                except (discord.NotFound, discord.HTTPException, ValueError):
+                    pass
+            return
+
+        if board_message_id:
+            try:
+                old_board = await channel.fetch_message(int(board_message_id))
+                await old_board.delete()
+            except (discord.NotFound, discord.HTTPException, ValueError):
+                pass
+        try:
+            new_board = await channel.send(embed=embed, view=view)
+        except discord.HTTPException:
+            return
+        save_sand_pair_message_id(round_id, pair, str(new_board.id))
+
+
 async def refresh_or_finish_sand_round(
     interaction: discord.Interaction,
     round_id: int,
@@ -1680,19 +2288,14 @@ async def refresh_or_finish_sand_round(
         if not round_row:
             await interaction.response.send_message("존재하지 않는 라운드입니다.", ephemeral=True)
             return
-        extra = round_extra(round_row)
-        complete = sand_games_complete(extra)
-        progress_embed = build_sand_play_embed(round_row, extra)
+        channel_id = str(round_row["channel_id"])
+        complete = sand_games_complete(round_extra(round_row))
 
     await interaction.response.send_message(private_message, ephemeral=True)
-    if interaction.message:
-        try:
-            await interaction.message.edit(
-                embed=progress_embed,
-                view=sand_play_view(round_id, disabled=complete),
-            )
-        except discord.HTTPException:
-            pass
+
+    # 누른 사람의 방만 갱신한다. 다른 짝의 상황은 이 방에 새어 나가지 않는다.
+    await refresh_sand_pair_board(interaction, round_id)
+    await refresh_main_sand_board(round_id)
 
     if not complete:
         return
@@ -1702,8 +2305,16 @@ async def refresh_or_finish_sand_round(
     task = bot.auto_close_tasks.pop(round_id, None)
     if task:
         task.cancel()
+    await publish_sand_pair_results(round_id)
+
+    # followup은 버튼을 누른 비공개 방으로 들어간다. 라운드 결과는 메인 채널에 알려야 한다.
     _, result_embed = result
-    await interaction.followup.send(embed=result_embed, view=planned_mini_game_view(round_id))
+    channel = await resolve_text_channel(channel_id)
+    if channel is not None:
+        try:
+            await channel.send(embed=result_embed, view=planned_mini_game_view(round_id))
+        except discord.HTTPException:
+            pass
 
 
 async def handle_sand_number(
@@ -1727,6 +2338,12 @@ async def handle_sand_number(
         pair = find_sand_pair(extra, user_id)
         if not pair:
             await interaction.response.send_message("이 라운드에 매칭된 참가자가 아닙니다.", ephemeral=True)
+            return
+        if not sand_pair_thread_matches(pair, interaction.channel_id):
+            await interaction.response.send_message(
+                "자신에게 배정된 1:1 모래성 방에서만 진행할 수 있습니다.",
+                ephemeral=True,
+            )
             return
         if pair.get("phase") != "number_selection":
             await interaction.response.send_message("숫자 선택 단계가 이미 끝났습니다.", ephemeral=True)
@@ -1772,6 +2389,12 @@ async def handle_sand_action(
         if not pair:
             await interaction.response.send_message("이 라운드에 매칭된 참가자가 아닙니다.", ephemeral=True)
             return
+        if not sand_pair_thread_matches(pair, interaction.channel_id):
+            await interaction.response.send_message(
+                "자신에게 배정된 1:1 모래성 방에서만 진행할 수 있습니다.",
+                ephemeral=True,
+            )
+            return
         phase = str(pair.get("phase"))
         if phase == "number_selection":
             await interaction.response.send_message("두 참가자 모두 먼저 1~10 중 숫자를 확정해야 합니다.", ephemeral=True)
@@ -1800,6 +2423,12 @@ class EventBot(discord.Client):
         self.tree = app_commands.CommandTree(self)
         self.auto_close_tasks: dict[int, asyncio.Task[None]] = {}
         self.auto_close_restored = False
+        self.afk_coin_task: asyncio.Task[None] | None = None
+        self.sand_board_locks: dict[int, asyncio.Lock] = {}
+
+    def sand_board_lock(self, thread_id: int) -> asyncio.Lock:
+        """방별 진행판 재게시를 직렬화한다. 두 사람이 동시에 눌러도 진행판이 하나만 남는다."""
+        return self.sand_board_locks.setdefault(thread_id, asyncio.Lock())
 
     async def setup_hook(self) -> None:
         guild_id = os.getenv("GUILD_ID", "").strip()
@@ -1818,8 +2447,36 @@ class EventBot(discord.Client):
         if not self.auto_close_restored:
             self.auto_close_restored = True
             self.restore_auto_close_tasks()
+        if self.afk_coin_task is None or self.afk_coin_task.done():
+            self.afk_coin_task = asyncio.create_task(self.afk_coin_loop())
         # 로그인 + 진행 중이던 라운드 타이머 복구까지 끝나야 배포가 성공으로 처리된다.
         sd_notify("READY=1")
+
+    async def afk_coin_loop(self) -> None:
+        """음성채널에 있는 사람에게 1분마다 잠수 코인을 준다.
+
+        입장/퇴장을 추적하지 않고 매 틱마다 현재 접속자를 훑는다. 코인이 DB에만 쌓이므로
+        재시작 후 복구할 상태가 없다 (재시작 시 손해는 1분 미만).
+        """
+        await self.wait_until_ready()
+        while not self.is_closed():
+            await asyncio.sleep(AFK_TICK_SECONDS)
+            try:
+                self.grant_voice_afk_coins()
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:  # noqa: BLE001 - 틱 한 번 실패로 루프가 죽으면 안 된다.
+                print(f"잠수 코인 적립 실패: {error}")
+
+    def grant_voice_afk_coins(self) -> None:
+        with db() as conn:
+            for guild in self.guilds:
+                for voice_channel in guild.voice_channels:
+                    for member in voice_channel.members:
+                        if member.bot:
+                            continue
+                        ensure_user(conn, member)
+                        grant_afk_coins(conn, str(member.id), AFK_COIN_PER_TICK)
 
     def schedule_auto_close(self, round_id: int, close_at: float) -> None:
         existing = self.auto_close_tasks.pop(round_id, None)
@@ -1878,6 +2535,7 @@ class EventBot(discord.Client):
                 transition = start_sand_game(round_id)
                 if not transition:
                     return
+                await create_sand_pair_threads(transition)
                 await update_trust_main_message(transition)
                 if transition["state"] == "playing":
                     self.schedule_auto_close(round_id, float(transition["close_at"]))
@@ -1890,6 +2548,8 @@ class EventBot(discord.Client):
             _, embed = result
             if row["type"] == "trust":
                 await publish_trust_pair_results(round_id)
+            if row["type"] == "sand":
+                await publish_sand_pair_results(round_id)
             if hasattr(channel, "send"):
                 await channel.send(embed=embed, view=planned_mini_game_view(round_id))
         except asyncio.CancelledError:
@@ -1927,6 +2587,15 @@ class EventBot(discord.Client):
                 await interaction.response.send_message("잘못된 메인게임 번호입니다.", ephemeral=True)
                 return
             await handle_planned_mini_game(interaction, main_round_id)
+            return
+
+        if action == "emergency":
+            try:
+                round_id = int(parts[2])
+            except ValueError:
+                await interaction.response.send_message("잘못된 라운드 번호입니다.", ephemeral=True)
+                return
+            await handle_emergency_join(interaction, round_id)
             return
 
         if action == "sandjoin":
@@ -2303,11 +2972,30 @@ def trust_registration_view(round_id: int) -> discord.ui.View:
     return view
 
 
+def emergency_join_view(round_id: int) -> discord.ui.View:
+    """참가자가 홀수라 짝이 없는 사람이 생겼을 때만 메인 메시지에 붙는다."""
+    view = discord.ui.View(timeout=None)
+    view.add_item(
+        discord.ui.Button(
+            label="긴급 투입하기",
+            emoji="🚨",
+            style=discord.ButtonStyle.danger,
+            custom_id=f"eventbot:emergency:{round_id}",
+        )
+    )
+    return view
+
+
+def emergency_join_notice(emergency_user_id: str) -> str:
+    return f"<@{emergency_user_id}>님이 긴급 투입되어 전체 진행 시간이 1분 연장되었습니다."
+
+
 def build_trust_decision_embed(
     round_id: int,
     title: str,
     pairs: list[tuple[str, str]],
     unmatched_user_id: str | None,
+    emergency_user_id: str | None = None,
 ) -> discord.Embed:
     embed = discord.Embed(
         title=title,
@@ -2321,8 +3009,18 @@ def build_trust_decision_embed(
     )
     if unmatched_user_id:
         embed.add_field(
-            name="매칭 대기",
-            value=f"<@{unmatched_user_id}>님, 참여자가 홀수이므로 새 참가자가 긴급 투입중입니다. 잠시만 기다려주세요!",
+            name="🚨 긴급 투입 대기",
+            value=(
+                f"<@{unmatched_user_id}>님, 참여자가 홀수라 짝이 없습니다. 잠시만 기다려주세요!\n"
+                "아직 게임에 참여하지 않은 분이 아래 `긴급 투입하기` 버튼을 누르면 둘만의 방이 새로 열리고, "
+                "전체 진행 시간이 1분 연장됩니다."
+            ),
+            inline=False,
+        )
+    if emergency_user_id:
+        embed.add_field(
+            name="🚨 긴급 투입",
+            value=emergency_join_notice(emergency_user_id),
             inline=False,
         )
     embed.add_field(
@@ -2385,42 +3083,104 @@ def sand_registration_view(round_id: int) -> discord.ui.View:
     return view
 
 
+def sand_pair_status_text(pair: dict[str, Any]) -> str:
+    phase = str(pair.get("phase"))
+    if phase == "number_selection":
+        selected = int(pair.get("number_a") is not None) + int(pair.get("number_b") is not None)
+        return f"숫자를 고르세요(번복 불가) : {selected}/2"
+    if phase == "active":
+        return (
+            f"<@{pair['current_user_id']}> 차례 · 성공한 모래 덜기 "
+            f"{int(pair.get('successful_removals', 0))}회"
+        )
+    if phase == "awaiting_quit_response":
+        return f"<@{pair['current_user_id']}>님이 함께 포기/마지막 덜기 선택 중"
+    return SAND_OUTCOME_LABELS.get(str(pair.get("outcome")), "종료")
+
+
+def build_sand_pair_embed(title: str, pair: dict[str, Any], extra: dict[str, Any]) -> discord.Embed:
+    """짝 하나의 비공개 방에 걸리는 진행판. 다른 짝의 정보는 담지 않는다."""
+    embed = discord.Embed(
+        title=f"{title} · 1:1 모래성",
+        description=f"<@{pair['user_a_id']}> ↔ <@{pair['user_b_id']}>",
+        color=discord.Color.from_rgb(218, 165, 90),
+    )
+    embed.add_field(name="진행 상황", value=sand_pair_status_text(pair), inline=False)
+    embed.add_field(name="규칙", value=SAND_RULES_TEXT, inline=False)
+    if str(pair.get("phase")) != "resolved":
+        embed.add_field(
+            name="제한 시간",
+            value=(
+                f"예정 마감: {close_time_text(extra.get('play_close_at'))}\n"
+                "시간 안에 끝내지 못하면 남은 숫자와 행동이 랜덤으로 배정됩니다."
+            ),
+            inline=False,
+        )
+    return embed
+
+
+def build_sand_pair_result_embed(title: str, pair: dict[str, Any]) -> discord.Embed:
+    number_a = pair.get("number_a")
+    number_b = pair.get("number_b")
+    embed = discord.Embed(
+        title=f"1:1 결과 · {title}",
+        description=f"<@{pair['user_a_id']}> ↔ <@{pair['user_b_id']}>",
+        color=discord.Color.from_rgb(218, 165, 90),
+    )
+    if number_a is not None and number_b is not None:
+        embed.add_field(
+            name="서로의 숫자",
+            value=(
+                f"<@{pair['user_a_id']}>: **{number_a}**\n"
+                f"<@{pair['user_b_id']}>: **{number_b}**\n"
+                f"차이 {abs(int(number_a) - int(number_b))} → {abs(int(number_a) - int(number_b)) + 1}번째 덜기에서 붕괴"
+            ),
+            inline=False,
+        )
+    embed.add_field(
+        name="결과",
+        value=SAND_OUTCOME_LABELS.get(str(pair.get("outcome")), "미완료"),
+        inline=False,
+    )
+    embed.add_field(name="정산", value=sand_pair_settlement_text(pair), inline=False)
+    if pair.get("auto_completed"):
+        embed.add_field(name="자동 진행", value="제한 시간이 끝나 남은 선택이 랜덤으로 배정되었습니다.", inline=False)
+    return embed
+
+
 def build_sand_play_embed(round_row: sqlite3.Row, extra: dict[str, Any]) -> discord.Embed:
     embed = discord.Embed(
         title=str(round_row["title"]),
-        description="아래 숫자 버튼과 행동 버튼은 매칭된 본인에게만 적용되며, 선택 내용은 비공개입니다.",
+        description="각자 초대된 1:1 비공개 방에서 숫자와 행동을 선택하세요. 선택 내용은 비공개입니다.",
         color=discord.Color.from_rgb(218, 165, 90),
     )
-    lines: list[str] = []
-    for index, pair in enumerate(extra.get("sand_pairs", []), start=1):
-        user_a_id = str(pair["user_a_id"])
-        user_b_id = str(pair["user_b_id"])
-        phase = str(pair.get("phase"))
-        if phase == "number_selection":
-            selected = int(pair.get("number_a") is not None) + int(pair.get("number_b") is not None)
-            status = f"숫자를 고르세요(번복 불가) : {selected}/2"
-        elif phase == "active":
-            status = (
-                f"<@{pair['current_user_id']}> 차례 · 성공한 모래 덜기 "
-                f"{int(pair.get('successful_removals', 0))}회"
-            )
-        elif phase == "awaiting_quit_response":
-            status = f"<@{pair['current_user_id']}>님이 함께 포기/마지막 덜기 선택 중"
-        else:
-            status = SAND_OUTCOME_LABELS.get(str(pair.get("outcome")), "종료")
-        lines.append(f"{index}. <@{user_a_id}> ↔ <@{user_b_id}> · {status}")
+    lines = [
+        f"{index}. <@{pair['user_a_id']}> ↔ <@{pair['user_b_id']}> · {sand_pair_status_text(pair)}"
+        for index, pair in enumerate(extra.get("sand_pairs", []), start=1)
+    ]
     embed.add_field(name="1:1 진행 현황", value=field_text(lines), inline=False)
     unmatched_user_id = str(extra.get("unmatched_user_id") or "")
     if unmatched_user_id:
         embed.add_field(
-            name="매칭 대기",
-            value=f"<@{unmatched_user_id}>님, 참여자가 홀수이므로 새 참가자가 긴급 투입중입니다. 잠시만 기다려주세요!",
+            name="🚨 긴급 투입 대기",
+            value=(
+                f"<@{unmatched_user_id}>님, 참여자가 홀수라 짝이 없습니다. 잠시만 기다려주세요!\n"
+                "아직 게임에 참여하지 않은 분이 아래 `긴급 투입하기` 버튼을 누르면 둘만의 방이 새로 열리고, "
+                "전체 진행 시간이 1분 연장됩니다."
+            ),
+            inline=False,
+        )
+    emergency_user_id = str(extra.get("emergency_user_id") or "")
+    if emergency_user_id:
+        embed.add_field(
+            name="🚨 긴급 투입",
+            value=emergency_join_notice(emergency_user_id),
             inline=False,
         )
     embed.add_field(
         name="선택 제한 시간",
         value=(
-            f"10분 안에 모든 1:1 게임을 끝내주세요. 예정 마감: {close_time_text(extra.get('play_close_at'))}\n"
+            f"예정 마감: {close_time_text(extra.get('play_close_at'))}\n"
             "시간 안에 끝내지 못하면 남은 숫자와 행동이 랜덤으로 배정되어 자동으로 결과가 확정됩니다."
         ),
         inline=False,
@@ -2990,7 +3750,6 @@ def close_round_record(
                             conn, user_id, member_name(guild, user_id), -1,
                             f"라운드 #{round_row['id']} 모래성 둘 다 포기", round_row["id"],
                         )
-                    settlement = "각 -1점"
                 elif outcome == "quit_success":
                     winner_id = str(result["winner"])
                     quitter_id = str(result["quitter"])
@@ -3002,7 +3761,6 @@ def close_round_record(
                         conn, quitter_id, member_name(guild, quitter_id), -1,
                         f"라운드 #{round_row['id']} 모래성 단독 포기", round_row["id"],
                     )
-                    settlement = f"<@{winner_id}> +2점 · <@{quitter_id}> -1점"
                 elif outcome == "quit_collapse":
                     winner_id = str(result["winner"])
                     collapsed_user_id = str(result["collapsed_user"])
@@ -3014,14 +3772,12 @@ def close_round_record(
                         conn, collapsed_user_id, member_name(guild, collapsed_user_id), -1,
                         f"라운드 #{round_row['id']} 모래성 마지막 덜기 붕괴", round_row["id"],
                     )
-                    settlement = f"<@{winner_id}> +1점 · <@{collapsed_user_id}> -1점"
                 elif outcome == "plain_collapse":
                     collapsed_user_id = str(result["collapsed_user"])
                     add_score(
                         conn, collapsed_user_id, member_name(guild, collapsed_user_id), -1,
                         f"라운드 #{round_row['id']} 모래성 일반 붕괴", round_row["id"],
                     )
-                    settlement = f"<@{collapsed_user_id}> -1점"
                 else:
                     result_lines.append(
                         f"<@{user_a_id}> ↔ <@{user_b_id}>: 제한 시간 내 미완료 (0점)"
@@ -3032,7 +3788,7 @@ def close_round_record(
                 auto_mark = " · 자동 진행" if pair.get("auto_completed") else ""
                 result_lines.append(
                     f"<@{user_a_id}> ↔ <@{user_b_id}>: {SAND_OUTCOME_LABELS[outcome]} "
-                    f"({number_text}) · {settlement}{auto_mark}"
+                    f"({number_text}) · {sand_pair_settlement_text(pair)}{auto_mark}"
                 )
 
             extra.update({"sand_phase": "scored", "sand_scored_at": now_text()})
@@ -3196,12 +3952,14 @@ def parse_defuse_color(value: str) -> str:
     return color_id
 
 
-async def ensure_trust_private_thread_permissions(interaction: discord.Interaction) -> bool:
+async def ensure_pair_thread_permissions(interaction: discord.Interaction, 게임: str) -> bool:
+    """딜레마의 섬·모래성은 짝마다 비공개 스레드를 연다. 시작 전에 권한을 확인한다."""
+    game_name = GAME_NAMES[게임]
     guild = interaction.guild
     interaction_channel = interaction.channel
     if guild is None or not isinstance(interaction_channel, discord.TextChannel):
         await interaction.response.send_message(
-            "딜레마의 섬은 스레드가 아닌 서버 텍스트 채널에서 시작해주세요.",
+            f"{game_name}은(는) 스레드가 아닌 서버 텍스트 채널에서 시작해주세요.",
             ephemeral=True,
         )
         return False
@@ -3220,7 +3978,7 @@ async def ensure_trust_private_thread_permissions(interaction: discord.Interacti
         return True
 
     await interaction.response.send_message(
-        "딜레마의 섬에는 봇의 `비공개 스레드 만들기`, `스레드에서 메시지 보내기`, "
+        f"{game_name}에는 봇의 `비공개 스레드 만들기`, `스레드에서 메시지 보내기`, "
         "`스레드 관리` 권한이 필요합니다.",
         ephemeral=True,
     )
@@ -3455,7 +4213,7 @@ async def create_round_from_setup(
         await interaction.response.send_message("서버 텍스트 채널에서만 사용할 수 있습니다.", ephemeral=True)
         return
 
-    if 게임 == "trust" and not await ensure_trust_private_thread_permissions(interaction):
+    if 게임 in MAIN_GAME_TYPES and not await ensure_pair_thread_permissions(interaction, 게임):
         return
 
     close_at = time.time() + (int(진행시간분) * 60)
@@ -3585,7 +4343,7 @@ async def create_round_from_setup(
             )
             round_id = int(cursor.lastrowid)
             embed = build_balance_embed(round_id, 제목, 선택_a, 선택_b)
-            view = vote_view(round_id, [("A 선택", "A"), ("B 선택", "B")])
+            view = vote_view(round_id, BALANCE_VOTE_CHOICES)
         elif 게임 == "defuse4":
             if not 안전색:
                 await interaction.response.send_message(
@@ -3764,19 +4522,15 @@ async def create_round_from_setup(
                 (round_id, event_session_id),
             )
 
+    # 메인게임 등록 단계에서는 시작 시각만 알린다. 규칙은 임베드 본문에 이미 있고,
+    # 다음 미니게임이 뭔지는 참가자가 미리 알 필요가 없다.
     if 게임 in MAIN_GAME_TYPES:
-        next_step = (
-            "매칭 후에는 신뢰/배신 선택 시간이 3분 주어집니다."
-            if 게임 == "trust"
-            else "매칭 후에는 비공개 숫자 선택과 1:1 진행 시간이 10분 주어집니다."
-        )
         if 게임 == "sand":
             embed.add_field(
-                name="게임 준비 중",
+                name="게임 시작",
                 value=(
-                    f"현재는 모든 참가자에게 공개되는 규칙 안내 단계입니다. "
-                    f"{진행시간분}분 후 자동으로 1:1 매칭과 실제 게임을 시작합니다.\n"
-                    f"실제 시작 예정: {close_time_text(close_at)}\n{next_step}"
+                    f"{진행시간분}분 후 1:1 매칭과 함께 게임이 시작됩니다.\n"
+                    f"시작 예정: {close_time_text(close_at)}"
                 ),
                 inline=False,
             )
@@ -3785,15 +4539,11 @@ async def create_round_from_setup(
                 name="랜덤 매칭 시작",
                 value=(
                     f"오늘의 이벤트 참가 명단으로 {진행시간분}분 후 랜덤 매칭을 시작합니다.\n"
-                    f"예정 시각: {close_time_text(close_at)}\n{next_step}"
+                    f"예정 시각: {close_time_text(close_at)}\n"
+                    "매칭 후에는 신뢰/배신 선택 시간이 3분 주어집니다."
                 ),
                 inline=False,
             )
-        embed.add_field(
-            name="선택한 미니게임",
-            value=f"메인게임 정산 후 `{GAME_NAMES[str(예정_미니게임)]}` 설정 버튼이 표시됩니다.",
-            inline=False,
-        )
     else:
         embed.add_field(
             name="자동 마감",
@@ -3807,10 +4557,11 @@ async def create_round_from_setup(
     if 게임 in {"balance", "defuse4"}:
         try:
             thread_name = f"{제목} | 토론방"[:100]
-            thread = await message.create_thread(name=thread_name)
+            # 보관되면 일반 유저의 버튼 클릭이 막힌다. 라운드가 끝날 때까지 살아 있도록 넉넉히 잡는다.
+            thread = await message.create_thread(name=thread_name, auto_archive_duration=1440)
             button_message = await thread.send(
-                ANONYMOUS_GUIDE_TEXT,
-                view=anonymous_discussion_view(round_id),
+                embed=build_anonymous_guide_embed(0),
+                view=thread_discussion_view(round_id, 게임),
             )
             # 발언이 쌓여도 버튼이 항상 맨 아래에 오도록, 발언마다 이 메시지를 지우고 다시 보낸다.
             extra["anon_button_message_id"] = str(button_message.id)
@@ -3828,15 +4579,8 @@ async def create_round_from_setup(
                     "해체 토론방이 열렸습니다",
                     "버튼을 눌러 익명으로 관리자의 힌트를 해석해 안전 색을 추리해보세요. 블러핑과 역추리 모두 가능합니다.",
                 )
-            try:
-                await thread.edit(
-                    archived=True,
-                    locked=True,
-                    reason="익명 미니게임 토론방: 일반 채팅 차단",
-                )
-            except discord.HTTPException:
-                # 권한이 부족한 경우에도 on_message의 삭제 처리로 익명성을 최대한 보호합니다.
-                pass
+            # 스레드를 잠그면 `스레드 관리` 권한이 없는 유저의 버튼 클릭까지 디스코드가 막는다.
+            # 익명성은 on_message의 일반 메시지 삭제로만 지킨다.
             await interaction.followup.send(embed=notice_embed)
             discussion_thread_id = str(thread.id)
         except discord.HTTPException:
@@ -3889,31 +4633,37 @@ async def close_round(interaction: discord.Interaction) -> None:
         return
 
     if round_row["type"] == "sand" and round_extra(round_row).get("sand_phase") == "registration":
+        # 짝마다 비공개 방을 여느라 API 호출이 여러 번이다. 3초 응답 제한을 넘기므로 먼저 defer한다.
+        await interaction.response.defer(ephemeral=True)
         transition = start_sand_game(int(round_row["id"]))
         if not transition:
-            await interaction.response.send_message("참여자 모집을 마감하지 못했습니다.", ephemeral=True)
+            await interaction.followup.send("참여자 모집을 마감하지 못했습니다.", ephemeral=True)
             return
         task = bot.auto_close_tasks.pop(int(round_row["id"]), None)
         if task:
             task.cancel()
+        await create_sand_pair_threads(transition)
         await update_trust_main_message(transition)
         if transition["state"] == "playing":
             bot.schedule_auto_close(int(round_row["id"]), float(transition["close_at"]))
-            await interaction.response.send_message("참여자 모집을 마감하고 1:1 모래성 게임을 시작했습니다.", ephemeral=True)
+            await interaction.followup.send("참여자 모집을 마감하고 1:1 모래성 게임을 시작했습니다.", ephemeral=True)
         else:
-            await interaction.response.send_message("참여자가 부족해 모래성 게임을 취소했습니다.", ephemeral=True)
+            await interaction.followup.send("참여자가 부족해 모래성 게임을 취소했습니다.", ephemeral=True)
         return
 
+    # 짝별 방에 결과를 공개해야 하는 라운드는 응답 전에 API 호출이 여러 번이라 먼저 defer한다.
+    round_extra_row = round_extra(round_row)
     is_trust_decision = (
-        round_row["type"] == "trust"
-        and round_extra(round_row).get("trust_phase") == "decision"
+        round_row["type"] == "trust" and round_extra_row.get("trust_phase") == "decision"
     )
-    if is_trust_decision:
+    is_sand_playing = round_row["type"] == "sand" and round_extra_row.get("sand_phase") == "playing"
+    publishes_pair_results = is_trust_decision or is_sand_playing
+    if publishes_pair_results:
         await interaction.response.defer()
 
     result = close_round_record(int(round_row["id"]), interaction.guild)
     if not result:
-        if is_trust_decision:
+        if publishes_pair_results:
             await interaction.edit_original_response(content="현재 열린 라운드가 없습니다.")
         else:
             await interaction.response.send_message("현재 열린 라운드가 없습니다.", ephemeral=True)
@@ -3924,8 +4674,11 @@ async def close_round(interaction: discord.Interaction) -> None:
         task.cancel()
 
     _, embed = result
-    if is_trust_decision:
-        await publish_trust_pair_results(int(round_row["id"]))
+    if publishes_pair_results:
+        if is_trust_decision:
+            await publish_trust_pair_results(int(round_row["id"]))
+        else:
+            await publish_sand_pair_results(int(round_row["id"]))
         await interaction.edit_original_response(
             embed=embed,
             view=planned_mini_game_view(int(round_row["id"])),
@@ -3981,7 +4734,8 @@ async def force_end_event(interaction: discord.Interaction) -> None:
             except (discord.HTTPException, ValueError):
                 pass
 
-        if round_row["type"] == "trust":
+        # 딜레마의 섬·모래성은 짝마다 비공개 방을 연다. 강제 종료 시 전부 닫는다.
+        if round_row["type"] in MAIN_GAME_TYPES:
             with db() as conn:
                 pair_threads = conn.execute(
                     """
@@ -4060,6 +4814,114 @@ async def run_cutting(interaction: discord.Interaction) -> None:
 
     embed = build_cutting_progress_embed(round_row, extra)
     await interaction.response.send_message(embed=embed, view=cutting_action_view(int(round_row["id"])))
+
+
+@bot.tree.command(name="이벤트리스트", description="진행 중인 이벤트와 라운드를 확인합니다.")
+@app_commands.default_permissions()
+@admin_only()
+async def list_events(interaction: discord.Interaction) -> None:
+    with db() as conn:
+        event_row = get_current_event(conn)
+        if not event_row:
+            await interaction.response.send_message("진행 중인 이벤트가 없습니다.", ephemeral=True)
+            return
+        event_session_id = int(event_row["id"])
+        participant_count = int(
+            conn.execute(
+                "SELECT COUNT(*) AS count FROM event_participants WHERE event_session_id = ?",
+                (event_session_id,),
+            ).fetchone()["count"]
+        )
+        round_rows = conn.execute(
+            "SELECT * FROM rounds WHERE event_session_id = ? ORDER BY id ASC",
+            (event_session_id,),
+        ).fetchall()
+
+    status = str(event_row["status"])
+    embed = discord.Embed(
+        title=f"진행 중인 이벤트 #{event_session_id}",
+        description=f"<#{event_row['channel_id']}>에서 진행 중입니다.",
+        color=discord.Color.green(),
+    )
+    embed.add_field(
+        name="상태",
+        value=(
+            f"{EVENT_STATUS_LABELS.get(status, status)} · 참가자 {participant_count}명\n"
+            f"시작: {event_row['created_at']}"
+        ),
+        inline=False,
+    )
+
+    lines: list[str] = []
+    for round_row in round_rows:
+        extra = round_extra(round_row)
+        game_key = round_game_key(round_row)
+        phase = extra.get("trust_phase") or extra.get("sand_phase")
+        round_status = "진행 중" if round_row["status"] == "open" else "마감"
+        lines.append(
+            f"#{round_row['id']} {GAME_NAMES.get(game_key, game_key)} · {round_status}"
+            f"{f' ({phase})' if phase else ''} · {round_row['question']}"
+        )
+    embed.add_field(
+        name="라운드",
+        value=field_text(lines, empty="아직 시작한 라운드가 없습니다."),
+        inline=False,
+    )
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+@bot.tree.command(name="잠수", description="내 잠수 코인을 확인합니다.")
+async def show_afk_coins(interaction: discord.Interaction) -> None:
+    with db() as conn:
+        ensure_user(conn, interaction.user)
+        coins = get_afk_coins(conn, str(interaction.user.id))
+
+    await interaction.response.send_message(
+        f"현재 잠수 코인 **{coins}개**입니다.\n"
+        f"음성채널에 있으면 1분마다 {AFK_COIN_PER_TICK}개씩 쌓이고, "
+        f"`/지목` 1회에 {SCORE_REVEAL_COST}개를 씁니다.",
+        ephemeral=True,
+    )
+
+
+@bot.tree.command(
+    name="지목",
+    description=f"잠수 코인 {SCORE_REVEAL_COST}개를 써서 한 사람의 점수를 확인합니다.",
+)
+@app_commands.describe(사용자="점수를 확인할 사람")
+async def reveal_score(interaction: discord.Interaction, 사용자: discord.Member) -> None:
+    if 사용자.bot:
+        await interaction.response.send_message("봇의 점수는 확인할 수 없습니다.", ephemeral=True)
+        return
+    if 사용자.id == interaction.user.id:
+        await interaction.response.send_message(
+            "내 점수는 `/점수`로 코인 없이 확인할 수 있습니다.",
+            ephemeral=True,
+        )
+        return
+
+    user_id = str(interaction.user.id)
+    with db() as conn:
+        ensure_user(conn, interaction.user)
+        if not spend_afk_coins(conn, user_id, SCORE_REVEAL_COST):
+            coins = get_afk_coins(conn, user_id)
+            await interaction.response.send_message(
+                f"잠수 코인이 부족합니다. (현재 {coins}개 / 필요 {SCORE_REVEAL_COST}개)",
+                ephemeral=True,
+            )
+            return
+        remaining = get_afk_coins(conn, user_id)
+        target_row = conn.execute(
+            "SELECT total_score FROM users WHERE user_id = ?", (str(사용자.id),)
+        ).fetchone()
+
+    target_score = int(target_row["total_score"]) if target_row else 0
+    await interaction.response.send_message(
+        f"<@{사용자.id}>님의 현재 점수는 **{target_score}점**입니다.\n"
+        f"잠수 코인 {SCORE_REVEAL_COST}개를 사용했습니다. (잔여 {remaining}개)",
+        ephemeral=True,
+        allowed_mentions=discord.AllowedMentions.none(),
+    )
 
 
 @bot.tree.command(name="점수", description="3등 점수와 내 점수를 확인합니다.")
