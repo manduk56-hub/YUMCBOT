@@ -2124,7 +2124,7 @@ def apply_sand_action(pair: dict[str, Any], user_id: str, action: str) -> str:
                 "raw_difference": raw_difference,
             }
         )
-        return "모래를 덜다가 무너졌습니다. -1점입니다."
+        return "-1점입니다."
 
     if phase == "awaiting_quit_response":
         quitter_id = str(pair["quitter_id"])
@@ -2145,7 +2145,7 @@ def apply_sand_action(pair: dict[str, Any], user_id: str, action: str) -> str:
             "current_user_id": other_user_id,
         }
     )
-    return f"모래 덜기 성공! 이제 <@{other_user_id}>님의 차례입니다."
+    return "모래 덜기 성공!"
 
 
 def autocomplete_sand_pair(pair: dict[str, Any]) -> None:
@@ -2281,7 +2281,8 @@ async def refresh_sand_pair_board(interaction: discord.Interaction, round_id: in
 async def refresh_or_finish_sand_round(
     interaction: discord.Interaction,
     round_id: int,
-    private_message: str,
+    private_message: str | None = None,
+    public_message: str | None = None,
 ) -> None:
     with db() as conn:
         round_row = conn.execute("SELECT * FROM rounds WHERE id = ?", (round_id,)).fetchone()
@@ -2291,7 +2292,15 @@ async def refresh_or_finish_sand_round(
         channel_id = str(round_row["channel_id"])
         complete = sand_games_complete(round_extra(round_row))
 
-    await interaction.response.send_message(private_message, ephemeral=True)
+    # 공개 메시지는 이 1:1 방의 두 사람 모두에게 보이게, 개인 안내(점수 등)는 본인만 보게 보낸다.
+    if public_message:
+        await interaction.response.send_message(public_message)
+        if private_message:
+            await interaction.followup.send(private_message, ephemeral=True)
+    elif private_message:
+        await interaction.response.send_message(private_message, ephemeral=True)
+    else:
+        await interaction.response.defer()
 
     # 누른 사람의 방만 갱신한다. 다른 짝의 상황은 이 방에 새어 나가지 않는다.
     await refresh_sand_pair_board(interaction, round_id)
@@ -2360,10 +2369,9 @@ async def handle_sand_number(
             "UPDATE rounds SET extra_json = ? WHERE id = ?",
             (json.dumps(extra, ensure_ascii=False), round_id),
         )
-        current_user_id = str(pair["current_user_id"])
 
     suffix = (
-        f" 두 사람의 선택이 끝났습니다. {'내 차례입니다.' if current_user_id == user_id else f'<@{current_user_id}>님의 차례입니다.'}"
+        " 두 사람의 선택이 끝났습니다. 차례는 아래 박스를 확인해주세요!"
         if both_selected
         else " 상대의 선택을 기다립니다."
     )
@@ -2413,7 +2421,16 @@ async def handle_sand_action(
             (json.dumps(extra, ensure_ascii=False), round_id),
         )
 
-    await refresh_or_finish_sand_round(interaction, round_id, private_message)
+    outcome = str(pair.get("outcome") or "")
+    public_message = None
+    if outcome == "plain_collapse":
+        # 붕괴 안내는 방 모두에게, 점수(-1점)는 본인만.
+        public_message = "모래를 덜다가 무너졌습니다."
+    elif outcome == "quit_collapse":
+        # 문장 전체를 방 모두에게 공개.
+        public_message = private_message
+        private_message = None
+    await refresh_or_finish_sand_round(interaction, round_id, private_message, public_message)
 
 
 class EventBot(discord.Client):
