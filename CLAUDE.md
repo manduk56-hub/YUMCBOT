@@ -77,6 +77,11 @@ embed/view 빌더 → `close_round_record`(정산) → 슬래시 명령어 → s
 버튼 핸들러는 누른 곳이 본인 짝의 방인지 반드시 검증한다 (`handle_trust_decision`, `sand_pair_thread_matches`).
 방 안에서 누른 버튼의 `interaction.followup`은 그 방으로 들어가므로, **라운드 결과는 메인 채널로 직접 보내야 한다.**
 
+버튼을 누를 때마다 개인 응답(ephemeral)이 방에 쌓여 버튼이 달린 진행판을 위로 밀어낸다. 그래서 모래성은
+상호작용마다 방의 진행판을 지우고 맨 아래에 다시 붙인다(`refresh_sand_pair_board`, 현재 id는
+`sand_pairs[].play_message_id`). 숫자 선택은 두 사람이 동시에 누를 수 있어 `interaction.message`가 이미
+사라진 옛 진행판일 수 있으므로, `EventBot.sand_board_lock(thread_id)`을 잡고 DB에서 id를 다시 읽는다.
+
 참가자가 홀수면 `build_random_trust_pairs()`가 한 명을 `extra_json.unmatched_user_id`로 남긴다.
 그 사람에게는 메인 메시지에 **긴급 투입** 버튼이 붙고, 게임에 참여하지 않은 아무나 눌러 짝이 될 수 있다
 (`apply_emergency_join`). 누른 사람은 `event_participants`에 자동 등록되고, 전체 마감이 1분 밀린다.

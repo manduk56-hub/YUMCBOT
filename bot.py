@@ -1729,6 +1729,7 @@ async def publish_sand_pair_results(round_id: int) -> None:
         if not thread_id:
             continue
         try:
+            bot.sand_board_locks.pop(int(thread_id), None)
             thread = bot.get_channel(int(thread_id)) or await bot.fetch_channel(int(thread_id))
             if not isinstance(thread, discord.Thread):
                 continue
@@ -2174,35 +2175,95 @@ async def refresh_main_sand_board(round_id: int) -> None:
         pass
 
 
+def save_sand_pair_message_id(round_id: int, pair: dict[str, Any], message_id: str) -> None:
+    with db() as conn:
+        round_row = conn.execute("SELECT * FROM rounds WHERE id = ?", (round_id,)).fetchone()
+        if not round_row:
+            return
+        extra = round_extra(round_row)
+        target = find_sand_pair(extra, str(pair["user_a_id"]))
+        if not target:
+            return
+        target["play_message_id"] = message_id
+        conn.execute(
+            "UPDATE rounds SET extra_json = ? WHERE id = ?",
+            (json.dumps(extra, ensure_ascii=False), round_id),
+        )
+
+
+async def refresh_sand_pair_board(interaction: discord.Interaction, round_id: int) -> None:
+    """누른 사람의 방 진행판을 다시 그린다.
+
+    버튼을 누를 때마다 개인 응답(ephemeral)이 방에 쌓여서 버튼이 달린 진행판이 위로 밀려 올라간다.
+    그러면 다음 차례에 버튼을 누르려고 스크롤을 올려야 한다. 그래서 진행 중인 짝은 진행판을 지우고
+    맨 아래에 다시 붙인다. 끝난 짝은 더 누를 버튼이 없으므로 제자리에서 비활성화만 한다.
+
+    숫자 선택은 두 사람이 동시에 누를 수 있다. 그때 `interaction.message`는 상대가 이미 재게시해서
+    사라진 옛 메시지일 수 있으므로, 락을 잡고 DB에서 현재 진행판 id를 다시 읽어야 방이 두 개로 갈리지 않는다.
+    """
+    channel = interaction.channel
+    if channel is None:
+        return
+
+    async with bot.sand_board_lock(channel.id):
+        with db() as conn:
+            round_row = conn.execute("SELECT * FROM rounds WHERE id = ?", (round_id,)).fetchone()
+        if not round_row:
+            return
+
+        extra = round_extra(round_row)
+        pair = find_sand_pair(extra, str(interaction.user.id))
+        if not pair:
+            return
+
+        resolved = str(pair.get("phase")) == "resolved"
+        embed = build_sand_pair_embed(str(round_row["title"]), pair, extra)
+        view = sand_play_view(round_id, disabled=resolved)
+
+        board_message_id = str(pair.get("play_message_id") or "")
+        if not board_message_id and interaction.message:
+            board_message_id = str(interaction.message.id)
+
+        # 방이 없는 옛 라운드(메인 채널 진행)나 이미 끝난 짝은 제자리에서 갱신한다.
+        if resolved or not isinstance(channel, discord.Thread):
+            if board_message_id:
+                try:
+                    message = await channel.fetch_message(int(board_message_id))
+                    await message.edit(embed=embed, view=view)
+                except (discord.NotFound, discord.HTTPException, ValueError):
+                    pass
+            return
+
+        if board_message_id:
+            try:
+                old_board = await channel.fetch_message(int(board_message_id))
+                await old_board.delete()
+            except (discord.NotFound, discord.HTTPException, ValueError):
+                pass
+        try:
+            new_board = await channel.send(embed=embed, view=view)
+        except discord.HTTPException:
+            return
+        save_sand_pair_message_id(round_id, pair, str(new_board.id))
+
+
 async def refresh_or_finish_sand_round(
     interaction: discord.Interaction,
     round_id: int,
     private_message: str,
 ) -> None:
-    user_id = str(interaction.user.id)
     with db() as conn:
         round_row = conn.execute("SELECT * FROM rounds WHERE id = ?", (round_id,)).fetchone()
         if not round_row:
             await interaction.response.send_message("존재하지 않는 라운드입니다.", ephemeral=True)
             return
-        extra = round_extra(round_row)
-        title = str(round_row["title"])
         channel_id = str(round_row["channel_id"])
-        pair = find_sand_pair(extra, user_id)
-        complete = sand_games_complete(extra)
+        complete = sand_games_complete(round_extra(round_row))
 
     await interaction.response.send_message(private_message, ephemeral=True)
 
     # 누른 사람의 방만 갱신한다. 다른 짝의 상황은 이 방에 새어 나가지 않는다.
-    if interaction.message and pair:
-        try:
-            await interaction.message.edit(
-                embed=build_sand_pair_embed(title, pair, extra),
-                view=sand_play_view(round_id, disabled=str(pair.get("phase")) == "resolved"),
-            )
-        except discord.HTTPException:
-            pass
-
+    await refresh_sand_pair_board(interaction, round_id)
     await refresh_main_sand_board(round_id)
 
     if not complete:
@@ -2332,6 +2393,11 @@ class EventBot(discord.Client):
         self.auto_close_tasks: dict[int, asyncio.Task[None]] = {}
         self.auto_close_restored = False
         self.afk_coin_task: asyncio.Task[None] | None = None
+        self.sand_board_locks: dict[int, asyncio.Lock] = {}
+
+    def sand_board_lock(self, thread_id: int) -> asyncio.Lock:
+        """방별 진행판 재게시를 직렬화한다. 두 사람이 동시에 눌러도 진행판이 하나만 남는다."""
+        return self.sand_board_locks.setdefault(thread_id, asyncio.Lock())
 
     async def setup_hook(self) -> None:
         guild_id = os.getenv("GUILD_ID", "").strip()
