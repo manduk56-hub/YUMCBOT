@@ -2540,6 +2540,12 @@ def round_extra(row: sqlite3.Row) -> dict[str, Any]:
     return data if isinstance(data, dict) else {}
 
 
+def cutting_progress_bar(current_level: int, max_level: int) -> str:
+    """강화 진척도 막대. 초록(🟩)은 성공한 강화, 흰색(◻️)은 남은 강화. 예: 3강 → 🟩🟩🟩◻️◻️◻️"""
+    filled = max(0, min(current_level, max_level))
+    return "🟩" * filled + "◻️" * (max_level - filled)
+
+
 def build_cutting_progress_embed(round_row: sqlite3.Row, extra: dict[str, Any]) -> discord.Embed:
     current_level = int(extra.get("cutting_current_level", 0))
     max_level = int(extra.get("max_level", 6))
@@ -2559,8 +2565,13 @@ def build_cutting_progress_embed(round_row: sqlite3.Row, extra: dict[str, Any]) 
         inline=True,
     )
     embed.add_field(
-        name="진행 기록",
-        value="\n".join(logs[-10:]) if logs else "아직 시도 없음",
+        name="진척도",
+        value=f"{cutting_progress_bar(current_level, max_level)}  ({current_level}/{max_level}강)",
+        inline=False,
+    )
+    embed.add_field(
+        name="직전 시도",
+        value=logs[-1] if logs else "아직 시도 없음",
         inline=False,
     )
     embed.add_field(
@@ -2621,7 +2632,13 @@ def finalize_cutting_round(
         description=round_row["title"],
         color=discord.Color.green(),
     )
-    embed.add_field(name="세공 기록", value="\n".join(logs[-10:]), inline=False)
+    max_level = int(extra.get("max_level", 6))
+    embed.add_field(
+        name="진척도",
+        value=f"{cutting_progress_bar(result_level, max_level)}  ({result_level}/{max_level}강)",
+        inline=False,
+    )
+    embed.add_field(name="마지막 시도", value=logs[-1] if logs else "-", inline=False)
     embed.add_field(name="최종 단계", value=f"{result_level}강화", inline=True)
     embed.add_field(name="정답자", value=f"{len(correct_users)}명", inline=True)
     embed.add_field(name="예측 분포", value="\n".join(prediction_lines), inline=False)
