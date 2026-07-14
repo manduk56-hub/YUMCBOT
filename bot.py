@@ -1227,7 +1227,6 @@ def start_trust_decision(round_id: int) -> dict[str, Any] | None:
             "message_id": str(round_row["message_id"] or ""),
             "round_id": round_id,
             "title": str(round_row["title"]),
-            "created_by": str(extra.get("created_by") or ""),
             "pairs": pairs,
             "embed": embed,
             "view": emergency_join_view(round_id) if unmatched_user_id else None,
@@ -1273,6 +1272,9 @@ async def create_pair_thread(
 
     딜레마의 섬 · 모래성 · 긴급투입이 모두 이 헬퍼를 쓴다.
     보관되면 `스레드 관리` 권한이 없는 유저의 버튼 클릭이 막히므로 보관 시간을 넉넉히 잡는다.
+
+    초대는 짝 두 사람뿐이다. 운영자도 게임에 참여할 수 있으므로 참관용으로 방에 넣지 않는다.
+    운영자는 `스레드 관리` 권한으로 스레드 목록에서 필요한 방만 골라 보면 된다.
     """
     try:
         thread = await channel.create_thread(
@@ -1286,7 +1288,6 @@ async def create_pair_thread(
         return None
 
     for user_id in member_ids:
-        # 라운드를 연 운영자도 여기에 포함된다. 이미 참여자면 add_user는 무해하다.
         try:
             await thread.add_user(discord.Object(id=int(user_id)))
         except (discord.HTTPException, ValueError):
@@ -1342,14 +1343,13 @@ async def create_trust_pair_threads(transition: dict[str, Any]) -> None:
 
     round_id = int(transition["round_id"])
     title = str(transition["title"])
-    created_by = str(transition.get("created_by") or "")
     failed_pairs = 0
     for pair_number, pair in enumerate(transition.get("pairs", []), start=1):
         user_a_id, user_b_id = (str(pair[0]), str(pair[1]))
         created = await create_pair_thread(
             channel,
             f"{title} · {pair_number}세트",
-            [user_a_id, user_b_id] + ([created_by] if created_by else []),
+            [user_a_id, user_b_id],
             f"딜레마의 섬 #{round_id} 세트별 비공개 협상방",
             trust_decision_view(round_id),
             content=trust_pair_intro(user_a_id, user_b_id),
@@ -1618,7 +1618,6 @@ def start_sand_game(round_id: int) -> dict[str, Any] | None:
             "message_id": str(round_row["message_id"] or ""),
             "round_id": round_id,
             "title": str(round_row["title"]),
-            "created_by": str(extra.get("created_by") or ""),
             "pairs": pairs,
             "embed": build_sand_play_embed(updated_row, extra),
             # 숫자·행동 버튼은 짝별 비공개 방 안에만 둔다. 메인 메시지는 진행판 역할만 한다.
@@ -1661,7 +1660,6 @@ async def create_sand_pair_threads(transition: dict[str, Any]) -> None:
 
     round_id = int(transition["round_id"])
     title = str(transition["title"])
-    created_by = str(transition.get("created_by") or "")
 
     with db() as conn:
         round_row = conn.execute("SELECT * FROM rounds WHERE id = ?", (round_id,)).fetchone()
@@ -1677,7 +1675,7 @@ async def create_sand_pair_threads(transition: dict[str, Any]) -> None:
         created = await create_pair_thread(
             channel,
             f"{title} · {pair_number}번 모래성",
-            [user_a_id, user_b_id] + ([created_by] if created_by else []),
+            [user_a_id, user_b_id],
             f"모래성 게임 #{round_id} 1:1 비공개 방",
             sand_play_view(round_id),
             content=sand_pair_intro(user_a_id, user_b_id),
@@ -1788,8 +1786,18 @@ def apply_emergency_join(
     }
 
 
-async def announce_emergency_join(round_id: int, new_user_id: str, close_at: float) -> None:
-    """모든 비공개 방에 투입 사실과 늘어난 마감 시각을 알린다."""
+def emergency_thread_notice(close_at: float) -> str:
+    """비공개 방에 나가는 공지. 투입자가 누구인지는 절대 넣지 않는다.
+
+    방마다 상대가 누구인지가 게임의 일부다. 투입자 이름은 메인 채널의 진행판에서만 공개한다.
+    """
+    return (
+        "🚨 새 참가자가 긴급 투입되어 전체 진행 시간이 1분 연장됩니다.\n"
+        f"새 마감: {close_time_text(close_at)}"
+    )
+
+
+async def announce_emergency_join(round_id: int, close_at: float) -> None:
     with db() as conn:
         rows = conn.execute(
             """
@@ -1799,10 +1807,7 @@ async def announce_emergency_join(round_id: int, new_user_id: str, close_at: flo
             (round_id,),
         ).fetchall()
 
-    notice = (
-        f"🚨 <@{new_user_id}>님이 긴급 투입되었습니다. 전체 진행 시간이 1분 연장됩니다.\n"
-        f"새 마감: {close_time_text(close_at)}"
-    )
+    notice = emergency_thread_notice(close_at)
     for row in rows:
         thread_id = str(row["discussion_thread_id"])
         try:
@@ -1837,7 +1842,11 @@ async def refresh_main_trust_board(round_id: int) -> None:
         message = await channel.fetch_message(int(round_row["message_id"]))
         await message.edit(
             embed=build_trust_decision_embed(
-                round_id, str(round_row["title"]), pairs, unmatched_user_id
+                round_id,
+                str(round_row["title"]),
+                pairs,
+                unmatched_user_id,
+                str(extra.get("emergency_user_id") or "") or None,
             ),
             view=emergency_join_view(round_id) if unmatched_user_id else None,
         )
@@ -1914,7 +1923,6 @@ async def handle_emergency_join(interaction: discord.Interaction, round_id: int)
         )
         title = str(round_row["title"])
         channel_id = str(round_row["channel_id"])
-        created_by = str(extra.get("created_by") or "")
 
     close_at = float(applied["close_at"])
     bot.schedule_auto_close(round_id, close_at)
@@ -1924,14 +1932,16 @@ async def handle_emergency_join(interaction: discord.Interaction, round_id: int)
         await interaction.followup.send("긴급 투입했지만 채널을 찾지 못해 방을 열지 못했습니다.", ephemeral=True)
         return
 
+    # 새 방을 만들기 전에 알린다. 갓 투입된 짝에게 자기 자신에 대한 공지가 가지 않는다.
+    await announce_emergency_join(round_id, close_at)
+
     user_a_id = str(applied["user_a_id"])
     user_b_id = str(applied["user_b_id"])
-    members = [user_a_id, user_b_id] + ([created_by] if created_by else [])
     if round_type == "trust":
         created = await create_pair_thread(
             channel,
             f"{title} · 긴급 투입 세트",
-            members,
+            [user_a_id, user_b_id],
             f"딜레마의 섬 #{round_id} 긴급 투입 협상방",
             trust_decision_view(round_id),
             content=trust_pair_intro(user_a_id, user_b_id),
@@ -1940,7 +1950,7 @@ async def handle_emergency_join(interaction: discord.Interaction, round_id: int)
         created = await create_pair_thread(
             channel,
             f"{title} · 긴급 투입 모래성",
-            members,
+            [user_a_id, user_b_id],
             f"모래성 게임 #{round_id} 긴급 투입 방",
             sand_play_view(round_id),
             content=sand_pair_intro(user_a_id, user_b_id),
@@ -1964,7 +1974,6 @@ async def handle_emergency_join(interaction: discord.Interaction, round_id: int)
             ephemeral=True,
         )
 
-    await announce_emergency_join(round_id, user_b_id, close_at)
     if round_type == "sand":
         await refresh_main_sand_board(round_id)
     else:
@@ -2880,11 +2889,16 @@ def emergency_join_view(round_id: int) -> discord.ui.View:
     return view
 
 
+def emergency_join_notice(emergency_user_id: str) -> str:
+    return f"<@{emergency_user_id}>님이 긴급 투입되어 전체 진행 시간이 1분 연장되었습니다."
+
+
 def build_trust_decision_embed(
     round_id: int,
     title: str,
     pairs: list[tuple[str, str]],
     unmatched_user_id: str | None,
+    emergency_user_id: str | None = None,
 ) -> discord.Embed:
     embed = discord.Embed(
         title=title,
@@ -2904,6 +2918,12 @@ def build_trust_decision_embed(
                 "아직 게임에 참여하지 않은 분이 아래 `긴급 투입하기` 버튼을 누르면 둘만의 방이 새로 열리고, "
                 "전체 진행 시간이 1분 연장됩니다."
             ),
+            inline=False,
+        )
+    if emergency_user_id:
+        embed.add_field(
+            name="🚨 긴급 투입",
+            value=emergency_join_notice(emergency_user_id),
             inline=False,
         )
     embed.add_field(
@@ -3051,6 +3071,13 @@ def build_sand_play_embed(round_row: sqlite3.Row, extra: dict[str, Any]) -> disc
                 "아직 게임에 참여하지 않은 분이 아래 `긴급 투입하기` 버튼을 누르면 둘만의 방이 새로 열리고, "
                 "전체 진행 시간이 1분 연장됩니다."
             ),
+            inline=False,
+        )
+    emergency_user_id = str(extra.get("emergency_user_id") or "")
+    if emergency_user_id:
+        embed.add_field(
+            name="🚨 긴급 투입",
+            value=emergency_join_notice(emergency_user_id),
             inline=False,
         )
     embed.add_field(
@@ -4096,8 +4123,6 @@ async def create_round_from_setup(
     extra: dict[str, Any] = {
         "auto_close_at": close_at,
         "duration_minutes": int(진행시간분),
-        # 비공개 짝 스레드는 초대된 사람에게만 보인다. 라운드를 연 운영자는 항상 초대해 참관시킨다.
-        "created_by": str(interaction.user.id),
     }
     if 게임 in MAIN_GAME_TYPES:
         if 예정_미니게임 not in MINI_GAME_TYPES:
@@ -4401,18 +4426,12 @@ async def create_round_from_setup(
             )
 
     if 게임 in MAIN_GAME_TYPES:
-        next_step = (
-            "매칭 후에는 신뢰/배신 선택 시간이 3분 주어집니다."
-            if 게임 == "trust"
-            else "매칭 후에는 비공개 숫자 선택과 1:1 진행 시간이 10분 주어집니다."
-        )
         if 게임 == "sand":
             embed.add_field(
-                name="게임 준비 중",
+                name="게임 시작",
                 value=(
-                    f"현재는 모든 참가자에게 공개되는 규칙 안내 단계입니다. "
-                    f"{진행시간분}분 후 자동으로 1:1 매칭과 실제 게임을 시작합니다.\n"
-                    f"실제 시작 예정: {close_time_text(close_at)}\n{next_step}"
+                    f"{진행시간분}분 후 1:1 매칭과 함께 게임이 시작됩니다.\n"
+                    f"시작 예정: {close_time_text(close_at)}"
                 ),
                 inline=False,
             )
@@ -4421,7 +4440,8 @@ async def create_round_from_setup(
                 name="랜덤 매칭 시작",
                 value=(
                     f"오늘의 이벤트 참가 명단으로 {진행시간분}분 후 랜덤 매칭을 시작합니다.\n"
-                    f"예정 시각: {close_time_text(close_at)}\n{next_step}"
+                    f"예정 시각: {close_time_text(close_at)}\n"
+                    "매칭 후에는 신뢰/배신 선택 시간이 3분 주어집니다."
                 ),
                 inline=False,
             )

@@ -779,6 +779,34 @@ class BotRegressionTests(unittest.TestCase):
         self.assertIsNone(bot.apply_emergency_join(extra, "sand", "3"))
         self.assertEqual(extra["unmatched_user_id"], "3")
 
+    def test_emergency_join_name_is_shown_on_the_main_board_only(self) -> None:
+        """투입자 이름은 메인 채널에만 뜬다. 각 방에는 시간 연장 사실만 알린다."""
+        with bot.db() as conn:
+            round_row = conn.execute(
+                """
+                INSERT INTO rounds (type, title, question, status, channel_id, extra_json, created_at)
+                VALUES ('sand', '모래성', '모래성', 'open', '10', ?, '2026-01-01 00:00:00')
+                RETURNING *
+                """,
+                (
+                    json.dumps(
+                        {
+                            "sand_phase": "playing",
+                            "emergency_user_id": "4",
+                            "sand_pairs": [
+                                {"user_a_id": "3", "user_b_id": "4", "phase": "number_selection"}
+                            ],
+                        }
+                    ),
+                ),
+            ).fetchone()
+
+        board = bot.build_sand_play_embed(round_row, bot.round_extra(round_row))
+        self.assertIn("<@4>", json.dumps(board.to_dict(), ensure_ascii=False))
+
+        self.assertNotIn("<@4>", bot.emergency_thread_notice(1000.0))
+        self.assertNotIn("4", bot.emergency_thread_notice(1000.0).split("새 마감")[0])
+
     def test_sand_buttons_only_work_in_the_pair_thread(self) -> None:
         pair = {"user_a_id": "1", "user_b_id": "2", "thread_id": "777"}
 
