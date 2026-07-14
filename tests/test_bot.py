@@ -200,8 +200,7 @@ class BotRegressionTests(unittest.TestCase):
 
         self.assertIsNotNone(result)
         rendered = json.dumps(result[1].to_dict(), ensure_ascii=False)
-        self.assertIn("투표 참여", rendered)
-        for removed in ("토론 발언", "마감 방식", "진행 시간", "예정 마감"):
+        for removed in ("투표 참여", "통계", "토론 발언", "마감 방식", "진행 시간", "예정 마감"):
             self.assertNotIn(removed, rendered)
 
     def test_trust_public_result_only_shows_aggregate_counts(self) -> None:

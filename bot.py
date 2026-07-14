@@ -3819,12 +3819,6 @@ def close_round_record(
                 color=discord.Color.from_rgb(218, 165, 90),
             )
             embed.add_field(name="짝별 결과", value=field_text(result_lines), inline=False)
-            completion_text = f"완료된 1:1 게임 {completed_count}쌍의 점수를 반영했습니다."
-            if auto_completed_count:
-                completion_text += (
-                    f"\n제한 시간 내에 끝나지 않은 {auto_completed_count}쌍은 랜덤으로 자동 진행했습니다."
-                )
-            embed.add_field(name="정산 완료", value=completion_text, inline=False)
             unmatched_user_id = str(extra.get("unmatched_user_id") or "")
             if unmatched_user_id:
                 embed.add_field(
@@ -3924,12 +3918,11 @@ def close_round_record(
                 inline=False,
             )
 
-        embed.add_field(name="통계", value=f"투표 참여: {len(votes)}명", inline=False)
         planned_mini_game = str(extra.get("planned_mini_game") or "")
         if round_row["type"] in MAIN_GAME_TYPES and planned_mini_game in MINI_GAME_TYPES:
             embed.add_field(
                 name="다음 미니게임",
-                value=f"처음 선택한 `{GAME_NAMES[planned_mini_game]}`의 설정 버튼을 눌러 시작해주세요.",
+                value=GAME_NAMES[planned_mini_game],
                 inline=False,
             )
         embed.set_footer(text=f"시작: {round_row['created_at']} · 종료: {now_text()}")
