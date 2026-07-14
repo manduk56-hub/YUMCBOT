@@ -4522,10 +4522,10 @@ async def create_round_from_setup(
                 (round_id, event_session_id),
             )
 
+    # 메인게임 등록 단계에서는 시작 시각만 알린다. 규칙은 임베드 본문에 이미 있고,
+    # 다음 미니게임이 뭔지는 참가자가 미리 알 필요가 없다.
     if 게임 in MAIN_GAME_TYPES:
         if 게임 == "sand":
-            # 참가자에게는 시작 시각만 알린다. 규칙은 임베드 본문에 이미 있고,
-            # 다음 미니게임이 뭔지는 알려줄 필요가 없다.
             embed.add_field(
                 name="게임 시작",
                 value=(
@@ -4542,11 +4542,6 @@ async def create_round_from_setup(
                     f"예정 시각: {close_time_text(close_at)}\n"
                     "매칭 후에는 신뢰/배신 선택 시간이 3분 주어집니다."
                 ),
-                inline=False,
-            )
-            embed.add_field(
-                name="선택한 미니게임",
-                value=f"메인게임 정산 후 `{GAME_NAMES[str(예정_미니게임)]}` 설정 버튼이 표시됩니다.",
                 inline=False,
             )
     else:
