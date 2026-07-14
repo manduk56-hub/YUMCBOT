@@ -70,6 +70,17 @@ class FreshDatabaseTest(unittest.TestCase):
         bot.init_db()
         bot.verify_schema()  # 예외가 나면 실패
 
+    def test_discussion_messages_table_is_created(self) -> None:
+        """v2 마이그레이션. 익명 발언을 유저당 여러 건 저장하기 위한 테이블."""
+        bot.init_db()
+        with bot.db() as conn:
+            columns = {
+                row["name"]
+                for row in conn.execute("PRAGMA table_info(discussion_messages)").fetchall()
+            }
+        self.assertIn("anon_number", columns)
+        self.assertIn("content", columns)
+
     def test_init_db_is_idempotent(self) -> None:
         bot.init_db()
         bot.init_db()
@@ -103,7 +114,12 @@ class SchemaGuardTest(unittest.TestCase):
         bot.init_db()
 
     def test_missing_column_blocks_startup(self) -> None:
-        pending = {bot.SCHEMA_VERSION + 1: ["ALTER TABLE rounds ADD COLUMN memo TEXT"]}
+        # 기존 마이그레이션은 그대로 두고 아직 적용되지 않은 버전을 하나 얹는다.
+        # (canonical_schema가 v2부터 순서대로 실행하므로 구멍이 있으면 안 된다.)
+        pending = {
+            **bot.MIGRATIONS,
+            bot.SCHEMA_VERSION + 1: ["ALTER TABLE rounds ADD COLUMN memo TEXT"],
+        }
         with patch.object(bot, "MIGRATIONS", pending), patch.object(
             bot, "SCHEMA_VERSION", bot.SCHEMA_VERSION + 1
         ):
