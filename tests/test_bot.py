@@ -328,6 +328,120 @@ class BotRegressionTests(unittest.TestCase):
 
         self.assertTrue(json.loads(round_row["extra_json"])["force_closed"])
 
+    def test_event_stays_open_until_planned_mini_game_finishes(self) -> None:
+        with bot.db() as conn:
+            event_cursor = conn.execute(
+                """
+                INSERT INTO event_sessions (status, channel_id, created_at)
+                VALUES ('active', '10', '2026-01-01 00:00:00')
+                """
+            )
+            event_id = int(event_cursor.lastrowid)
+            conn.execute(
+                """
+                INSERT INTO rounds
+                    (type, title, question, status, channel_id, extra_json, created_at,
+                     closed_at, event_session_id)
+                VALUES ('trust', '메인', '메인', 'closed', '10', ?,
+                        '2026-01-01 00:00:00', '2026-01-01 00:05:00', ?)
+                """,
+                (json.dumps({"trust_phase": "scored", "planned_mini_game": "balance"}), event_id),
+            )
+
+        self.assertIsNone(bot.close_completed_event(event_id))
+        with bot.db() as conn:
+            status = conn.execute(
+                "SELECT status FROM event_sessions WHERE id = ?", (event_id,)
+            ).fetchone()["status"]
+        self.assertEqual(status, "active")
+
+    def test_event_completion_closes_session_and_builds_final_summary(self) -> None:
+        self.add_user("1", "참가자", 1)
+        with bot.db() as conn:
+            event_cursor = conn.execute(
+                """
+                INSERT INTO event_sessions (status, channel_id, created_at)
+                VALUES ('active', '10', '2026-01-01 00:00:00')
+                """
+            )
+            event_id = int(event_cursor.lastrowid)
+            conn.execute(
+                """
+                INSERT INTO event_participants (event_session_id, user_id, joined_at)
+                VALUES (?, '1', '2026-01-01 00:00:00')
+                """,
+                (event_id,),
+            )
+            main_cursor = conn.execute(
+                """
+                INSERT INTO rounds
+                    (type, title, question, status, channel_id, extra_json, created_at,
+                     closed_at, event_session_id)
+                VALUES ('trust', '딜레마', '딜레마', 'closed', '10', ?,
+                        '2026-01-01 00:00:00', '2026-01-01 00:05:00', ?)
+                """,
+                (json.dumps({"trust_phase": "scored", "planned_mini_game": "balance"}), event_id),
+            )
+            mini_cursor = conn.execute(
+                """
+                INSERT INTO rounds
+                    (type, title, question, option_a, option_b, status, channel_id,
+                     extra_json, created_at, closed_at, event_session_id)
+                VALUES ('balance', '결승 선택', '선택', 'A', 'B', 'closed', '10', '{}',
+                        '2026-01-01 00:05:00', '2026-01-01 00:10:00', ?)
+                """,
+                (event_id,),
+            )
+            conn.execute(
+                """
+                INSERT INTO score_logs (round_id, user_id, delta, reason, created_at)
+                VALUES (?, '1', 1, '테스트 정산', '2026-01-01 00:10:00')
+                """,
+                (int(mini_cursor.lastrowid),),
+            )
+            main_round_id = int(main_cursor.lastrowid)
+
+        result = bot.close_completed_event(event_id)
+
+        self.assertIsNotNone(result)
+        channel_id, embed = result
+        self.assertEqual(channel_id, "10")
+        rendered = json.dumps(embed.to_dict(), ensure_ascii=False)
+        self.assertIn("이벤트 종료 · 최종 결과 요약", rendered)
+        self.assertIn(f"#{main_round_id}", rendered)
+        self.assertIn("딜레마의 섬", rendered)
+        self.assertIn("밸런스 게임", rendered)
+        self.assertIn("점수 합계 +1점", rendered)
+        with bot.db() as conn:
+            event_row = conn.execute(
+                "SELECT status, closed_at FROM event_sessions WHERE id = ?", (event_id,)
+            ).fetchone()
+        self.assertEqual(event_row["status"], "closed")
+        self.assertIsNotNone(event_row["closed_at"])
+        self.assertIsNone(bot.close_completed_event(event_id))
+
+    def test_unresolved_cutting_does_not_finish_event(self) -> None:
+        with bot.db() as conn:
+            event_cursor = conn.execute(
+                """
+                INSERT INTO event_sessions (status, channel_id, created_at)
+                VALUES ('active', '10', '2026-01-01 00:00:00')
+                """
+            )
+            event_id = int(event_cursor.lastrowid)
+            conn.execute(
+                """
+                INSERT INTO rounds
+                    (type, title, question, status, channel_id, extra_json, created_at,
+                     closed_at, event_session_id)
+                VALUES ('cutting', '세공', '세공', 'closed', '10', '{}',
+                        '2026-01-01 00:00:00', '2026-01-01 00:05:00', ?)
+                """,
+                (event_id,),
+            )
+
+        self.assertIsNone(bot.close_completed_event(event_id))
+
     def test_sand_rules_match_requested_settlements(self) -> None:
         embed = bot.build_sand_registration_embed(1, "모래성", 2)
         rendered = json.dumps(embed.to_dict(), ensure_ascii=False)
