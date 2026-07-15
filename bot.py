@@ -639,6 +639,169 @@ def force_close_current_event(
     return event_row, round_rows
 
 
+def event_rounds_are_complete(round_rows: list[sqlite3.Row]) -> bool:
+    """이벤트에 예정된 게임이 모두 정산됐는지 확인한다."""
+    if not round_rows or any(row["status"] != "closed" for row in round_rows):
+        return False
+
+    for index, round_row in enumerate(round_rows):
+        extra = round_extra(round_row)
+        if extra.get("force_closed"):
+            return False
+        if round_row["type"] == "cutting" and "cutting_result_level" not in extra:
+            return False
+        if round_row["type"] not in MAIN_GAME_TYPES:
+            continue
+
+        planned_mini_game = str(extra.get("planned_mini_game") or "")
+        if planned_mini_game not in MINI_GAME_TYPES:
+            continue
+        if not any(
+            round_game_key(candidate) == planned_mini_game
+            and candidate["status"] == "closed"
+            and not round_extra(candidate).get("force_closed")
+            for candidate in round_rows[index + 1 :]
+        ):
+            return False
+    return True
+
+
+def build_event_summary_embed(
+    conn: sqlite3.Connection,
+    event_row: sqlite3.Row | dict[str, Any],
+    round_rows: list[sqlite3.Row],
+    *,
+    force_closed: bool = False,
+) -> discord.Embed:
+    """종료 시점에 메인 채널에 남길 이벤트 단위 최종 요약."""
+    participant_count = int(
+        conn.execute(
+            "SELECT COUNT(*) AS count FROM event_participants WHERE event_session_id = ?",
+            (int(event_row["id"]),),
+        ).fetchone()["count"]
+    )
+    score_by_round: dict[int, tuple[int, int]] = {}
+    if round_rows:
+        placeholders = ", ".join("?" for _ in round_rows)
+        score_rows = conn.execute(
+            f"""
+            SELECT round_id, COALESCE(SUM(delta), 0) AS delta,
+                   COUNT(DISTINCT user_id) AS affected_users
+            FROM score_logs
+            WHERE round_id IN ({placeholders})
+            GROUP BY round_id
+            """,
+            tuple(int(row["id"]) for row in round_rows),
+        ).fetchall()
+        score_by_round = {
+            int(row["round_id"]): (int(row["delta"]), int(row["affected_users"]))
+            for row in score_rows
+        }
+
+    result_lines: list[str] = []
+    completed_count = 0
+    cancelled_count = 0
+    for round_row in round_rows:
+        extra = round_extra(round_row)
+        was_cancelled = bool(extra.get("force_closed")) or (
+            extra.get("trust_phase") == "cancelled" or extra.get("sand_phase") == "cancelled"
+        )
+        if was_cancelled:
+            status_text = "취소"
+            cancelled_count += 1
+        elif round_row["type"] == "cutting" and "cutting_result_level" not in extra:
+            status_text = "결과 미확정"
+        else:
+            status_text = "완료"
+            completed_count += 1
+
+        delta, affected_users = score_by_round.get(int(round_row["id"]), (0, 0))
+        delta_text = f"+{delta}" if delta > 0 else str(delta)
+        result_lines.append(
+            f"#{round_row['id']} **{GAME_NAMES.get(round_game_key(round_row), round_game_key(round_row))}**"
+            f" · {round_row['title']} · {status_text} · 점수 합계 {delta_text}점"
+            f" ({affected_users}명 반영)"
+        )
+
+    ended_at = str(event_row["closed_at"] or now_text())
+    embed = discord.Embed(
+        title="⛔ 이벤트 강제 종료 · 최종 요약" if force_closed else "🏁 이벤트 종료 · 최종 결과 요약",
+        description=(
+            "남은 게임을 정산하지 않고 이벤트를 종료했습니다. 진행 기록과 스레드는 그대로 보관됩니다."
+            if force_closed
+            else "예정된 게임이 모두 종료되었습니다. 진행 기록과 최종 정산 현황을 확인하세요."
+        ),
+        color=discord.Color.orange() if force_closed else discord.Color.gold(),
+    )
+    embed.add_field(
+        name="이벤트 현황",
+        value=(
+            f"참가자 {participant_count}명 · 완료 {completed_count}개"
+            f"{f' · 취소 {cancelled_count}개' if cancelled_count else ''}\n"
+            f"시작: {event_row['created_at']}\n종료: {ended_at}"
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="진행한 게임 최종 결과",
+        value=field_text(result_lines, empty="진행된 게임이 없습니다."),
+        inline=False,
+    )
+    embed.set_footer(text=f"이벤트 #{event_row['id']} · 세부 결과는 각 게임 메시지와 보관된 스레드에서 확인할 수 있습니다.")
+    return embed
+
+
+def close_completed_event(event_session_id: int) -> tuple[str, discord.Embed] | None:
+    """모든 게임이 끝난 이벤트를 한 번만 종료 상태로 전환하고 요약을 만든다."""
+    with db() as conn:
+        event_row = conn.execute(
+            "SELECT * FROM event_sessions WHERE id = ? AND status != 'closed'",
+            (event_session_id,),
+        ).fetchone()
+        if not event_row:
+            return None
+        round_rows = conn.execute(
+            "SELECT * FROM rounds WHERE event_session_id = ? ORDER BY id ASC",
+            (event_session_id,),
+        ).fetchall()
+        if not event_rounds_are_complete(round_rows):
+            return None
+
+        closed_at = now_text()
+        cursor = conn.execute(
+            """
+            UPDATE event_sessions SET status = 'closed', closed_at = ?
+            WHERE id = ? AND status != 'closed'
+            """,
+            (closed_at, event_session_id),
+        )
+        if cursor.rowcount != 1:
+            return None
+        event_values = dict(event_row)
+        event_values["closed_at"] = closed_at
+        return str(event_row["channel_id"]), build_event_summary_embed(
+            conn,
+            event_values,
+            round_rows,
+        )
+
+
+async def publish_event_summary_if_complete(event_session_id: int | None) -> None:
+    if not event_session_id:
+        return
+    summary = close_completed_event(int(event_session_id))
+    if not summary:
+        return
+    channel_id, embed = summary
+    channel = await resolve_text_channel(channel_id)
+    if channel is None:
+        return
+    try:
+        await channel.send(embed=embed)
+    except discord.HTTPException:
+        pass
+
+
 def is_event_participant(
     conn: sqlite3.Connection,
     event_session_id: int,
@@ -1288,6 +1451,23 @@ async def resolve_text_channel(channel_id: str) -> discord.TextChannel | None:
         except (discord.HTTPException, ValueError):
             return None
     return channel if isinstance(channel, discord.TextChannel) else None
+
+
+async def archive_round_discussion_thread(
+    round_row: sqlite3.Row,
+    *,
+    reason: str,
+) -> None:
+    """일반 토론 스레드를 삭제하지 않고 읽기 전용 보관 상태로 남긴다."""
+    thread_id = str(round_row["discussion_thread_id"] or "")
+    if not thread_id:
+        return
+    try:
+        thread = bot.get_channel(int(thread_id)) or await bot.fetch_channel(int(thread_id))
+        if isinstance(thread, discord.Thread):
+            await thread.edit(archived=True, locked=True, reason=reason)
+    except (discord.HTTPException, ValueError):
+        pass
 
 
 async def create_pair_thread(
@@ -2324,6 +2504,7 @@ async def refresh_or_finish_sand_round(
             await channel.send(embed=result_embed, view=planned_mini_game_view(round_id))
         except discord.HTTPException:
             pass
+    await publish_event_summary_if_complete(round_row["event_session_id"])
 
 
 async def handle_sand_number(
@@ -2567,8 +2748,10 @@ class EventBot(discord.Client):
                 await publish_trust_pair_results(round_id)
             if row["type"] == "sand":
                 await publish_sand_pair_results(round_id)
+            await archive_round_discussion_thread(row, reason="라운드 종료 후 영구 보관")
             if hasattr(channel, "send"):
                 await channel.send(embed=embed, view=planned_mini_game_view(round_id))
+            await publish_event_summary_if_complete(row["event_session_id"])
         except asyncio.CancelledError:
             raise
         finally:
@@ -3458,6 +3641,8 @@ async def handle_cutting_button(interaction: discord.Interaction, round_id: int)
             logs.append(f"{max_level}강까지 성공, 세공 종료")
             embed = finalize_cutting_round(conn, round_row, extra, max_level, logs, interaction.guild)
             await interaction.response.edit_message(embed=embed, view=cutting_action_view(round_id, disabled=True))
+            conn.commit()
+            await publish_event_summary_if_complete(round_row["event_session_id"])
             return
 
         next_level = current_level + 1
@@ -3469,6 +3654,8 @@ async def handle_cutting_button(interaction: discord.Interaction, round_id: int)
                 logs.append(f"{max_level}강까지 성공, 세공 종료")
                 embed = finalize_cutting_round(conn, round_row, extra, current_level, logs, interaction.guild)
                 await interaction.response.edit_message(embed=embed, view=cutting_action_view(round_id, disabled=True))
+                conn.commit()
+                await publish_event_summary_if_complete(round_row["event_session_id"])
                 return
 
             extra.update(
@@ -3489,6 +3676,8 @@ async def handle_cutting_button(interaction: discord.Interaction, round_id: int)
         logs.append(f"{next_level}강 시도: 실패, {current_level}강화에서 종료")
         embed = finalize_cutting_round(conn, round_row, extra, current_level, logs, interaction.guild)
         await interaction.response.edit_message(embed=embed, view=cutting_action_view(round_id, disabled=True))
+        conn.commit()
+        await publish_event_summary_if_complete(round_row["event_session_id"])
 
 
 def close_round_record(
@@ -3962,24 +4151,24 @@ def parse_defuse_color(value: str) -> str:
     return color_id
 
 
-async def ensure_pair_thread_permissions(interaction: discord.Interaction, 게임: str) -> bool:
+async def ensure_pair_thread_permissions(
+    interaction: discord.Interaction,
+    게임: str,
+    channel: discord.TextChannel,
+) -> bool:
     """딜레마의 섬·모래성은 짝마다 비공개 스레드를 연다. 시작 전에 권한을 확인한다."""
     game_name = GAME_NAMES[게임]
     guild = interaction.guild
-    interaction_channel = interaction.channel
-    if guild is None or not isinstance(interaction_channel, discord.TextChannel):
-        await interaction.response.send_message(
-            f"{game_name}은(는) 스레드가 아닌 서버 텍스트 채널에서 시작해주세요.",
-            ephemeral=True,
-        )
+    if guild is None:
+        await interaction.followup.send("서버에서 봇 권한을 확인하지 못했습니다.", ephemeral=True)
         return False
 
     bot_member = guild.me
     if bot_member is None:
-        await interaction.response.send_message("서버에서 봇 권한을 확인하지 못했습니다.", ephemeral=True)
+        await interaction.followup.send("서버에서 봇 권한을 확인하지 못했습니다.", ephemeral=True)
         return False
 
-    permissions = interaction_channel.permissions_for(bot_member)
+    permissions = channel.permissions_for(bot_member)
     if (
         permissions.create_private_threads
         and permissions.send_messages_in_threads
@@ -3987,7 +4176,7 @@ async def ensure_pair_thread_permissions(interaction: discord.Interaction, 게�
     ):
         return True
 
-    await interaction.response.send_message(
+    await interaction.followup.send(
         f"{game_name}에는 봇의 `비공개 스레드 만들기`, `스레드에서 메시지 보내기`, "
         "`스레드 관리` 권한이 필요합니다.",
         ephemeral=True,
@@ -4087,8 +4276,11 @@ class StartSetupModal(discord.ui.Modal):
 @app_commands.default_permissions()
 @admin_only()
 async def open_event(interaction: discord.Interaction) -> None:
-    if not isinstance(interaction.channel, (discord.TextChannel, discord.Thread)):
-        await interaction.response.send_message("서버 텍스트 채널에서만 사용할 수 있습니다.", ephemeral=True)
+    if not isinstance(interaction.channel, discord.TextChannel):
+        await interaction.response.send_message(
+            "이벤트 메인 채널로 사용할 서버 텍스트 채널에서 실행해주세요. 스레드에서는 열 수 없습니다.",
+            ephemeral=True,
+        )
         return
 
     with db() as conn:
@@ -4223,7 +4415,31 @@ async def create_round_from_setup(
         await interaction.response.send_message("서버 텍스트 채널에서만 사용할 수 있습니다.", ephemeral=True)
         return
 
-    if 게임 in MAIN_GAME_TYPES and not await ensure_pair_thread_permissions(interaction, 게임):
+    await interaction.response.defer(ephemeral=True)
+
+    with db() as conn:
+        initial_event_row = get_current_event(conn)
+    if not initial_event_row:
+        await interaction.followup.send(
+            "현재 열린 이벤트가 없습니다. 먼저 `/오픈`을 실행해주세요.",
+            ephemeral=True,
+        )
+        return
+
+    main_channel_id = str(initial_event_row["channel_id"])
+    main_channel = await resolve_text_channel(main_channel_id)
+    if main_channel is None:
+        await interaction.followup.send(
+            "이벤트를 시작한 메인 텍스트 채널을 찾을 수 없습니다.",
+            ephemeral=True,
+        )
+        return
+
+    if 게임 in MAIN_GAME_TYPES and not await ensure_pair_thread_permissions(
+        interaction,
+        게임,
+        main_channel,
+    ):
         return
 
     close_at = time.time() + (int(진행시간분) * 60)
@@ -4233,19 +4449,19 @@ async def create_round_from_setup(
     }
     if 게임 in MAIN_GAME_TYPES:
         if 예정_미니게임 not in MINI_GAME_TYPES:
-            await interaction.response.send_message("시작할 미니게임을 함께 선택해주세요.", ephemeral=True)
+            await interaction.followup.send("시작할 미니게임을 함께 선택해주세요.", ephemeral=True)
             return
         extra["planned_mini_game"] = 예정_미니게임
 
     with db() as conn:
         if get_open_round(conn):
-            await interaction.response.send_message("이미 열린 라운드가 있습니다. 먼저 `/라운드마감`을 해주세요.", ephemeral=True)
+            await interaction.followup.send("이미 열린 라운드가 있습니다. 먼저 `/라운드마감`을 해주세요.", ephemeral=True)
             return
 
         event_row = get_current_event(conn)
-        if not event_row:
-            await interaction.response.send_message(
-                "현재 열린 이벤트가 없습니다. 먼저 `/오픈`을 실행해주세요.",
+        if not event_row or int(event_row["id"]) != int(initial_event_row["id"]):
+            await interaction.followup.send(
+                "이벤트 상태가 바뀌었습니다. 현재 이벤트에서 다시 시도해주세요.",
                 ephemeral=True,
             )
             return
@@ -4260,7 +4476,7 @@ async def create_round_from_setup(
             ).fetchone()["count"]
         )
         if 게임 in MAIN_GAME_TYPES and participant_count < 2:
-            await interaction.response.send_message(
+            await interaction.followup.send(
                 "메인게임을 시작하려면 `/오픈`의 `참여하기` 등록자가 최소 2명 필요합니다.",
                 ephemeral=True,
             )
@@ -4275,7 +4491,7 @@ async def create_round_from_setup(
             (event_session_id,),
         ).fetchone()
         if 게임 in MAIN_GAME_TYPES and (event_row["status"] != "recruiting" or previous_round):
-            await interaction.response.send_message(
+            await interaction.followup.send(
                 "이번 이벤트의 게임 조합은 이미 확정되었습니다. 다음 이벤트는 `/오픈`부터 다시 시작해주세요.",
                 ephemeral=True,
             )
@@ -4283,7 +4499,7 @@ async def create_round_from_setup(
         if previous_round and previous_round["type"] == "cutting":
             previous_extra = round_extra(previous_round)
             if "cutting_result_level" not in previous_extra:
-                await interaction.response.send_message(
+                await interaction.followup.send(
                     "이전 돌 세공 예측의 결과가 아직 확정되지 않았습니다. 먼저 `/세공진행`으로 마무리해주세요.",
                     ephemeral=True,
                 )
@@ -4303,7 +4519,7 @@ async def create_round_from_setup(
                 and previous_round["type"] in MAIN_GAME_TYPES
                 and previous_phase not in {"cancelled", None}
             ):
-                await interaction.response.send_message(
+                await interaction.followup.send(
                     "메인게임 다음에는 미니게임 하나를 진행해야 합니다.",
                     ephemeral=True,
                 )
@@ -4321,7 +4537,7 @@ async def create_round_from_setup(
                 or previous_round["status"] != "closed"
                 or previous_phase not in {"scored", None}
             ):
-                await interaction.response.send_message(
+                await interaction.followup.send(
                     "미니게임을 시작하려면 참여자 모집·매칭·선택·정산까지 끝난 메인게임이 필요합니다.",
                     ephemeral=True,
                 )
@@ -4329,7 +4545,7 @@ async def create_round_from_setup(
 
         if 게임 == "balance":
             if not 선택_a or not 선택_b:
-                await interaction.response.send_message(
+                await interaction.followup.send(
                     "밸런스 게임은 `선택_a`와 `선택_b`가 필요합니다.",
                     ephemeral=True,
                 )
@@ -4346,7 +4562,7 @@ async def create_round_from_setup(
                     제목,
                     선택_a,
                     선택_b,
-                    str(interaction.channel.id),
+                    main_channel_id,
                     json.dumps(extra, ensure_ascii=False),
                     now_text(),
                 ),
@@ -4356,13 +4572,13 @@ async def create_round_from_setup(
             view = vote_view(round_id, BALANCE_VOTE_CHOICES)
         elif 게임 == "defuse4":
             if not 안전색:
-                await interaction.response.send_message(
+                await interaction.followup.send(
                     "4선 폭탄 해체 게임은 안전 색이 필요합니다.",
                     ephemeral=True,
                 )
                 return
             if not 힌트:
-                await interaction.response.send_message(
+                await interaction.followup.send(
                     "4선 폭탄 해체 게임은 관리자의 힌트가 필요합니다.",
                     ephemeral=True,
                 )
@@ -4390,7 +4606,7 @@ async def create_round_from_setup(
                 (
                     제목,
                     제목,
-                    str(interaction.channel.id),
+                    main_channel_id,
                     json.dumps(extra, ensure_ascii=False),
                     now_text(),
                 ),
@@ -4415,7 +4631,7 @@ async def create_round_from_setup(
                 (
                     제목,
                     제목,
-                    str(interaction.channel.id),
+                    main_channel_id,
                     json.dumps(extra, ensure_ascii=False),
                     now_text(),
                 ),
@@ -4440,7 +4656,7 @@ async def create_round_from_setup(
                 (
                     제목,
                     제목,
-                    str(interaction.channel.id),
+                    main_channel_id,
                     json.dumps(extra, ensure_ascii=False),
                     now_text(),
                 ),
@@ -4461,7 +4677,7 @@ async def create_round_from_setup(
                 (event_session_id,),
             ).fetchall()
             if len(rows) < 3:
-                await interaction.response.send_message(
+                await interaction.followup.send(
                     "상위 3명 견제 게임은 이번 이벤트 참가자 중 점수 기록 유저가 최소 3명 필요합니다.",
                     ephemeral=True,
                 )
@@ -4485,7 +4701,7 @@ async def create_round_from_setup(
                 (
                     제목,
                     제목,
-                    str(interaction.channel.id),
+                    main_channel_id,
                     json.dumps(extra, ensure_ascii=False),
                     now_text(),
                 ),
@@ -4504,7 +4720,7 @@ async def create_round_from_setup(
                 (
                     제목,
                     제목,
-                    str(interaction.channel.id),
+                    main_channel_id,
                     json.dumps(extra, ensure_ascii=False),
                     now_text(),
                 ),
@@ -4560,8 +4776,7 @@ async def create_round_from_setup(
             value=f"{진행시간분}분 후 자동으로 종료됩니다.\n예정 시각: {close_time_text(close_at)}",
             inline=False,
         )
-    await interaction.response.send_message(embed=embed, view=view)
-    message = await interaction.original_response()
+    message = await main_channel.send(embed=embed, view=view)
 
     discussion_thread_id = None
     if 게임 in {"balance", "defuse4"}:
@@ -4591,7 +4806,7 @@ async def create_round_from_setup(
                 )
             # 스레드를 잠그면 `스레드 관리` 권한이 없는 유저의 버튼 클릭까지 디스코드가 막는다.
             # 익명성은 on_message의 일반 메시지 삭제로만 지킨다.
-            await interaction.followup.send(embed=notice_embed)
+            await main_channel.send(embed=notice_embed)
             discussion_thread_id = str(thread.id)
         except discord.HTTPException:
             discussion_thread_id = None
@@ -4612,6 +4827,10 @@ async def create_round_from_setup(
         )
 
     bot.schedule_auto_close(round_id, close_at)
+    await interaction.followup.send(
+        f"게임 메시지를 <#{main_channel_id}>에 게시했습니다.",
+        ephemeral=True,
+    )
 
 
 @bot.tree.command(name="라운드마감", description="현재 열린 라운드를 마감하고 결과를 공개합니다.")
@@ -4661,43 +4880,48 @@ async def close_round(interaction: discord.Interaction) -> None:
             await interaction.followup.send("참여자가 부족해 모래성 게임을 취소했습니다.", ephemeral=True)
         return
 
-    # 짝별 방에 결과를 공개해야 하는 라운드는 응답 전에 API 호출이 여러 번이라 먼저 defer한다.
+    # 결과 메시지는 명령을 실행한 위치와 무관하게 이벤트가 시작된 메인 채널에만 게시한다.
     round_extra_row = round_extra(round_row)
     is_trust_decision = (
         round_row["type"] == "trust" and round_extra_row.get("trust_phase") == "decision"
     )
     is_sand_playing = round_row["type"] == "sand" and round_extra_row.get("sand_phase") == "playing"
     publishes_pair_results = is_trust_decision or is_sand_playing
-    if publishes_pair_results:
-        await interaction.response.defer()
+    await interaction.response.defer(ephemeral=True)
 
     result = close_round_record(int(round_row["id"]), interaction.guild)
     if not result:
-        if publishes_pair_results:
-            await interaction.edit_original_response(content="현재 열린 라운드가 없습니다.")
-        else:
-            await interaction.response.send_message("현재 열린 라운드가 없습니다.", ephemeral=True)
+        await interaction.followup.send("현재 열린 라운드가 없습니다.", ephemeral=True)
         return
 
     task = bot.auto_close_tasks.pop(int(round_row["id"]), None)
     if task:
         task.cancel()
 
-    _, embed = result
+    channel_id, embed = result
     if publishes_pair_results:
         if is_trust_decision:
             await publish_trust_pair_results(int(round_row["id"]))
         else:
             await publish_sand_pair_results(int(round_row["id"]))
-        await interaction.edit_original_response(
-            embed=embed,
-            view=planned_mini_game_view(int(round_row["id"])),
+    await archive_round_discussion_thread(round_row, reason="라운드 종료 후 영구 보관")
+
+    channel = await resolve_text_channel(channel_id)
+    if channel is None:
+        await interaction.followup.send(
+            "라운드는 마감했지만 이벤트 메인 채널을 찾지 못해 결과를 게시하지 못했습니다.",
+            ephemeral=True,
         )
-    else:
-        await interaction.response.send_message(
-            embed=embed,
-            view=planned_mini_game_view(int(round_row["id"])),
-        )
+        return
+    await channel.send(
+        embed=embed,
+        view=planned_mini_game_view(int(round_row["id"])),
+    )
+    await publish_event_summary_if_complete(round_row["event_session_id"])
+    await interaction.followup.send(
+        f"라운드 결과를 <#{channel_id}>에 게시했습니다.",
+        ephemeral=True,
+    )
 
 
 @bot.tree.command(name="이벤트종료", description="개발 중인 현재 이벤트를 남은 게임과 관계없이 강제로 종료합니다.")
@@ -4708,6 +4932,26 @@ async def force_end_event(interaction: discord.Interaction) -> None:
 
     with db() as conn:
         result = force_close_current_event(conn)
+        force_summary: tuple[str, discord.Embed] | None = None
+        if result:
+            original_event_row, _ = result
+            closed_event_row = conn.execute(
+                "SELECT * FROM event_sessions WHERE id = ?",
+                (int(original_event_row["id"]),),
+            ).fetchone()
+            closed_round_rows = conn.execute(
+                "SELECT * FROM rounds WHERE event_session_id = ? ORDER BY id ASC",
+                (int(original_event_row["id"]),),
+            ).fetchall()
+            force_summary = (
+                str(closed_event_row["channel_id"]),
+                build_event_summary_embed(
+                    conn,
+                    closed_event_row,
+                    closed_round_rows,
+                    force_closed=True,
+                ),
+            )
     if not result:
         await interaction.followup.send("현재 열려 있는 이벤트가 없습니다.", ephemeral=True)
         return
@@ -4736,6 +4980,7 @@ async def force_end_event(interaction: discord.Interaction) -> None:
             try:
                 thread = bot.get_channel(int(thread_id)) or await bot.fetch_channel(int(thread_id))
                 if isinstance(thread, discord.Thread):
+                    # archive+lock은 삭제가 아니다. 활성 목록에서만 빠지고 보관 목록에 영구히 남는다.
                     await thread.edit(
                         archived=True,
                         locked=True,
@@ -4759,6 +5004,7 @@ async def force_end_event(interaction: discord.Interaction) -> None:
                     pair_thread_id = int(pair_thread["discussion_thread_id"])
                     thread = bot.get_channel(pair_thread_id) or await bot.fetch_channel(pair_thread_id)
                     if isinstance(thread, discord.Thread):
+                        # 강제 종료 때도 스레드를 지우지 않고 읽기 전용 보관 상태로만 전환한다.
                         await thread.edit(
                             archived=True,
                             locked=True,
@@ -4778,6 +5024,15 @@ async def force_end_event(interaction: discord.Interaction) -> None:
         except (discord.HTTPException, ValueError):
             pass
 
+    if force_summary:
+        channel_id, summary_embed = force_summary
+        channel = await resolve_text_channel(channel_id)
+        if channel is not None:
+            try:
+                await channel.send(embed=summary_embed)
+            except discord.HTTPException:
+                pass
+
     await interaction.followup.send(
         f"이벤트 #{event_row['id']}을 강제로 종료했습니다. "
         f"미완료 라운드 {open_round_count}개는 점수 정산 없이 취소했습니다.",
@@ -4789,6 +5044,7 @@ async def force_end_event(interaction: discord.Interaction) -> None:
 @app_commands.default_permissions()
 @admin_only()
 async def run_cutting(interaction: discord.Interaction) -> None:
+    await interaction.response.defer(ephemeral=True)
     with db() as conn:
         rows = conn.execute(
             """
@@ -4808,10 +5064,10 @@ async def run_cutting(interaction: discord.Interaction) -> None:
                 break
 
         if not round_row:
-            await interaction.response.send_message("세공을 진행할 마감된 돌 세공 라운드가 없습니다.", ephemeral=True)
+            await interaction.followup.send("세공을 진행할 마감된 돌 세공 라운드가 없습니다.", ephemeral=True)
             return
         if round_row["status"] != "closed":
-            await interaction.response.send_message("먼저 투표 집계를 마감한 뒤 `/세공진행`을 실행해주세요.", ephemeral=True)
+            await interaction.followup.send("먼저 투표 집계를 마감한 뒤 `/세공진행`을 실행해주세요.", ephemeral=True)
             return
 
         extra.setdefault("cutting_current_level", 0)
@@ -4823,7 +5079,16 @@ async def run_cutting(interaction: discord.Interaction) -> None:
         )
 
     embed = build_cutting_progress_embed(round_row, extra)
-    await interaction.response.send_message(embed=embed, view=cutting_action_view(int(round_row["id"])))
+    channel_id = str(round_row["channel_id"])
+    channel = await resolve_text_channel(channel_id)
+    if channel is None:
+        await interaction.followup.send("이벤트 메인 채널을 찾을 수 없습니다.", ephemeral=True)
+        return
+    await channel.send(embed=embed, view=cutting_action_view(int(round_row["id"])))
+    await interaction.followup.send(
+        f"세공 진행 패널을 <#{channel_id}>에 게시했습니다.",
+        ephemeral=True,
+    )
 
 
 @bot.tree.command(name="이벤트리스트", description="진행 중인 이벤트와 라운드를 확인합니다.")
