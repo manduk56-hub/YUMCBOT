@@ -929,10 +929,8 @@ class BotRegressionTests(unittest.TestCase):
         same_user_next_post = bot.build_anonymous_message_embed(1, "다음 발언").to_dict()
         second = bot.build_anonymous_message_embed(2, "다른 발언").to_dict()
 
-        self.assertEqual(first["title"], "익명")
-        self.assertEqual(second["title"], "익명")
-        self.assertNotIn("1", first["title"])
-        self.assertNotIn("2", second["title"])
+        self.assertNotIn("title", first)
+        self.assertNotIn("title", second)
         self.assertEqual(first["description"], "첫 발언")
         self.assertEqual(first["color"], same_user_next_post["color"])
         self.assertNotEqual(first["color"], second["color"])
@@ -940,8 +938,26 @@ class BotRegressionTests(unittest.TestCase):
     def test_anonymous_message_embed_reuses_palette_safely(self) -> None:
         palette_size = len(bot.ANONYMOUS_EMBED_COLORS)
 
-        self.assertEqual(palette_size, 16)
+        self.assertEqual(palette_size, 20)
         self.assertEqual(len(set(bot.ANONYMOUS_EMBED_COLORS)), palette_size)
+
+        def rgb(color: int) -> tuple[int, int, int]:
+            return ((color >> 16) & 0xFF, (color >> 8) & 0xFF, color & 0xFF)
+
+        def distance(left: int, right: int) -> float:
+            return sum(
+                (left_channel - right_channel) ** 2
+                for left_channel, right_channel in zip(rgb(left), rgb(right))
+            ) ** 0.5
+
+        adjacent_distances = [
+            distance(left, right)
+            for left, right in zip(
+                bot.ANONYMOUS_EMBED_COLORS,
+                bot.ANONYMOUS_EMBED_COLORS[1:],
+            )
+        ]
+        self.assertGreater(min(adjacent_distances), 100)
 
         first = bot.build_anonymous_message_embed(1, "발언").to_dict()
         wrapped = bot.build_anonymous_message_embed(palette_size + 1, "발언").to_dict()

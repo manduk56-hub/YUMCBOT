@@ -101,22 +101,27 @@ GAME_NAMES = {
 }
 BALANCE_VOTE_CHOICES = [("A 선택", "A"), ("B 선택", "B")]
 ANONYMOUS_EMBED_COLORS = (
-    0xE74C3C,  # red
-    0x3498DB,  # blue
-    0x2ECC71,  # green
-    0xF1C40F,  # yellow
-    0x9B59B6,  # purple
-    0xE67E22,  # orange
-    0x1ABC9C,  # cyan
-    0xE91E63,  # pink
-    0x3F51B5,  # indigo
-    0x8BC34A,  # lime green
-    0xFF4FD8,  # magenta
-    0x00897B,  # teal
-    0xFFB300,  # amber
-    0x1E3A8A,  # navy
-    0xFF7043,  # coral
-    0x78909C,  # blue gray
+    # 가까운 번호끼리 색상·명도 차이가 크게 나도록 고대비 순서로 배치한다.
+    0xD1382A,
+    0x0AD10A,
+    0x940CF5,
+    0x31C4F5,
+    0xD1B00A,
+    0xAD3D91,
+    0x3DAD75,
+    0x3172F5,
+    0xAD753D,
+    0xF556F5,
+    0xF50C6D,
+    0x3D6CAD,
+    0xF5810C,
+    0x74AD23,
+    0xAD3D59,
+    0xF50CA7,
+    0x8D49D1,
+    0x0AD1D1,
+    0x2AD162,
+    0xF50C0C,
 )
 ANONYMOUS_GUIDE_TEXT = (
     "아래 버튼으로 익명 발언을 남겨주세요. 일반 메시지는 익명 보호를 위해 삭제됩니다.\n"
@@ -516,10 +521,9 @@ def assign_anonymous_number(conn: sqlite3.Connection, round_id: int, user_id: st
 
 
 def build_anonymous_message_embed(anon_number: int, content: str) -> discord.Embed:
-    """내부 익명 번호마다 고정 색상을 붙이되 번호는 노출하지 않는 토론 발언 카드."""
+    """작성자 이름 없이 내부 익명 번호마다 고정 색상만 붙이는 토론 발언 카드."""
     color = ANONYMOUS_EMBED_COLORS[(anon_number - 1) % len(ANONYMOUS_EMBED_COLORS)]
     return discord.Embed(
-        title="익명",
         description=content,
         color=color,
     )
