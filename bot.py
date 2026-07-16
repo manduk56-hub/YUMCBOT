@@ -3777,8 +3777,8 @@ def build_balance_embed(round_id: int, question: str, option_a: str, option_b: s
         description=question,
         color=discord.Color.blurple(),
     )
-    embed.add_field(name="🅰️ A", value=option_a, inline=True)
-    embed.add_field(name="🅱️ B", value=option_b, inline=True)
+    embed.add_field(name="🅰️", value=option_a, inline=True)
+    embed.add_field(name="🅱️", value=option_b, inline=True)
     embed.add_field(
         name="📜 규칙",
         value=(
@@ -3808,12 +3808,12 @@ def build_minority_balance_revote_embed(
         color=discord.Color.gold(),
     )
     embed.add_field(
-        name=f"🅰️ A. {round_row['option_a']}",
+        name=f"🅰️ {round_row['option_a']}",
         value=f"**{first_a_count}명**",
         inline=True,
     )
     embed.add_field(
-        name=f"🅱️ B. {round_row['option_b']}",
+        name=f"🅱️ {round_row['option_b']}",
         value=f"**{first_b_count}명**",
         inline=True,
     )
@@ -4837,12 +4837,12 @@ def close_round_record(
             )
             # 누가 무엇을 골랐는지는 공개하지 않는다. 인원수만.
             embed.add_field(
-                name=f"🅰️ A. {round_row['option_a']}",
+                name=f"🅰️ {round_row['option_a']}",
                 value=f"**{len(a_users)}명**",
                 inline=True,
             )
             embed.add_field(
-                name=f"🅱️ B. {round_row['option_b']}",
+                name=f"🅱️ {round_row['option_b']}",
                 value=f"**{len(b_users)}명**",
                 inline=True,
             )

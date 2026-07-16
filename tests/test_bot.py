@@ -858,7 +858,7 @@ class BotRegressionTests(unittest.TestCase):
             ).to_dict(),
             ensure_ascii=False,
         )
-        self.assertIn("A. 짜장", rendered)
+        self.assertIn("🅰️ 짜장", rendered)
         self.assertIn("2명", rendered)
         self.assertIn("인원이 더 적은 선택지", rendered)
         self.assertIn("1차 선택은 그대로 유지", rendered)
