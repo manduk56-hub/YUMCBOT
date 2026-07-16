@@ -706,6 +706,140 @@ class BotRegressionTests(unittest.TestCase):
 
         self.assertEqual(self.score_of("1"), 3)
 
+    def create_minority_balance_round(self, votes: list[tuple[str, str]]) -> int:
+        extra = {
+            "mode": "minority_balance",
+            "balance_phase": "initial",
+            "duration_minutes": 1,
+            "auto_close_at": 1,
+        }
+        with bot.db() as conn:
+            cursor = conn.execute(
+                """
+                INSERT INTO rounds
+                    (type, title, question, option_a, option_b, status, channel_id, extra_json, created_at)
+                VALUES ('balance', '밸런스 게임 라운드', '선택', '짜장', '짬뽕', 'open', '10', ?,
+                        '2026-01-01 00:00:00')
+                """,
+                (json.dumps(extra, ensure_ascii=False),),
+            )
+            round_id = int(cursor.lastrowid)
+            conn.executemany(
+                """
+                INSERT INTO votes (round_id, user_id, choice, created_at, updated_at)
+                VALUES (?, ?, ?, '2026-01-01 00:00:00', '2026-01-01 00:00:00')
+                """,
+                [(round_id, user_id, choice) for user_id, choice in votes],
+            )
+        return round_id
+
+    def test_minority_balance_initial_guide_is_identical_to_normal_balance(self) -> None:
+        normal = bot.build_balance_embed(1, "선택", "짜장", "짬뽕").to_dict()
+        disguised = bot.build_balance_embed(2, "선택", "짜장", "짬뽕").to_dict()
+
+        self.assertIn("balance", bot.MINI_GAME_TYPES)
+        self.assertIn("minority_balance", bot.MINI_GAME_TYPES)
+        self.assertNotEqual("balance", "minority_balance")
+        self.assertEqual(normal, disguised)
+        self.assertNotIn("소수", json.dumps(disguised, ensure_ascii=False))
+        self.assertEqual(bot.GAME_NAMES["minority_balance"], "밸런스 게임")
+
+        round_id = self.create_minority_balance_round([])
+        with bot.db() as conn:
+            row = conn.execute("SELECT * FROM rounds WHERE id = ?", (round_id,)).fetchone()
+        self.assertEqual(bot.round_game_key(row), "minority_balance")
+
+    def test_minority_balance_first_tally_keeps_votes_and_starts_revote(self) -> None:
+        round_id = self.create_minority_balance_round(
+            [("1", "A"), ("2", "A"), ("3", "B")]
+        )
+
+        transition = bot.start_minority_balance_revote(round_id)
+
+        self.assertIsNotNone(transition)
+        self.assertEqual(transition["first_a_count"], 2)
+        self.assertEqual(transition["first_b_count"], 1)
+        with bot.db() as conn:
+            row = conn.execute("SELECT * FROM rounds WHERE id = ?", (round_id,)).fetchone()
+            vote_count = conn.execute(
+                "SELECT COUNT(*) AS count FROM votes WHERE round_id = ?", (round_id,)
+            ).fetchone()["count"]
+        self.assertEqual(row["status"], "open")
+        self.assertEqual(bot.round_extra(row)["balance_phase"], "revote")
+        self.assertEqual(vote_count, 3)
+
+        rendered = json.dumps(
+            bot.build_minority_balance_revote_embed(
+                transition,
+                transition["first_a_count"],
+                transition["first_b_count"],
+                transition["close_at"],
+            ).to_dict(),
+            ensure_ascii=False,
+        )
+        self.assertIn("A. 짜장", rendered)
+        self.assertIn("2명", rendered)
+        self.assertIn("인원이 더 적은 선택지", rendered)
+        self.assertIn("1차 선택은 그대로 유지", rendered)
+
+    def test_minority_balance_rewards_only_final_minority(self) -> None:
+        for user_id in ("1", "2", "3"):
+            self.add_user(user_id, f"참가자{user_id}", 0)
+        round_id = self.create_minority_balance_round(
+            [("1", "A"), ("2", "A"), ("3", "B")]
+        )
+        bot.start_minority_balance_revote(round_id)
+        with bot.db() as conn:
+            # 1번은 1차 선택(A)을 유지하고, 2번만 A에서 B로 바꾼다.
+            conn.execute(
+                """
+                INSERT INTO votes (round_id, user_id, choice, created_at, updated_at)
+                VALUES (?, ?, ?, '2026-01-01 00:01:00', '2026-01-01 00:01:00')
+                ON CONFLICT(round_id, user_id) DO UPDATE SET
+                    choice = excluded.choice,
+                    updated_at = excluded.updated_at
+                """,
+                (round_id, "2", "B"),
+            )
+
+        result = bot.close_round_record(round_id, None)
+
+        self.assertEqual(self.score_of("1"), 1)
+        self.assertEqual(self.score_of("2"), 0)
+        self.assertEqual(self.score_of("3"), 0)
+        self.assertIn("소수파 `A`", json.dumps(result[1].to_dict(), ensure_ascii=False))
+
+    def test_minority_balance_tie_and_empty_side_score_nothing(self) -> None:
+        for user_id in ("1", "2"):
+            self.add_user(user_id, f"참가자{user_id}", 0)
+
+        tied_round = self.create_minority_balance_round([])
+        bot.start_minority_balance_revote(tied_round)
+        with bot.db() as conn:
+            conn.executemany(
+                """
+                INSERT INTO votes (round_id, user_id, choice, created_at, updated_at)
+                VALUES (?, ?, ?, '2026-01-01', '2026-01-01')
+                """,
+                [(tied_round, "1", "A"), (tied_round, "2", "B")],
+            )
+        bot.close_round_record(tied_round, None)
+
+        empty_side_round = self.create_minority_balance_round([])
+        bot.start_minority_balance_revote(empty_side_round)
+        with bot.db() as conn:
+            conn.executemany(
+                """
+                INSERT INTO votes (round_id, user_id, choice, created_at, updated_at)
+                VALUES (?, ?, ?, '2026-01-01', '2026-01-01')
+                """,
+                [(empty_side_round, "1", "A"), (empty_side_round, "2", "A")],
+            )
+        bot.close_round_record(empty_side_round, None)
+
+        self.assertEqual(self.score_of("1"), 0)
+        self.assertEqual(self.score_of("2"), 0)
+
     # --- 3선 폭탄 게임 ------------------------------------------------------
 
     def create_defuse_round(self, votes: list[tuple[str, str]]) -> int:

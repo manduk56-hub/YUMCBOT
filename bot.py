@@ -73,9 +73,11 @@ TRUST_OUTCOME_LABELS = {
 MAIN_GAME_TYPES = {"trust", "sand"}
 # 'grid'(관리자 시점 타일)는 제거된 미니게임이다. rounds.type CHECK 제약에는 남아 있지만
 # (BASE_SCHEMA 불변) 새 라운드로는 만들 수 없다.
-MINI_GAME_TYPES = {"balance", "defuse4", "cutting", "top3"}
+MINI_GAME_TYPES = {"balance", "minority_balance", "defuse4", "cutting", "top3"}
 GAME_NAMES = {
     "balance": "밸런스 게임",
+    # 참가자에게는 1차 집계가 끝날 때까지 일반 밸런스 게임으로 보여야 한다.
+    "minority_balance": "밸런스 게임",
     # DB 호환을 위해 내부 키는 defuse4를 유지하지만 현재 규칙은 3선 방식이다.
     "defuse4": "3선 폭탄 게임",
     "cutting": "돌 세공 예측",
@@ -1019,7 +1021,7 @@ def thread_discussion_view(round_id: int, game_key: str) -> discord.ui.View:
     view = discord.ui.View(timeout=None)
     vote_buttons = (
         vote_view(round_id, BALANCE_VOTE_CHOICES)
-        if game_key == "balance"
+        if game_key in {"balance", "minority_balance"}
         else defuse_vote_view(round_id)
     )
     for button in [*vote_buttons.children, *anonymous_discussion_view(round_id).children]:
@@ -2880,6 +2882,19 @@ class EventBot(discord.Client):
                     self.schedule_auto_close(round_id, float(transition["close_at"]))
                 return
 
+            row_extra = round_extra(row)
+            if (
+                row["type"] == "balance"
+                and row_extra.get("mode") == "minority_balance"
+                and row_extra.get("balance_phase") == "initial"
+            ):
+                transition = start_minority_balance_revote(round_id)
+                if not transition:
+                    return
+                await publish_minority_balance_revote(transition)
+                self.schedule_auto_close(round_id, float(transition["close_at"]))
+                return
+
             result = close_round_record(round_id, guild, closed_by="자동 마감")
             if not result:
                 return
@@ -3184,6 +3199,162 @@ def build_balance_embed(round_id: int, question: str, option_a: str, option_b: s
         inline=False,
     )
     return embed
+
+
+def build_minority_balance_revote_embed(
+    round_row: sqlite3.Row | dict[str, Any],
+    first_a_count: int,
+    first_b_count: int,
+    close_at: float,
+) -> discord.Embed:
+    """1차 집계 뒤에 처음으로 변형 규칙을 공개하는 재선택 안내."""
+    embed = discord.Embed(
+        title=f"1차 집계 · {round_row['question']}",
+        description=(
+            "첫 선택의 인원수가 공개되었습니다. 지금부터 같은 선택지로 다시 선택합니다.\n"
+            "**1차 선택은 그대로 유지됩니다.** 선택을 바꾸고 싶은 경우에만 A/B 버튼을 다시 눌러주세요."
+        ),
+        color=discord.Color.gold(),
+    )
+    embed.add_field(
+        name=f"A. {round_row['option_a']}",
+        value=f"{first_a_count}명",
+        inline=True,
+    )
+    embed.add_field(
+        name=f"B. {round_row['option_b']}",
+        value=f"{first_b_count}명",
+        inline=True,
+    )
+    embed.add_field(
+        name="재선택 규칙 공개",
+        value=(
+            "최종 집계에서 **인원이 더 적은 선택지**를 고른 사람 전원에게 **+1점**이 지급됩니다.\n"
+            "두 선택지의 인원이 같거나, 아무도 고르지 않은 쪽이 소수라면 점수는 지급되지 않습니다.\n"
+            "재선택 시간 동안에는 선택을 몇 번이든 바꿀 수 있으며, 누르지 않으면 1차 선택으로 최종 집계됩니다."
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="⏳ 재선택 마감",
+        value=close_time_text(close_at),
+        inline=False,
+    )
+    return embed
+
+
+def start_minority_balance_revote(round_id: int) -> dict[str, Any] | None:
+    """1차 표를 유지한 채 같은 라운드를 재선택 단계로 전환한다."""
+    with db() as conn:
+        round_row = conn.execute(
+            "SELECT * FROM rounds WHERE id = ? AND type = 'balance' AND status = 'open'",
+            (round_id,),
+        ).fetchone()
+        if not round_row:
+            return None
+
+        extra = round_extra(round_row)
+        if extra.get("mode") != "minority_balance" or extra.get("balance_phase") != "initial":
+            return None
+
+        counts = {"A": 0, "B": 0}
+        for vote in conn.execute(
+            "SELECT choice FROM votes WHERE round_id = ?",
+            (round_id,),
+        ).fetchall():
+            choice = str(vote["choice"])
+            if choice in counts:
+                counts[choice] += 1
+
+        duration_minutes = max(1, int(extra.get("duration_minutes") or 1))
+        close_at = time.time() + duration_minutes * 60
+        extra.update(
+            {
+                "balance_phase": "revote",
+                "first_tally": counts,
+                "first_tallied_at": now_text(),
+                "auto_close_at": close_at,
+            }
+        )
+        conn.execute(
+            "UPDATE rounds SET extra_json = ? WHERE id = ?",
+            (json.dumps(extra, ensure_ascii=False), round_id),
+        )
+
+        return {
+            "round_id": round_id,
+            "channel_id": str(round_row["channel_id"]),
+            "discussion_thread_id": str(round_row["discussion_thread_id"] or ""),
+            "question": str(round_row["question"]),
+            "option_a": str(round_row["option_a"]),
+            "option_b": str(round_row["option_b"]),
+            "first_a_count": counts["A"],
+            "first_b_count": counts["B"],
+            "close_at": close_at,
+        }
+
+
+async def publish_minority_balance_revote(transition: dict[str, Any]) -> bool:
+    """재선택 안내를 메인 채널에 게시하고 토론방의 고정 버튼도 새 마감으로 갱신한다."""
+    round_id = int(transition["round_id"])
+    close_at = float(transition["close_at"])
+    channel = await resolve_text_channel(str(transition["channel_id"]))
+    if channel is None:
+        return False
+
+    embed = build_minority_balance_revote_embed(
+        transition,
+        int(transition["first_a_count"]),
+        int(transition["first_b_count"]),
+        close_at,
+    )
+    try:
+        await channel.send(embed=embed, view=vote_view(round_id, BALANCE_VOTE_CHOICES))
+    except discord.HTTPException:
+        return False
+
+    thread_id = str(transition.get("discussion_thread_id") or "")
+    if not thread_id:
+        return True
+    try:
+        thread = bot.get_channel(int(thread_id)) or await bot.fetch_channel(int(thread_id))
+    except (discord.HTTPException, ValueError):
+        return True
+    if not isinstance(thread, discord.Thread):
+        return True
+
+    with db() as conn:
+        round_row = conn.execute("SELECT * FROM rounds WHERE id = ?", (round_id,)).fetchone()
+        if not round_row:
+            return True
+        extra = round_extra(round_row)
+        old_button_message_id = str(extra.get("anon_button_message_id") or "")
+        post_count = count_discussion_messages(conn, round_id)
+
+    if old_button_message_id:
+        try:
+            old_button = await thread.fetch_message(int(old_button_message_id))
+            await old_button.delete()
+        except (discord.NotFound, discord.HTTPException, ValueError):
+            pass
+    try:
+        new_button = await thread.send(
+            embed=build_anonymous_guide_embed(post_count, close_at),
+            view=thread_discussion_view(round_id, "minority_balance"),
+        )
+    except discord.HTTPException:
+        return True
+
+    with db() as conn:
+        fresh_row = conn.execute("SELECT extra_json FROM rounds WHERE id = ?", (round_id,)).fetchone()
+        if fresh_row:
+            extra = round_extra(fresh_row)
+            extra["anon_button_message_id"] = str(new_button.id)
+            conn.execute(
+                "UPDATE rounds SET extra_json = ? WHERE id = ?",
+                (json.dumps(extra, ensure_ascii=False), round_id),
+            )
+    return True
 
 
 def build_defuse_embed(round_id: int, title: str) -> discord.Embed:
@@ -3655,6 +3826,8 @@ def auto_close_action_label(round_row: sqlite3.Row | dict[str, Any]) -> str:
         return "참가 모집 종료 및 랜덤 매칭"
     if round_row["type"] == "sand" and extra.get("sand_phase") == "registration":
         return "참가 모집 종료 및 모래성 게임 시작"
+    if extra.get("mode") == "minority_balance" and extra.get("balance_phase") == "revote":
+        return "재선택 종료"
     game_key = round_game_key(round_row)  # type: ignore[arg-type]
     return f"{GAME_NAMES.get(game_key, game_key)} 종료"
 
@@ -3913,6 +4086,15 @@ def close_round_record(
         if not round_row or round_row["status"] != "open":
             return None
 
+        extra = round_extra(round_row)
+        # 이 모드는 1차 집계에서 닫히면 안 된다. 호출자는 먼저 재선택 단계로 전환해야 한다.
+        if (
+            round_row["type"] == "balance"
+            and extra.get("mode") == "minority_balance"
+            and extra.get("balance_phase") != "revote"
+        ):
+            return None
+
         votes = conn.execute(
             "SELECT user_id, choice FROM votes WHERE round_id = ? ORDER BY updated_at ASC",
             (round_row["id"],),
@@ -3922,51 +4104,77 @@ def close_round_record(
             (now_text(), round_row["id"]),
         )
 
-        extra = round_extra(round_row)
         if round_row["type"] == "balance":
             a_users = [row["user_id"] for row in votes if row["choice"] == "A"]
             b_users = [row["user_id"] for row in votes if row["choice"] == "B"]
 
             scored = False
-            if not a_users and not b_users:
-                settlement = "투표가 없어 점수가 지급되지 않았습니다."
-            elif not a_users or not b_users:
-                # 한쪽으로 몰표. 밸런스가 성립하지 않았으므로 고른 사람 전원에게 패널티.
-                one_sided_users = a_users or b_users
-                one_sided_choice = "A" if a_users else "B"
-                for user_id in one_sided_users:
-                    add_score(
-                        conn,
-                        user_id,
-                        member_name(guild, user_id),
-                        -2,
-                        f"라운드 #{round_row['id']} 몰표 패널티",
-                        round_row["id"],
-                    )
-                scored = True
-                settlement = (
-                    f"모두 `{one_sided_choice}`만 골라 밸런스가 성립하지 않았습니다. "
-                    f"선택자 {len(one_sided_users)}명 전원 -2점"
-                )
-            elif len(a_users) == len(b_users):
-                settlement = "무승부라 점수가 지급되지 않았습니다."
+            is_minority_balance = extra.get("mode") == "minority_balance"
+            if is_minority_balance:
+                if not a_users and not b_users:
+                    settlement = "재선택한 사람이 없어 점수가 지급되지 않았습니다."
+                elif not a_users or not b_users:
+                    settlement = "인원이 더 적은 쪽에 선택자가 없어 점수가 지급되지 않았습니다."
+                elif len(a_users) == len(b_users):
+                    settlement = "두 선택지의 인원이 같아 점수가 지급되지 않았습니다."
+                else:
+                    winner = "A" if len(a_users) < len(b_users) else "B"
+                    winner_users = a_users if winner == "A" else b_users
+                    for user_id in winner_users:
+                        add_score(
+                            conn,
+                            user_id,
+                            member_name(guild, user_id),
+                            1,
+                            f"라운드 #{round_row['id']} 소수파 선택",
+                            round_row["id"],
+                        )
+                    scored = True
+                    settlement = f"소수파 `{winner}` 선택자 {len(winner_users)}명 전원 +1점"
             else:
-                winner = "A" if len(a_users) > len(b_users) else "B"
-                winner_users = a_users if winner == "A" else b_users
-                for user_id in winner_users:
-                    add_score(
-                        conn,
-                        user_id,
-                        member_name(guild, user_id),
-                        1,
-                        f"라운드 #{round_row['id']} 다수파 선택",
-                        round_row["id"],
+                if not a_users and not b_users:
+                    settlement = "투표가 없어 점수가 지급되지 않았습니다."
+                elif not a_users or not b_users:
+                    # 한쪽으로 몰표. 밸런스가 성립하지 않았으므로 고른 사람 전원에게 패널티.
+                    one_sided_users = a_users or b_users
+                    one_sided_choice = "A" if a_users else "B"
+                    for user_id in one_sided_users:
+                        add_score(
+                            conn,
+                            user_id,
+                            member_name(guild, user_id),
+                            -2,
+                            f"라운드 #{round_row['id']} 몰표 패널티",
+                            round_row["id"],
+                        )
+                    scored = True
+                    settlement = (
+                        f"모두 `{one_sided_choice}`만 골라 밸런스가 성립하지 않았습니다. "
+                        f"선택자 {len(one_sided_users)}명 전원 -2점"
                     )
-                scored = True
-                settlement = f"다수파 `{winner}` 선택자 전원 +1점"
+                elif len(a_users) == len(b_users):
+                    settlement = "무승부라 점수가 지급되지 않았습니다."
+                else:
+                    winner = "A" if len(a_users) > len(b_users) else "B"
+                    winner_users = a_users if winner == "A" else b_users
+                    for user_id in winner_users:
+                        add_score(
+                            conn,
+                            user_id,
+                            member_name(guild, user_id),
+                            1,
+                            f"라운드 #{round_row['id']} 다수파 선택",
+                            round_row["id"],
+                        )
+                    scored = True
+                    settlement = f"다수파 `{winner}` 선택자 전원 +1점"
 
             embed = discord.Embed(
-                title=f"결과 · {round_row['title']}",
+                title=(
+                    f"최종 결과 · {round_row['title']}"
+                    if is_minority_balance
+                    else f"결과 · {round_row['title']}"
+                ),
                 description=round_row["question"],
                 color=discord.Color.green() if scored else discord.Color.light_grey(),
             )
@@ -4499,7 +4707,7 @@ class StartSetupModal(discord.ui.Modal):
         self.add_item(self.game_title)
         self.add_item(self.duration)
 
-        if game == "balance":
+        if game in {"balance", "minority_balance"}:
             self.option_a = discord.ui.TextInput(label="A 선택지", max_length=80)
             self.option_b = discord.ui.TextInput(label="B 선택지", max_length=80)
             self.add_item(self.option_a)
@@ -4512,7 +4720,7 @@ class StartSetupModal(discord.ui.Modal):
             if not title:
                 raise ValueError("제목을 입력해주세요.")
 
-            if self.game == "balance":
+            if self.game in {"balance", "minority_balance"}:
                 await create_round_from_setup(
                     interaction,
                     self.game,
@@ -4603,6 +4811,7 @@ async def open_event(interaction: discord.Interaction) -> None:
     ],
     미니게임=[
         app_commands.Choice(name="밸런스 게임", value="balance"),
+        app_commands.Choice(name="소수파 밸런스 (1차 위장)", value="minority_balance"),
         app_commands.Choice(name="3선 폭탄 게임", value="defuse4"),
         app_commands.Choice(name="돌 세공 예측", value="cutting"),
         app_commands.Choice(name="상위 3명 견제", value="top3"),
@@ -4633,6 +4842,7 @@ async def start(interaction: discord.Interaction, 메인게임: str, 미니게�
 @app_commands.choices(
     게임=[
         app_commands.Choice(name="밸런스 게임", value="balance"),
+        app_commands.Choice(name="소수파 밸런스 (1차 위장)", value="minority_balance"),
         app_commands.Choice(name="3선 폭탄 게임", value="defuse4"),
         app_commands.Choice(name="돌 세공 예측", value="cutting"),
         app_commands.Choice(name="상위 3명 견제", value="top3"),
@@ -4807,13 +5017,16 @@ async def create_round_from_setup(
                 )
                 return
 
-        if 게임 == "balance":
+        if 게임 in {"balance", "minority_balance"}:
             if not 선택_a or not 선택_b:
                 await interaction.followup.send(
                     "밸런스 게임은 `선택_a`와 `선택_b`가 필요합니다.",
                     ephemeral=True,
                 )
                 return
+
+            if 게임 == "minority_balance":
+                extra.update({"mode": "minority_balance", "balance_phase": "initial"})
 
             cursor = conn.execute(
                 """
@@ -5029,7 +5242,7 @@ async def create_round_from_setup(
     message = await main_channel.send(embed=embed, view=view)
 
     discussion_thread_id = None
-    if 게임 in {"balance", "defuse4"}:
+    if 게임 in {"balance", "minority_balance", "defuse4"}:
         try:
             thread_name = f"{제목} | 토론방"[:100]
             # 보관되면 일반 유저의 버튼 클릭이 막힌다. 라운드가 끝날 때까지 살아 있도록 넉넉히 잡는다.
@@ -5040,7 +5253,7 @@ async def create_round_from_setup(
             )
             # 발언이 쌓여도 버튼이 항상 맨 아래에 오도록, 발언마다 이 메시지를 지우고 다시 보낸다.
             extra["anon_button_message_id"] = str(button_message.id)
-            if 게임 == "balance":
+            if 게임 in {"balance", "minority_balance"}:
                 notice_embed = build_thread_notice_embed(
                     round_id,
                     thread,
@@ -5130,8 +5343,35 @@ async def close_round(interaction: discord.Interaction) -> None:
             await interaction.followup.send("참여자가 부족해 모래성 게임을 취소했습니다.", ephemeral=True)
         return
 
-    # 결과 메시지는 명령을 실행한 위치와 무관하게 이벤트가 시작된 메인 채널에만 게시한다.
     round_extra_row = round_extra(round_row)
+    if (
+        round_row["type"] == "balance"
+        and round_extra_row.get("mode") == "minority_balance"
+        and round_extra_row.get("balance_phase") == "initial"
+    ):
+        await interaction.response.defer(ephemeral=True)
+        transition = start_minority_balance_revote(int(round_row["id"]))
+        if not transition:
+            await interaction.followup.send("1차 집계를 마감하지 못했습니다.", ephemeral=True)
+            return
+        task = bot.auto_close_tasks.pop(int(round_row["id"]), None)
+        if task:
+            task.cancel()
+        published = await publish_minority_balance_revote(transition)
+        bot.schedule_auto_close(int(round_row["id"]), float(transition["close_at"]))
+        if published:
+            await interaction.followup.send(
+                "1차 인원수를 공개하고 같은 선택지의 재선택을 시작했습니다.",
+                ephemeral=True,
+            )
+        else:
+            await interaction.followup.send(
+                "재선택 단계로 전환했지만 이벤트 메인 채널에 안내를 게시하지 못했습니다.",
+                ephemeral=True,
+            )
+        return
+
+    # 결과 메시지는 명령을 실행한 위치와 무관하게 이벤트가 시작된 메인 채널에만 게시한다.
     is_trust_decision = (
         round_row["type"] == "trust" and round_extra_row.get("trust_phase") == "decision"
     )
