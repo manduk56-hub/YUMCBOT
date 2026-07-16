@@ -103,8 +103,9 @@ embed/view 빌더 → `close_round_record`(정산) → 슬래시 명령어 → s
 
 - **미니게임 "3선 폭탄 게임"의 레거시 코드상 이름은 `defuse4`이고 DB에는 `bomb`으로 저장된다** (`extra_json.mode = "defuse4"`). 새 라운드는 `extra_json.settlement_rule = "top_vote_penalty"`로 구방식 안전선 라운드와 구분한다.
 - **소수파 밸런스는 DB에 `balance`로 저장하고 `extra_json.mode = "minority_balance"`로 구분한다.** `balance_phase`는 `initial` → `revote` 순서이며, 1차 `votes`를 유지한 채 변경 선택을 upsert하고 두 번째 마감에서만 소수파를 정산한다.
-- **`grid`(관리자 시점 타일)는 제거된 게임이다.** `BASE_SCHEMA`가 불변이라 CHECK 제약에서 뺄 수 없어 값만 남아 있다.
-  `close_round_record`의 마지막 `else`가 이런 옛 라운드를 점수 없이 마감한다.
+- **`grid`(관리자 시점 타일)는 제거된 게임이다.** `BASE_SCHEMA`가 불변이라 CHECK 제약에서 뺄 수 없어,
+  새 **유일 숫자 게임**을 DB에 저장할 때만 `type = grid`, `extra_json.mode = unique_number`로 재사용한다.
+  `mode`가 없는 옛 grid 라운드는 `close_round_record`의 마지막 `else`에서 점수 없이 마감한다.
 
 권위 있는 목록은 `MAIN_GAME_TYPES` / `MINI_GAME_TYPES` / `GAME_NAMES` 상수다. CHECK 제약이 아니다.
 

@@ -61,6 +61,7 @@ CUTTING_SUCCESS_RATES = {
     5: 0.3,
 }
 TOP3_NONE_CHOICE = "__none__"
+UNIQUE_NUMBER_CHOICES = [str(index) for index in range(1, 16)]
 TRUST_REGISTRATION_DEFAULT_MINUTES = 2
 TRUST_DECISION_SECONDS = 180
 TRUST_MATCH_HISTORY_ROUNDS = 3
@@ -71,9 +72,16 @@ TRUST_OUTCOME_LABELS = {
     "incomplete": "미선택",
 }
 MAIN_GAME_TYPES = {"trust", "sand"}
-# 'grid'(관리자 시점 타일)는 제거된 미니게임이다. rounds.type CHECK 제약에는 남아 있지만
-# (BASE_SCHEMA 불변) 새 라운드로는 만들 수 없다.
-MINI_GAME_TYPES = {"balance", "minority_balance", "defuse4", "cutting", "top3"}
+# 'grid'(관리자 시점 타일)는 제거된 미니게임이다. 불변인 rounds.type CHECK 제약의 grid 값은
+# extra_json.mode='unique_number'인 새 유일 숫자 게임의 저장 타입으로만 재사용한다.
+MINI_GAME_TYPES = {
+    "balance",
+    "minority_balance",
+    "defuse4",
+    "cutting",
+    "top3",
+    "unique_number",
+}
 GAME_NAMES = {
     "balance": "밸런스 게임",
     # 참가자에게는 1차 집계가 끝날 때까지 일반 밸런스 게임으로 보여야 한다.
@@ -82,6 +90,7 @@ GAME_NAMES = {
     "defuse4": "3선 폭탄 게임",
     "cutting": "돌 세공 예측",
     "top3": "상위 3명 견제",
+    "unique_number": "유일 숫자 게임",
     "trust": "딜레마의 섬",
     "sand": "모래성 게임",
 }
@@ -952,7 +961,9 @@ def member_name(guild: discord.Guild | None, user_id: str) -> str:
     return f"User {user_id}"
 
 
-def choice_display(choice: str) -> str:
+def choice_display(choice: str, game_key: str | None = None) -> str:
+    if game_key == "unique_number" and choice in UNIQUE_NUMBER_CHOICES:
+        return f"{choice}번"
     if choice in DEFUSE_COLOR_BY_ID:
         color = DEFUSE_COLOR_BY_ID[choice]
         return f"{color['emoji']} {color['name']}"
@@ -3128,6 +3139,14 @@ class EventBot(discord.Client):
                 )
                 return
 
+            game_key = round_game_key(round_row)
+            if game_key == "unique_number" and choice not in UNIQUE_NUMBER_CHOICES:
+                await interaction.response.send_message(
+                    "유일 숫자 게임에서는 1~15 중 하나만 선택할 수 있습니다.",
+                    ephemeral=True,
+                )
+                return
+
             ensure_user(conn, interaction.user)
             ts = now_text()
             conn.execute(
@@ -3142,7 +3161,7 @@ class EventBot(discord.Client):
             )
 
         await interaction.response.send_message(
-            f"`{choice_display(choice)}` 선택을 저장했습니다. 마감 전까지 버튼을 다시 누르면 선택이 바뀝니다.",
+            f"`{choice_display(choice, game_key)}` 선택을 저장했습니다. 마감 전까지 버튼을 다시 누르면 선택이 바뀝니다.",
             ephemeral=True,
         )
 
@@ -3435,6 +3454,36 @@ def build_top3_embed(round_id: int, title: str, candidates: list[dict[str, Any]]
             "`선택하지 않는다` 득표수가 세 후보 득표수 합보다 많으면 `선택하지 않는다`를 고른 사람 전원이 +1점입니다.\n"
             "그렇지 않으면 세 후보 중 가장 많이 선택된 1명이 -1점입니다.\n"
             "아무도 투표하지 않으면 이 라운드는 무효 처리됩니다."
+        ),
+        inline=False,
+    )
+    return embed
+
+
+def unique_number_reward(number: int) -> int:
+    """1~5는 1점, 6~10은 2점, 11~15는 3점이다."""
+    if not 1 <= number <= 15:
+        raise ValueError("유일 숫자 게임의 숫자는 1~15여야 합니다.")
+    return ((number - 1) // 5) + 1
+
+
+def build_unique_number_embed(round_id: int, title: str) -> discord.Embed:
+    embed = discord.Embed(
+        title=title,
+        description="1부터 15까지 중 하나를 선택하세요.",
+        color=discord.Color.purple(),
+    )
+    embed.add_field(
+        name="배점",
+        value="1~5: **+1점** · 6~10: **+2점** · 11~15: **+3점**",
+        inline=False,
+    )
+    embed.add_field(
+        name="규칙",
+        value=(
+            "같은 숫자를 고른 사람이 2명 이상이면 그 숫자의 선택자는 모두 제외됩니다.\n"
+            "중복되지 않은 숫자 중 **가장 높은 숫자**를 고른 단 한 명만 해당 구간의 점수를 받습니다.\n"
+            "중복되지 않은 숫자가 없으면 점수는 지급되지 않습니다."
         ),
         inline=False,
     )
@@ -3795,6 +3844,27 @@ def cutting_vote_view(round_id: int) -> discord.ui.View:
                 style=discord.ButtonStyle.secondary,
                 custom_id=f"eventbot:vote:{round_id}:{value}",
                 row=0 if index < 4 else 1,
+            )
+        )
+    return view
+
+
+def unique_number_vote_view(round_id: int) -> discord.ui.View:
+    view = discord.ui.View(timeout=None)
+    for index, value in enumerate(UNIQUE_NUMBER_CHOICES):
+        number = int(value)
+        view.add_item(
+            discord.ui.Button(
+                label=value,
+                style=(
+                    discord.ButtonStyle.secondary
+                    if number <= 5
+                    else discord.ButtonStyle.primary
+                    if number <= 10
+                    else discord.ButtonStyle.success
+                ),
+                custom_id=f"eventbot:vote:{round_id}:{value}",
+                row=index // 5,
             )
         )
     return view
@@ -4310,6 +4380,60 @@ def close_round_record(
                     ),
                     inline=False,
                 )
+        elif round_row["type"] == "grid" and extra.get("mode") == "unique_number":
+            grouped: dict[int, list[str]] = {}
+            for row in votes:
+                if str(row["choice"]) not in UNIQUE_NUMBER_CHOICES:
+                    continue
+                grouped.setdefault(int(row["choice"]), []).append(str(row["user_id"]))
+
+            unique_numbers = [number for number, users in grouped.items() if len(users) == 1]
+            winning_number = max(unique_numbers, default=None)
+            winner_id = grouped[winning_number][0] if winning_number is not None else None
+            reward = unique_number_reward(winning_number) if winning_number is not None else 0
+
+            if winner_id is not None and winning_number is not None:
+                add_score(
+                    conn,
+                    winner_id,
+                    member_name(guild, winner_id),
+                    reward,
+                    f"라운드 #{round_row['id']} 최고 유일 숫자 {winning_number}",
+                    round_row["id"],
+                )
+
+            result_lines = []
+            for number in sorted(grouped, reverse=True):
+                users = grouped[number]
+                if number == winning_number:
+                    marker = "🏆 최고 유일 숫자"
+                elif len(users) > 1:
+                    marker = "중복 제외"
+                else:
+                    marker = "유일 숫자"
+                result_lines.append(
+                    f"**{number}** · {len(users)}명 · {marker} · {mention_list(users)}"
+                )
+
+            embed = discord.Embed(
+                title=f"결과 · {round_row['title']}",
+                description=round_row["title"],
+                color=discord.Color.green() if winner_id else discord.Color.light_grey(),
+            )
+            embed.add_field(
+                name="숫자별 선택 결과",
+                value=field_text(result_lines, empty="선택한 사람이 없습니다."),
+                inline=False,
+            )
+            if winner_id is None:
+                settlement = (
+                    "선택한 사람이 없어 점수가 지급되지 않았습니다."
+                    if not grouped
+                    else "모든 선택 숫자가 중복되어 점수가 지급되지 않았습니다."
+                )
+            else:
+                settlement = f"<@{winner_id}>님이 최고 유일 숫자 **{winning_number}**으로 **+{reward}점**"
+            embed.add_field(name="정산", value=settlement, inline=False)
         elif round_row["type"] == "trust":
             vote_choices = {str(row["user_id"]): str(row["choice"]) for row in votes}
             pairs = conn.execute(
@@ -4815,6 +4939,7 @@ async def open_event(interaction: discord.Interaction) -> None:
         app_commands.Choice(name="3선 폭탄 게임", value="defuse4"),
         app_commands.Choice(name="돌 세공 예측", value="cutting"),
         app_commands.Choice(name="상위 3명 견제", value="top3"),
+        app_commands.Choice(name="유일 숫자 게임", value="unique_number"),
     ],
 )
 @app_commands.describe(메인게임="먼저 진행할 메인게임", 미니게임="메인게임 뒤에 진행할 미니게임")
@@ -4846,6 +4971,7 @@ async def start(interaction: discord.Interaction, 메인게임: str, 미니게�
         app_commands.Choice(name="3선 폭탄 게임", value="defuse4"),
         app_commands.Choice(name="돌 세공 예측", value="cutting"),
         app_commands.Choice(name="상위 3명 견제", value="top3"),
+        app_commands.Choice(name="유일 숫자 게임", value="unique_number"),
     ]
 )
 @app_commands.describe(게임="바로 시작할 미니게임")
@@ -5172,6 +5298,27 @@ async def create_round_from_setup(
             round_id = int(cursor.lastrowid)
             embed = build_top3_embed(round_id, 제목, candidates)
             view = top3_vote_view(round_id, candidates)
+        elif 게임 == "unique_number":
+            # BASE_SCHEMA의 불변 CHECK 제약에 남아 있는 레거시 grid 슬롯을 사용하고,
+            # mode로 과거 제거된 grid 라운드와 새 게임을 명확히 구분한다.
+            extra.update({"mode": "unique_number"})
+            cursor = conn.execute(
+                """
+                INSERT INTO rounds
+                    (type, title, question, status, channel_id, extra_json, created_at)
+                VALUES ('grid', ?, ?, 'open', ?, ?, ?)
+                """,
+                (
+                    제목,
+                    제목,
+                    main_channel_id,
+                    json.dumps(extra, ensure_ascii=False),
+                    now_text(),
+                ),
+            )
+            round_id = int(cursor.lastrowid)
+            embed = build_unique_number_embed(round_id, 제목)
+            view = unique_number_vote_view(round_id)
         else:
             extra.update({"max_level": 6})
             cursor = conn.execute(
