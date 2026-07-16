@@ -674,7 +674,7 @@ class BotRegressionTests(unittest.TestCase):
         self.assertIn(f"#{main_round_id}", rendered)
         self.assertIn("딜레마의 섬", rendered)
         self.assertIn("밸런스 게임", rendered)
-        self.assertIn("점수 합계 +1점", rendered)
+        self.assertIn("점수 합계 **+1점**", rendered)
         with bot.db() as conn:
             event_row = conn.execute(
                 "SELECT status, closed_at FROM event_sessions WHERE id = ?", (event_id,)
@@ -709,10 +709,10 @@ class BotRegressionTests(unittest.TestCase):
         embed = bot.build_sand_registration_embed(1, "모래성", 2)
         rendered = json.dumps(embed.to_dict(), ensure_ascii=False)
         for expected in (
-            "둘 다 포기 선택 시: 서로 -1점",
-            "덜기 성공: A는 -1점, B는 +2점",
-            "무너짐: B는 -1점, A는 +1점",
-            "서로 덜기를 하다 무너진 경우: 그 턴의 사람이 -1점",
+            "둘 다 포기 선택 시: **서로 -1점**",
+            "덜기 성공: A는 **-1점**, B는 **+2점**",
+            "무너짐: B는 **-1점**, A는 **+1점**",
+            "서로 덜기를 하다 무너진 경우: 그 턴의 사람이 **-1점**",
         ):
             self.assertIn(expected, rendered)
 
