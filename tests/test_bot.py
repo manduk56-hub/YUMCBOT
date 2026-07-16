@@ -414,7 +414,9 @@ class BotRegressionTests(unittest.TestCase):
 
         self.assertIsNotNone(result)
         rendered = json.dumps(result[1].to_dict(), ensure_ascii=False)
-        self.assertIn("신뢰 : 0 · 단독 배신 : 1 · 동시 배신 : 0", rendered)
+        self.assertIn("신뢰      : 0", rendered)
+        self.assertIn("단독 배신 : 1", rendered)
+        self.assertIn("동시 배신 : 0", rendered)
         self.assertNotIn("쌍", rendered)
         self.assertNotIn("짝별 결과", rendered)
         self.assertNotIn("<@1>", rendered)

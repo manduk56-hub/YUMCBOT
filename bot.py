@@ -125,16 +125,16 @@ ANONYMOUS_GUIDE_TEXT = (
 SAND_NUMBER_CHOICES = [str(index) for index in range(1, 11)]
 SAND_PLAY_SECONDS = 600
 SAND_RULES_TEXT = (
-    "1. 각 참여자가 1~10 중 모래성이 무너질 횟수를 정합니다.\n"
-    "2. 두 수의 차이만큼은 안전하게 덜 수 있고, 그 횟수를 초과해서 더는 순간 무너집니다. "
+    "**1** ─ 각 참여자가 1~10 중 모래성이 무너질 횟수를 정합니다.\n"
+    "**2** ─ 두 수의 차이만큼은 안전하게 덜 수 있고, 그 횟수를 초과해서 더는 순간 무너집니다. "
     "(예: 9와 7이면 차이가 2 → 2번까지는 성공, 3번째에 붕괴. 차이가 0이면 첫 덜기에서 붕괴)\n"
-    "3. 참여자는 번갈아가며 `포기하기` 또는 `모래 덜기`를 결정합니다.\n"
-    "4. 숫자를 안 내거나 제한 시간 안에 끝내지 못하면 마감 때 랜덤으로 자동 진행됩니다.\n\n"
-    "- 둘 다 포기 선택 시: 서로 -1점\n"
-    "- 한 명이 포기(A), 다른 한 명이 모래 덜기(B) 선택 시:\n"
-    "  - 덜기 성공: A는 -1점, B는 +2점\n"
-    "  - 무너짐: B는 -1점, A는 +1점\n"
-    "- 서로 덜기를 하다 무너진 경우: 그 턴의 사람이 -1점"
+    "**3** ─ 참여자는 번갈아가며 `포기하기` 또는 `모래 덜기`를 결정합니다.\n"
+    "**4** ─ 숫자를 안 내거나 제한 시간 안에 끝내지 못하면 마감 때 랜덤으로 자동 진행됩니다.\n\n"
+    "> 🏳️ 둘 다 포기 선택 시: **서로 -1점**\n"
+    "> ⚖️ 한 명이 포기(A), 다른 한 명이 모래 덜기(B) 선택 시:\n"
+    "> 　├ 덜기 성공: A는 **-1점**, B는 **+2점**\n"
+    "> 　└ 무너짐: B는 **-1점**, A는 **+1점**\n"
+    "> 💥 서로 덜기를 하다 무너진 경우: 그 턴의 사람이 **-1점**"
 )
 SAND_OUTCOME_LABELS = {
     "mutual_quit": "둘 다 포기",
@@ -748,9 +748,9 @@ def build_event_summary_embed(
         delta, affected_users = score_by_round.get(int(round_row["id"]), (0, 0))
         delta_text = f"+{delta}" if delta > 0 else str(delta)
         result_lines.append(
-            f"#{round_row['id']} **{GAME_NAMES.get(round_game_key(round_row), round_game_key(round_row))}**"
-            f" · {round_row['title']} · {status_text} · 점수 합계 {delta_text}점"
-            f" ({affected_users}명 반영)"
+            f"`#{round_row['id']}` **{GAME_NAMES.get(round_game_key(round_row), round_game_key(round_row))}**"
+            f" · {round_row['title']}\n"
+            f"　└ {status_text} · 점수 합계 **{delta_text}점** ({affected_users}명 반영)"
         )
 
     ended_at = str(event_row["closed_at"] or now_text())
@@ -764,16 +764,16 @@ def build_event_summary_embed(
         color=discord.Color.orange() if force_closed else discord.Color.gold(),
     )
     embed.add_field(
-        name="이벤트 현황",
+        name="📊 이벤트 현황",
         value=(
-            f"참가자 {participant_count}명 · 완료 {completed_count}개"
-            f"{f' · 취소 {cancelled_count}개' if cancelled_count else ''}\n"
-            f"시작: {event_row['created_at']}\n종료: {ended_at}"
+            f"참가자 **{participant_count}명** · 완료 **{completed_count}개**"
+            f"{f' · 취소 **{cancelled_count}개**' if cancelled_count else ''}\n"
+            f"> 시작: {event_row['created_at']}\n> 종료: {ended_at}"
         ),
         inline=False,
     )
     embed.add_field(
-        name="진행한 게임 최종 결과",
+        name="🎮 진행한 게임 최종 결과",
         value=field_text(result_lines, empty="진행된 게임이 없습니다."),
         inline=False,
     )
@@ -1061,15 +1061,15 @@ def build_anonymous_guide_embed(
         color=discord.Color.dark_grey(),
     )
     embed.add_field(
-        name="투표",
+        name="🗳️ 투표",
         value="아래 선택 버튼으로 이 방에서 바로 투표할 수 있습니다. 마감 전까지 몇 번이든 바꿀 수 있습니다.",
         inline=False,
     )
-    embed.add_field(name="누적 발언", value=f"{post_count}개", inline=False)
+    embed.add_field(name="💬 누적 발언", value=f"**{post_count}개**", inline=False)
     if close_at:
         embed.add_field(
             name="⏳ 마감 시각",
-            value=close_time_text(close_at),
+            value=f"**{close_time_text(close_at)}**",
             inline=False,
         )
     return embed
@@ -1082,17 +1082,17 @@ def build_event_open_embed() -> discord.Embed:
         color=discord.Color.green(),
     )
     embed.add_field(
-        name="진행 흐름",
+        name="🗺️ 진행 흐름",
         value=(
-            "1. 지금 `참여하기` 버튼으로 오늘의 참가 등록\n"
-            "2. 메인게임 1개 진행 (딜레마의 섬 또는 모래성 게임)\n"
-            "3. 메인게임 결과와 점수 정산\n"
-            "4. 미니게임 1개 진행 후 결과와 점수 정산"
+            "> **1** ─ 지금 `참여하기` 버튼으로 오늘의 참가 등록\n"
+            "> **2** ─ 메인게임 1개 진행 (딜레마의 섬 또는 모래성 게임)\n"
+            "> **3** ─ 메인게임 결과와 점수 정산\n"
+            "> **4** ─ 미니게임 1개 진행 후 결과와 점수 정산"
         ),
         inline=False,
     )
     embed.add_field(
-        name="꼭 확인해주세요",
+        name="⚠️ 꼭 확인해주세요",
         value=(
             "게임이 시작되면 참가 등록이 마감됩니다. 이전 이벤트의 참가 기록은 이어지지 않으며, "
             "이벤트가 다시 열릴 때마다 새로 `참여하기`를 눌러야 합니다."
@@ -1662,10 +1662,10 @@ def trust_pair_intro(
     close_at: float | None = None,
 ) -> str:
     intro = (
-        f"<@{user_a_id}>님과 <@{user_b_id}>님의 비공개 협상방입니다.\n"
-        "서로 마음껏 대화한 뒤 아래 버튼으로 `신뢰` 또는 `배신`을 선택하세요. (마감 전까지 몇 번이든 바꿀 수 있습니다)\n"
-        "선택은 마감 전까지 상대에게 공개되지 않으며, 마감 후 이 방에서 함께 공개됩니다.\n"
-        "*마감까지 고르지 않으면 `신뢰`/`배신` 중 하나가 랜덤으로 배정됩니다."
+        f"<@{user_a_id}>님과 <@{user_b_id}>님의 **비공개 협상방**입니다.\n"
+        "> 서로 마음껏 대화한 뒤 아래 버튼으로 `신뢰` 또는 `배신`을 선택하세요. (마감 전까지 몇 번이든 바꿀 수 있습니다)\n"
+        "> 선택은 마감 전까지 상대에게 공개되지 않으며, 마감 후 이 방에서 함께 공개됩니다.\n"
+        "> \\*마감까지 고르지 않으면 `신뢰`/`배신` 중 하나가 랜덤으로 배정됩니다."
     )
     if close_at:
         intro += f"\n\n⏳ **선택 마감:** {close_time_text(close_at)}"
@@ -1726,14 +1726,14 @@ def build_trust_pair_result_embed(
         color=discord.Color.gold(),
     )
     embed.add_field(
-        name="서로의 선택",
+        name="🃏 서로의 선택",
         value=(
             f"<@{user_a_id}>: **{choice_labels.get(user_a_choice, '미선택')}**\n"
             f"<@{user_b_id}>: **{choice_labels.get(user_b_choice, '미선택')}**"
         ),
         inline=False,
     )
-    embed.add_field(name="세트 정산", value=outcome, inline=False)
+    embed.add_field(name="💰 세트 정산", value=outcome, inline=False)
     return embed
 
 
@@ -1967,9 +1967,9 @@ def start_sand_game(round_id: int) -> dict[str, Any] | None:
 
 def sand_pair_intro(user_a_id: str, user_b_id: str) -> str:
     return (
-        f"<@{user_a_id}>님과 <@{user_b_id}>님의 1:1 모래성 방입니다.\n"
-        "먼저 각자 1~10 중 하나를 고르세요. (번복 불가, 마감까지 상대에게 공개되지 않습니다)\n"
-        "두 사람이 모두 고르면 번갈아가며 `포기하기` 또는 `모래 덜기`를 선택합니다."
+        f"<@{user_a_id}>님과 <@{user_b_id}>님의 **1:1 모래성 방**입니다.\n"
+        "> **1** ─ 먼저 각자 1~10 중 하나를 고르세요. (번복 불가, 마감까지 상대에게 공개되지 않습니다)\n"
+        "> **2** ─ 두 사람이 모두 고르면 번갈아가며 `포기하기` 또는 `모래 덜기`를 선택합니다."
     )
 
 
@@ -3205,15 +3205,15 @@ def build_balance_embed(round_id: int, question: str, option_a: str, option_b: s
         description=question,
         color=discord.Color.blurple(),
     )
-    embed.add_field(name="A", value=option_a, inline=True)
-    embed.add_field(name="B", value=option_b, inline=True)
+    embed.add_field(name="🅰️ A", value=option_a, inline=True)
+    embed.add_field(name="🅱️ B", value=option_b, inline=True)
     embed.add_field(
-        name="규칙",
+        name="📜 규칙",
         value=(
-            "투표 현황은 마감 전까지 비공개입니다.\n"
-            "토론 스레드에서 익명으로 몇 번이든 발언할 수 있습니다.\n"
-            "마감 후 다수파 선택자에게 +1점이 지급됩니다.\n"
-            "단, 한쪽이 0명이면 밸런스가 성립하지 않으므로 고른 사람 전원 -2점입니다."
+            "> 🔒 투표 현황은 마감 전까지 비공개입니다.\n"
+            "> 🕶️ 토론 스레드에서 익명으로 몇 번이든 발언할 수 있습니다.\n"
+            "> 🏆 마감 후 다수파 선택자에게 **+1점**이 지급됩니다.\n"
+            "> ⚠️ 단, 한쪽이 0명이면 밸런스가 성립하지 않으므로 고른 사람 전원 **-2점**입니다."
         ),
         inline=False,
     )
@@ -3236,27 +3236,27 @@ def build_minority_balance_revote_embed(
         color=discord.Color.gold(),
     )
     embed.add_field(
-        name=f"A. {round_row['option_a']}",
-        value=f"{first_a_count}명",
+        name=f"🅰️ A. {round_row['option_a']}",
+        value=f"**{first_a_count}명**",
         inline=True,
     )
     embed.add_field(
-        name=f"B. {round_row['option_b']}",
-        value=f"{first_b_count}명",
+        name=f"🅱️ B. {round_row['option_b']}",
+        value=f"**{first_b_count}명**",
         inline=True,
     )
     embed.add_field(
-        name="재선택 규칙 공개",
+        name="🔓 재선택 규칙 공개",
         value=(
-            "최종 집계에서 **인원이 더 적은 선택지**를 고른 사람 전원에게 **+1점**이 지급됩니다.\n"
-            "두 선택지의 인원이 같거나, 아무도 고르지 않은 쪽이 소수라면 점수는 지급되지 않습니다.\n"
-            "재선택 시간 동안에는 선택을 몇 번이든 바꿀 수 있으며, 누르지 않으면 1차 선택으로 최종 집계됩니다."
+            "> 🏆 최종 집계에서 **인원이 더 적은 선택지**를 고른 사람 전원에게 **+1점**이 지급됩니다.\n"
+            "> ⚠️ 두 선택지의 인원이 같거나, 아무도 고르지 않은 쪽이 소수라면 점수는 지급되지 않습니다.\n"
+            "> 🔄 재선택 시간 동안에는 선택을 몇 번이든 바꿀 수 있으며, 누르지 않으면 1차 선택으로 최종 집계됩니다."
         ),
         inline=False,
     )
     embed.add_field(
         name="⏳ 재선택 마감",
-        value=close_time_text(close_at),
+        value=f"**{close_time_text(close_at)}**",
         inline=False,
     )
     return embed
@@ -3383,17 +3383,17 @@ def build_defuse_embed(round_id: int, title: str) -> discord.Embed:
         color=discord.Color.dark_red(),
     )
     embed.add_field(
-        name="선택 가능한 선",
-        value=" ".join(f"{color['emoji']} {color['name']}" for color in DEFUSE_COLORS),
+        name="🔌 선택 가능한 선",
+        value="　　".join(f"{color['emoji']} {color['name']}" for color in DEFUSE_COLORS),
         inline=False,
     )
     embed.add_field(
-        name="규칙",
+        name="📜 규칙",
         value=(
-            "빨강, 파랑, 초록 중 하나를 선택합니다.\n"
-            "마감 후 가장 많은 표를 받은 선이 폭발하며, 그 선을 고른 사람은 -1점입니다.\n"
-            "최다 득표가 동률이면 공동 1위인 선이 모두 폭발합니다.\n"
-            "해체 토론방에서는 익명으로 몇 번이든 심리전과 블러핑을 할 수 있습니다."
+            "> 🎯 빨강, 파랑, 초록 중 하나를 선택합니다.\n"
+            "> 💥 마감 후 가장 많은 표를 받은 선이 폭발하며, 그 선을 고른 사람은 **-1점**입니다.\n"
+            "> ⚖️ 최다 득표가 동률이면 공동 1위인 선이 모두 폭발합니다.\n"
+            "> 🕶️ 해체 토론방에서는 익명으로 몇 번이든 심리전과 블러핑을 할 수 있습니다."
         ),
         inline=False,
     )
@@ -3407,18 +3407,18 @@ def build_cutting_embed(round_id: int, title: str) -> discord.Embed:
         color=discord.Color.teal(),
     )
     embed.add_field(
-        name="예측 단계",
-        value=" | ".join(f"{level}강화" for level in CUTTING_LEVEL_CHOICES),
+        name="📈 예측 단계",
+        value=" │ ".join(f"{level}강화" for level in CUTTING_LEVEL_CHOICES),
         inline=False,
     )
     # 확률과 보상은 상수에서 만든다. 손으로 적어두면 상수를 바꿨을 때 안내문만 옛날 값으로 남는다.
     embed.add_field(
-        name="규칙",
+        name="📜 규칙",
         value=(
-            f"강화 성공 확률: {cutting_success_rate_text()}\n"
-            "처음 실패하기 직전의 강화 단계를 맞히는 게임입니다.\n"
-            f"정답 보상: {cutting_reward_text()}\n"
-            "투표 집계가 끝나면 운영자가 `/세공진행`으로 직접 세공을 진행합니다."
+            f"> 🎲 강화 성공 확률: {cutting_success_rate_text()}\n"
+            "> 🎯 처음 실패하기 직전의 강화 단계를 맞히는 게임입니다.\n"
+            f"> 🏆 정답 보상: {cutting_reward_text()}\n"
+            "> 🔨 투표 집계가 끝나면 운영자가 직접 세공을 진행합니다."
         ),
         inline=False,
     )
@@ -3431,7 +3431,7 @@ def build_thread_notice_embed(round_id: int, thread: discord.Thread, title: str,
         description=f"{thread.mention}\n{guide}",
         color=discord.Color.gold(),
     )
-    embed.add_field(name="참여 방법", value="위 스레드를 눌러 의견을 남겨주세요.", inline=False)
+    embed.add_field(name="👉 참여 방법", value="위 스레드를 눌러 의견을 남겨주세요.", inline=False)
     return embed
 
 
@@ -3441,19 +3441,21 @@ def build_top3_embed(round_id: int, title: str, candidates: list[dict[str, Any]]
         description=title,
         color=discord.Color.orange(),
     )
+    medals = ["🥇", "🥈", "🥉"]
     candidate_lines = [
-        f"{index}. <@{candidate['user_id']}> - {candidate['score']}점"
+        f"> {medals[index - 1] if index <= len(medals) else '▫️'} "
+        f"<@{candidate['user_id']}> ─ **{candidate['score']}점**"
         for index, candidate in enumerate(candidates, start=1)
     ]
-    embed.add_field(name="후보", value="\n".join(candidate_lines), inline=False)
+    embed.add_field(name="👑 후보", value="\n".join(candidate_lines), inline=False)
     embed.add_field(
-        name="규칙",
+        name="📜 규칙",
         value=(
-            "현재 점수가 가장 높은 3명과 `선택하지 않는다` 중 하나에 투표합니다.\n"
-            "후보로 오른 3명은 투표할 수 없습니다.\n"
-            "`선택하지 않는다` 득표수가 세 후보 득표수 합보다 많으면 `선택하지 않는다`를 고른 사람 전원이 +1점입니다.\n"
-            "그렇지 않으면 세 후보 중 가장 많이 선택된 1명이 -1점입니다.\n"
-            "아무도 투표하지 않으면 이 라운드는 무효 처리됩니다."
+            "> 🗳️ 현재 점수가 가장 높은 3명과 `선택하지 않는다` 중 하나에 투표합니다.\n"
+            "> 🚫 후보로 오른 3명은 투표할 수 없습니다.\n"
+            "> 🏆 `선택하지 않는다` 득표수가 세 후보 득표수 합보다 많으면 `선택하지 않는다`를 고른 사람 전원이 **+1점**입니다.\n"
+            "> 🎯 그렇지 않으면 세 후보 중 가장 많이 선택된 1명이 **-1점**입니다.\n"
+            "> ⚠️ 아무도 투표하지 않으면 이 라운드는 무효 처리됩니다."
         ),
         inline=False,
     )
@@ -3497,17 +3499,19 @@ def build_trust_registration_embed(round_id: int, title: str, registration_minut
         color=discord.Color.dark_gold(),
     )
     embed.add_field(
-        name="진행 게임",
+        name="🎮 진행 게임",
         value="딜레마의 섬",
         inline=False,
     )
     embed.add_field(
-        name="메인 규칙",
+        name="📜 메인 규칙",
         value=(
             "무작위로 매칭된 두 명의 참가자가 신뢰와 배신을 선택합니다.\n"
-            "- 상호 신뢰 시 : 각 +1점\n"
-            "- 한명만 배신 시 : 배신자 +2점\n"
-            "- 동시 배신 시 : 각 -1점\n\n"
+            "```\n"
+            "상호 신뢰 시   : 각 +1점\n"
+            "한명만 배신 시 : 배신자 +2점\n"
+            "동시 배신 시   : 각 -1점\n"
+            "```\n"
             "선택은 마감 전까지 바꿀 수 있고, 끝까지 고르지 않으면 랜덤으로 배정됩니다."
         ),
         inline=False,
@@ -3573,8 +3577,8 @@ def build_trust_decision_embed(
         color=discord.Color.gold(),
     )
     embed.add_field(
-        name="랜덤 매칭 완료",
-        value=f"총 {len(pairs)}세트의 비공개 협상방을 열었습니다. 각자 초대된 방에서 대화와 선택을 진행하세요.",
+        name="🎲 랜덤 매칭 완료",
+        value=f"총 **{len(pairs)}세트**의 비공개 협상방을 열었습니다. 각자 초대된 방에서 대화와 선택을 진행하세요.",
         inline=False,
     )
     if unmatched_user_id:
@@ -3582,8 +3586,8 @@ def build_trust_decision_embed(
             name="🚨 긴급 투입 대기",
             value=(
                 f"<@{unmatched_user_id}>님, 참여자가 홀수라 짝이 없습니다. 잠시만 기다려주세요!\n"
-                "아직 게임에 참여하지 않은 분이 아래 `긴급 투입하기` 버튼을 누르면 둘만의 방이 새로 열리고, "
-                "전체 진행 시간이 1분 연장됩니다."
+                "> 아직 게임에 참여하지 않은 분이 아래 `긴급 투입하기` 버튼을 누르면 둘만의 방이 새로 열리고, "
+                "전체 진행 시간이 **1분 연장**됩니다."
             ),
             inline=False,
         )
@@ -3594,17 +3598,17 @@ def build_trust_decision_embed(
             inline=False,
         )
     embed.add_field(
-        name="선택 규칙 (3분)",
+        name="⚔️ 선택 규칙 (3분)",
         value=(
             "비공개 협상방에서 매칭된 짝과 대화한 뒤 `신뢰` 또는 `배신`을 선택하세요. 서로의 선택은 마감 후 해당 방에서 공개됩니다.\n"
-            "선택은 마감 전까지 몇 번이든 바꿀 수 있습니다. 끝까지 고르지 않으면 랜덤으로 배정됩니다."
+            "> 선택은 마감 전까지 **몇 번이든 바꿀 수 있습니다.** 끝까지 고르지 않으면 랜덤으로 배정됩니다."
         ),
         inline=False,
     )
     if close_at:
         embed.add_field(
             name="⏳ 선택 마감",
-            value=close_time_text(close_at),
+            value=f"**{close_time_text(close_at)}**",
             inline=False,
         )
     return embed
@@ -3634,12 +3638,12 @@ def trust_decision_view(round_id: int) -> discord.ui.View:
 def build_sand_registration_embed(round_id: int, title: str, registration_minutes: int) -> discord.Embed:
     embed = discord.Embed(title=title, description=title, color=discord.Color.from_rgb(218, 165, 90))
     embed.add_field(
-        name="진행 게임",
+        name="🎮 진행 게임",
         value="모래성 게임",
         inline=False,
     )
     embed.add_field(
-        name="메인 규칙",
+        name="📜 메인 규칙",
         value=SAND_RULES_TEXT,
         inline=False,
     )
@@ -3681,14 +3685,14 @@ def build_sand_pair_embed(title: str, pair: dict[str, Any], extra: dict[str, Any
         description=f"<@{pair['user_a_id']}> ↔ <@{pair['user_b_id']}>",
         color=discord.Color.from_rgb(218, 165, 90),
     )
-    embed.add_field(name="진행 상황", value=sand_pair_status_text(pair), inline=False)
-    embed.add_field(name="규칙", value=SAND_RULES_TEXT, inline=False)
+    embed.add_field(name="⚔️ 진행 상황", value=sand_pair_status_text(pair), inline=False)
+    embed.add_field(name="📜 규칙", value=SAND_RULES_TEXT, inline=False)
     if str(pair.get("phase")) != "resolved":
         embed.add_field(
-            name="제한 시간",
+            name="⏳ 제한 시간",
             value=(
-                f"예정 마감: {close_time_text(extra.get('play_close_at'))}\n"
-                "시간 안에 끝내지 못하면 남은 숫자와 행동이 랜덤으로 배정됩니다."
+                f"예정 마감: **{close_time_text(extra.get('play_close_at'))}**\n"
+                "> 시간 안에 끝내지 못하면 남은 숫자와 행동이 랜덤으로 배정됩니다."
             ),
             inline=False,
         )
@@ -3705,22 +3709,23 @@ def build_sand_pair_result_embed(title: str, pair: dict[str, Any]) -> discord.Em
     )
     if number_a is not None and number_b is not None:
         embed.add_field(
-            name="서로의 숫자",
+            name="🔢 서로의 숫자",
             value=(
                 f"<@{pair['user_a_id']}>: **{number_a}**\n"
                 f"<@{pair['user_b_id']}>: **{number_b}**\n"
-                f"차이 {abs(int(number_a) - int(number_b))} → {abs(int(number_a) - int(number_b)) + 1}번째 덜기에서 붕괴"
+                f"> 차이 **{abs(int(number_a) - int(number_b))}** → "
+                f"**{abs(int(number_a) - int(number_b)) + 1}번째** 덜기에서 붕괴"
             ),
             inline=False,
         )
     embed.add_field(
-        name="결과",
-        value=SAND_OUTCOME_LABELS.get(str(pair.get("outcome")), "미완료"),
+        name="🏁 결과",
+        value=f"**{SAND_OUTCOME_LABELS.get(str(pair.get('outcome')), '미완료')}**",
         inline=False,
     )
-    embed.add_field(name="정산", value=sand_pair_settlement_text(pair), inline=False)
+    embed.add_field(name="💰 정산", value=sand_pair_settlement_text(pair), inline=False)
     if pair.get("auto_completed"):
-        embed.add_field(name="자동 진행", value="제한 시간이 끝나 남은 선택이 랜덤으로 배정되었습니다.", inline=False)
+        embed.add_field(name="🎲 자동 진행", value="제한 시간이 끝나 남은 선택이 랜덤으로 배정되었습니다.", inline=False)
     return embed
 
 
@@ -3731,18 +3736,19 @@ def build_sand_play_embed(round_row: sqlite3.Row, extra: dict[str, Any]) -> disc
         color=discord.Color.from_rgb(218, 165, 90),
     )
     lines = [
-        f"{index}. <@{pair['user_a_id']}> ↔ <@{pair['user_b_id']}> · {sand_pair_status_text(pair)}"
+        f"**{index}.** <@{pair['user_a_id']}> ↔ <@{pair['user_b_id']}>\n"
+        f"　└ {sand_pair_status_text(pair)}"
         for index, pair in enumerate(extra.get("sand_pairs", []), start=1)
     ]
-    embed.add_field(name="1:1 진행 현황", value=field_text(lines), inline=False)
+    embed.add_field(name="⚔️ 1:1 진행 현황", value=field_text(lines), inline=False)
     unmatched_user_id = str(extra.get("unmatched_user_id") or "")
     if unmatched_user_id:
         embed.add_field(
             name="🚨 긴급 투입 대기",
             value=(
                 f"<@{unmatched_user_id}>님, 참여자가 홀수라 짝이 없습니다. 잠시만 기다려주세요!\n"
-                "아직 게임에 참여하지 않은 분이 아래 `긴급 투입하기` 버튼을 누르면 둘만의 방이 새로 열리고, "
-                "전체 진행 시간이 1분 연장됩니다."
+                "> 아직 게임에 참여하지 않은 분이 아래 `긴급 투입하기` 버튼을 누르면 둘만의 방이 새로 열리고, "
+                "전체 진행 시간이 **1분 연장**됩니다."
             ),
             inline=False,
         )
@@ -3754,10 +3760,10 @@ def build_sand_play_embed(round_row: sqlite3.Row, extra: dict[str, Any]) -> disc
             inline=False,
         )
     embed.add_field(
-        name="선택 제한 시간",
+        name="⏳ 선택 제한 시간",
         value=(
-            f"예정 마감: {close_time_text(extra.get('play_close_at'))}\n"
-            "시간 안에 끝내지 못하면 남은 숫자와 행동이 랜덤으로 배정되어 자동으로 결과가 확정됩니다."
+            f"예정 마감: **{close_time_text(extra.get('play_close_at'))}**\n"
+            "> 시간 안에 끝내지 못하면 남은 숫자와 행동이 랜덤으로 배정되어 자동으로 결과가 확정됩니다."
         ),
         inline=False,
     )
@@ -3983,25 +3989,25 @@ def build_cutting_progress_embed(round_row: sqlite3.Row, extra: dict[str, Any]) 
         description=round_row["title"],
         color=discord.Color.teal(),
     )
-    embed.add_field(name="현재 단계", value=f"{current_level}강화", inline=True)
-    embed.add_field(name="최대 단계", value=f"{max_level}강화", inline=True)
+    embed.add_field(name="📍 현재 단계", value=f"**{current_level}강화**", inline=True)
+    embed.add_field(name="🔝 최대 단계", value=f"**{max_level}강화**", inline=True)
     embed.add_field(
-        name="다음 시도 확률",
-        value=f"{success_rate * 100:.0f}%" if success_rate is not None else "최대 단계 도달",
+        name="🎲 다음 시도 확률",
+        value=f"**{success_rate * 100:.0f}%**" if success_rate is not None else "최대 단계 도달",
         inline=True,
     )
     embed.add_field(
-        name="진척도",
-        value=f"{cutting_progress_bar(current_level, max_level)}  ({current_level}/{max_level}강)",
+        name="📊 진척도",
+        value=f"{cutting_progress_bar(current_level, max_level)}　　**{current_level}** / {max_level}강",
         inline=False,
     )
     embed.add_field(
-        name="직전 시도",
+        name="🔨 직전 시도",
         value=logs[-1] if logs else "아직 시도 없음",
         inline=False,
     )
     embed.add_field(
-        name="진행 방식",
+        name="ℹ️ 진행 방식",
         value="관리자가 아래 `세공 시도` 버튼을 눌러 실패할 때까지 직접 진행합니다.",
         inline=False,
     )
@@ -4050,7 +4056,7 @@ def finalize_cutting_round(
     )
 
     prediction_lines = [
-        f"{level}강화: {len(grouped.get(level, []))}명"
+        f"{level}강화 ────── {len(grouped.get(level, []))}명"
         for level in CUTTING_LEVEL_CHOICES
     ]
     embed = discord.Embed(
@@ -4060,18 +4066,18 @@ def finalize_cutting_round(
     )
     max_level = int(extra.get("max_level", 6))
     embed.add_field(
-        name="진척도",
-        value=f"{cutting_progress_bar(result_level, max_level)}  ({result_level}/{max_level}강)",
+        name="📊 진척도",
+        value=f"{cutting_progress_bar(result_level, max_level)}　　**{result_level}** / {max_level}강",
         inline=False,
     )
-    embed.add_field(name="마지막 시도", value=logs[-1] if logs else "-", inline=False)
-    embed.add_field(name="최종 단계", value=f"{result_level}강화", inline=True)
-    embed.add_field(name="정답자", value=f"{len(correct_users)}명", inline=True)
-    embed.add_field(name="예측 분포", value="\n".join(prediction_lines), inline=False)
-    embed.add_field(name="정답자 명단", value=mention_list(correct_users), inline=False)
+    embed.add_field(name="🔨 마지막 시도", value=logs[-1] if logs else "-", inline=False)
+    embed.add_field(name="🏁 최종 단계", value=f"**{result_level}강화**", inline=True)
+    embed.add_field(name="🎯 정답자", value=f"**{len(correct_users)}명**", inline=True)
+    embed.add_field(name="📈 예측 분포", value="```\n" + "\n".join(prediction_lines) + "\n```", inline=False)
+    embed.add_field(name="👥 정답자 명단", value=mention_list(correct_users), inline=False)
     embed.add_field(
-        name="정산",
-        value=f"{result_level}강화를 맞힌 {len(correct_users)}명 전원 +{reward_points}점",
+        name="💰 정산",
+        value=f"{result_level}강화를 맞힌 **{len(correct_users)}명** 전원 **+{reward_points}점**",
         inline=False,
     )
     return embed
@@ -4250,16 +4256,16 @@ def close_round_record(
             )
             # 누가 무엇을 골랐는지는 공개하지 않는다. 인원수만.
             embed.add_field(
-                name=f"A. {round_row['option_a']}",
-                value=f"{len(a_users)}명",
+                name=f"🅰️ A. {round_row['option_a']}",
+                value=f"**{len(a_users)}명**",
                 inline=True,
             )
             embed.add_field(
-                name=f"B. {round_row['option_b']}",
-                value=f"{len(b_users)}명",
+                name=f"🅱️ B. {round_row['option_b']}",
+                value=f"**{len(b_users)}명**",
                 inline=True,
             )
-            embed.add_field(name="정산", value=settlement, inline=False)
+            embed.add_field(name="💰 정산", value=settlement, inline=False)
         elif round_row["type"] == "bomb":
             wires: dict[str, str] = extra["wires"]
             grouped: dict[str, list[str]] = {}
@@ -4295,13 +4301,15 @@ def close_round_record(
                     color=discord.Color.red() if penalized_users else discord.Color.light_grey(),
                 )
                 embed.add_field(
-                    name="폭발한 선",
+                    name="💥 폭발한 선",
                     value=(
-                        ", ".join(
+                        "**"
+                        + ", ".join(
                             wires[wire_id]
                             for wire_id in wires
                             if wire_id in exploded_wire_ids
                         )
+                        + "**"
                         if exploded_wire_ids
                         else "없음 (투표 없음)"
                     ),
@@ -4309,10 +4317,10 @@ def close_round_record(
                 )
                 for wire_id, wire_name in wires.items():
                     users = grouped.get(wire_id, [])
-                    marker = "폭발" if wire_id in exploded_wire_ids else "안전"
+                    marker = "💥 폭발" if wire_id in exploded_wire_ids else "✅ 안전"
                     embed.add_field(
                         name=f"{wire_name} ({marker})",
-                        value=f"{len(users)}명\n{mention_list(users)}",
+                        value=f"**{len(users)}명**\n{mention_list(users)}",
                         inline=False,
                     )
 
@@ -4329,7 +4337,7 @@ def close_round_record(
                         f"선택자 {len(penalized_users)}명 전원 -1점"
                     )
                 embed.add_field(
-                    name="정산",
+                    name="💰 정산",
                     value=settlement,
                     inline=False,
                 )
@@ -4522,37 +4530,34 @@ def close_round_record(
                 description=round_row["title"],
                 color=discord.Color.gold(),
             )
+            # 라벨 폭을 한글 2칸 기준으로 맞춰 코드블록 안에서 콜론이 세로로 정렬되게 한다.
+            distribution_lines = [
+                f"신뢰      : {outcome_counts['mutual']}",
+                f"단독 배신 : {outcome_counts['single']}",
+                f"동시 배신 : {outcome_counts['double']}",
+            ]
+            if outcome_counts["incomplete"]:
+                distribution_lines.append(f"미선택    : {outcome_counts['incomplete']}")
             embed.add_field(
-                name="전체 결과 분포",
-                value=" · ".join(
-                    [
-                        f"신뢰 : {outcome_counts['mutual']}",
-                        f"단독 배신 : {outcome_counts['single']}",
-                        f"동시 배신 : {outcome_counts['double']}",
-                    ]
-                    + (
-                        [f"미선택 : {outcome_counts['incomplete']}"]
-                        if outcome_counts["incomplete"]
-                        else []
-                    )
-                ),
+                name="📊 전체 결과 분포",
+                value="```\n" + "\n".join(distribution_lines) + "\n```",
                 inline=False,
             )
             if auto_assigned:
                 embed.add_field(
-                    name="미선택 랜덤 배정",
-                    value=f"{auto_assigned}명",
+                    name="🎲 미선택 랜덤 배정",
+                    value=f"**{auto_assigned}명**",
                     inline=False,
                 )
             unmatched_user_id = str(extra.get("unmatched_user_id") or "")
             if unmatched_user_id:
                 embed.add_field(
-                    name="매칭 대기",
-                    value="1명",
+                    name="⏳ 매칭 대기",
+                    value="**1명**",
                     inline=False,
                 )
             embed.add_field(
-                name="정산",
+                name="💰 정산",
                 value="상호 신뢰는 각 +1점, 단독 배신은 배신자 +2점·상대 0점, 동시 배신은 각 -1점입니다.",
                 inline=False,
             )
@@ -4615,14 +4620,16 @@ def close_round_record(
                     )
                 else:
                     result_lines.append(
-                        f"<@{user_a_id}> ↔ <@{user_b_id}>: 제한 시간 내 미완료 (0점)"
+                        f"**{len(result_lines) + 1}.** <@{user_a_id}> ↔ <@{user_b_id}>\n"
+                        f"　└ 제한 시간 내 미완료 (0점)"
                     )
                     continue
 
                 completed_count += 1
                 auto_mark = " · 자동 진행" if pair.get("auto_completed") else ""
                 result_lines.append(
-                    f"<@{user_a_id}> ↔ <@{user_b_id}>: {SAND_OUTCOME_LABELS[outcome]} "
+                    f"**{len(result_lines) + 1}.** <@{user_a_id}> ↔ <@{user_b_id}>\n"
+                    f"　└ **{SAND_OUTCOME_LABELS[outcome]}** "
                     f"({number_text}) · {sand_pair_settlement_text(pair)}{auto_mark}"
                 )
 
@@ -4636,11 +4643,11 @@ def close_round_record(
                 description=round_row["title"],
                 color=discord.Color.from_rgb(218, 165, 90),
             )
-            embed.add_field(name="짝별 결과", value=field_text(result_lines), inline=False)
+            embed.add_field(name="⚔️ 짝별 결과", value=field_text(result_lines), inline=False)
             unmatched_user_id = str(extra.get("unmatched_user_id") or "")
             if unmatched_user_id:
                 embed.add_field(
-                    name="매칭 대기",
+                    name="⏳ 매칭 대기",
                     value=f"<@{unmatched_user_id}>님은 이번 회차에 짝이 없어 점수 변동이 없습니다.",
                     inline=False,
                 )
@@ -4652,17 +4659,16 @@ def close_round_record(
             lines = []
             for level in CUTTING_LEVEL_CHOICES:
                 users = grouped.get(level, [])
-                lines.append(f"{level}강화: {len(users)}명")
+                lines.append(f"{level}강화 ────── {len(users)}명")
 
             embed = discord.Embed(
                 title=f"집계 · {round_row['title']}",
                 description=round_row["title"],
                 color=discord.Color.teal(),
             )
-            embed.add_field(name="강화 단계별 예측", value="\n".join(lines), inline=False)
             embed.add_field(
-                name="다음 진행",
-                value="운영자가 `/세공진행`을 실행하면 관리자 전용 세공 버튼이 열립니다. 버튼을 눌러 실패할 때까지 진행하면 결과와 정산이 공개됩니다.",
+                name="📊 강화 단계별 예측",
+                value="```\n" + "\n".join(lines) + "\n```",
                 inline=False,
             )
         elif round_row["type"] == "top3":
@@ -4679,7 +4685,7 @@ def close_round_record(
             for candidate in candidates:
                 user_id = str(candidate["user_id"])
                 candidate_lines.append(
-                    f"<@{user_id}>: {len(grouped.get(user_id, []))}표"
+                    f"<@{user_id}> ────── **{len(grouped.get(user_id, []))}표**"
                 )
 
             if none_votes + candidate_vote_sum == 0:
@@ -4718,11 +4724,11 @@ def close_round_record(
                 description=round_row["title"],
                 color=discord.Color.green(),
             )
-            embed.add_field(name="후보별 득표", value="\n".join(candidate_lines), inline=False)
-            embed.add_field(name="선택하지 않는다", value=f"{none_votes}표", inline=True)
-            embed.add_field(name="후보 득표 합", value=f"{candidate_vote_sum}표", inline=True)
-            embed.add_field(name="결과", value=outcome, inline=False)
-            embed.add_field(name="정산", value=settlement, inline=False)
+            embed.add_field(name="🗳️ 후보별 득표", value="\n".join(candidate_lines), inline=False)
+            embed.add_field(name="🚫 선택하지 않는다", value=f"**{none_votes}표**", inline=True)
+            embed.add_field(name="👑 후보 득표 합", value=f"**{candidate_vote_sum}표**", inline=True)
+            embed.add_field(name="🏁 결과", value=outcome, inline=False)
+            embed.add_field(name="💰 정산", value=settlement, inline=False)
         else:
             # 제거된 게임 타입(예: 과거의 'grid')이 열린 채 남아 있는 경우. 정산 없이 닫는다.
             embed = discord.Embed(
@@ -4731,7 +4737,7 @@ def close_round_record(
                 color=discord.Color.light_grey(),
             )
             embed.add_field(
-                name="정산",
+                name="💰 정산",
                 value="더 이상 지원하지 않는 게임이라 점수 없이 마감했습니다.",
                 inline=False,
             )
@@ -4739,8 +4745,8 @@ def close_round_record(
         planned_mini_game = str(extra.get("planned_mini_game") or "")
         if round_row["type"] in MAIN_GAME_TYPES and planned_mini_game in MINI_GAME_TYPES:
             embed.add_field(
-                name="다음 미니게임",
-                value=GAME_NAMES[planned_mini_game],
+                name="🎮 다음 미니게임",
+                value=f"**{GAME_NAMES[planned_mini_game]}**",
                 inline=False,
             )
         embed.set_footer(text=f"시작: {round_row['created_at']} · 종료: {now_text()}")
