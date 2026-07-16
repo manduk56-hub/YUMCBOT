@@ -126,10 +126,60 @@ class BotRegressionTests(unittest.TestCase):
 
         self.assertEqual([row["user_id"] for row in rows], ["300"])
 
-    def test_ranking_command_is_removed(self) -> None:
-        self.assertFalse(hasattr(bot, "shuffle_tied_ranking_rows"))
-        self.assertFalse(hasattr(bot, "format_ranking_lines"))
-        self.assertIsNone(bot.bot.tree.get_command("랭킹"))
+    def test_public_ranking_lines_show_users_and_scores(self) -> None:
+        rows = [
+            {"user_id": "200", "display_name": "1등", "total_score": 9},
+            {"user_id": "300", "display_name": "2등", "total_score": 7},
+        ]
+
+        self.assertEqual(
+            bot.format_public_ranking_lines(rows),
+            ["1. <@200> - **9점**", "2. <@300> - **7점**"],
+        )
+        self.assertEqual(
+            bot.format_public_ranking_lines([rows[1]], start_rank=2),
+            ["2. <@300> - **7점**"],
+        )
+
+    def test_ranking_command_is_admin_only(self) -> None:
+        command = bot.bot.tree.get_command("랭킹")
+
+        self.assertIsNotNone(command)
+        self.assertEqual(command.default_permissions.value, 0)
+        self.assertEqual(len(command.checks), 1)
+        rank_parameter = command.parameters[0]
+        self.assertEqual(rank_parameter.name, "등수")
+        self.assertFalse(rank_parameter.required)
+        self.assertEqual(rank_parameter.min_value, 1)
+        self.assertEqual(rank_parameter.max_value, 1000)
+
+    def test_anonymous_ranking_hides_all_user_information(self) -> None:
+        rows = [
+            {"user_id": "200", "display_name": "1등 이름", "total_score": 9},
+            {"user_id": "300", "display_name": "2등 이름", "total_score": 7},
+        ]
+
+        lines = bot.format_anonymous_ranking_lines(rows)
+        self.assertEqual(lines, ["1등 - **9점**", "2등 - **7점**"])
+        self.assertNotIn("200", "".join(lines))
+        self.assertNotIn("300", "".join(lines))
+        self.assertNotIn("이름", "".join(lines))
+        self.assertEqual(
+            bot.format_anonymous_ranking_lines([rows[1]], start_rank=2),
+            ["2등 - **7점**"],
+        )
+
+    def test_anonymous_ranking_command_is_admin_only(self) -> None:
+        command = bot.bot.tree.get_command("익명랭킹")
+
+        self.assertIsNotNone(command)
+        self.assertEqual(command.default_permissions.value, 0)
+        self.assertEqual(len(command.checks), 1)
+        rank_parameter = command.parameters[0]
+        self.assertEqual(rank_parameter.name, "등수")
+        self.assertFalse(rank_parameter.required)
+        self.assertEqual(rank_parameter.min_value, 1)
+        self.assertEqual(rank_parameter.max_value, 1000)
 
     def test_admin_score_report_records_user_names_and_scores(self) -> None:
         report_path = Path(self.temp_dir.name) / "score_report.csv"

@@ -875,6 +875,22 @@ def fetch_ranking_rows(conn: sqlite3.Connection, current_bot_id: str) -> list[sq
     ).fetchall()
 
 
+def format_public_ranking_lines(rows: list[sqlite3.Row], start_rank: int = 1) -> list[str]:
+    """공개 랭킹에 표시할 순위, 멘션, 점수를 만든다."""
+    return [
+        f"{index}. <@{row['user_id']}> - **{row['total_score']}점**"
+        for index, row in enumerate(rows, start=start_rank)
+    ]
+
+
+def format_anonymous_ranking_lines(rows: list[sqlite3.Row], start_rank: int = 1) -> list[str]:
+    """사용자 정보 없이 공개할 순위와 점수만 만든다."""
+    return [
+        f"{index}등 - **{row['total_score']}점**"
+        for index, row in enumerate(rows, start=start_rank)
+    ]
+
+
 def fetch_admin_score_rows(conn: sqlite3.Connection, current_bot_id: str) -> list[sqlite3.Row]:
     return conn.execute(
         """
@@ -5237,6 +5253,94 @@ async def show_score(interaction: discord.Interaction) -> None:
         ephemeral=True,
         allowed_mentions=discord.AllowedMentions.none(),
     )
+
+
+async def send_ranking(
+    interaction: discord.Interaction,
+    rank: int | None,
+    *,
+    reveal_users: bool,
+) -> None:
+    if interaction.guild is None:
+        await interaction.response.send_message("서버 안에서만 랭킹을 공개할 수 있습니다.", ephemeral=True)
+        return
+
+    await interaction.response.defer()
+
+    current_bot_id = str(interaction.client.user.id) if interaction.client.user else ""
+    with db() as conn:
+        candidates = fetch_ranking_rows(conn, current_bot_id)
+
+    requested_count = rank if rank is not None else 10
+    rows = []
+    try:
+        for candidate in candidates:
+            if await current_guild_member(interaction.guild, str(candidate["user_id"])) is None:
+                continue
+            rows.append(candidate)
+            if len(rows) == requested_count:
+                break
+    except discord.HTTPException:
+        await interaction.followup.send(
+            "현재 서버 멤버를 확인하지 못했습니다. 잠시 후 다시 시도해주세요.",
+            ephemeral=True,
+        )
+        return
+
+    if not rows:
+        await interaction.followup.send(
+            "현재 서버에 게임 참여 기록이 있는 유저가 없습니다.",
+            ephemeral=True,
+        )
+        return
+
+    if rank is not None and len(rows) < rank:
+        await interaction.followup.send(
+            f"현재 서버 랭킹에는 {rank}등이 없습니다. 참가자는 {len(rows)}명입니다.",
+            ephemeral=True,
+        )
+        return
+
+    ranking_label = "랭킹" if reveal_users else "익명 랭킹"
+    formatter = format_public_ranking_lines if reveal_users else format_anonymous_ranking_lines
+    if rank is None:
+        title = f"현재 {ranking_label} TOP 10"
+        ranking_lines = formatter(rows)
+    else:
+        title = f"현재 {ranking_label} {rank}등"
+        ranking_lines = formatter([rows[rank - 1]], start_rank=rank)
+
+    embed = discord.Embed(
+        title=title,
+        description="\n".join(ranking_lines),
+        color=discord.Color.gold(),
+    )
+    await interaction.followup.send(
+        embed=embed,
+        allowed_mentions=discord.AllowedMentions.none(),
+    )
+
+
+@bot.tree.command(name="랭킹", description="이름이 표시되는 TOP 10 또는 특정 등수를 공개합니다.")
+@app_commands.default_permissions()
+@admin_only()
+@app_commands.describe(등수="이 등수만 공개합니다. 생략하면 TOP 10을 공개합니다.")
+async def show_ranking(
+    interaction: discord.Interaction,
+    등수: app_commands.Range[int, 1, 1000] | None = None,
+) -> None:
+    await send_ranking(interaction, 등수, reveal_users=True)
+
+
+@bot.tree.command(name="익명랭킹", description="이름을 숨긴 TOP 10 또는 특정 등수를 공개합니다.")
+@app_commands.default_permissions()
+@admin_only()
+@app_commands.describe(등수="이 등수만 익명으로 공개합니다. 생략하면 TOP 10을 공개합니다.")
+async def show_anonymous_ranking(
+    interaction: discord.Interaction,
+    등수: app_commands.Range[int, 1, 1000] | None = None,
+) -> None:
+    await send_ranking(interaction, 등수, reveal_users=False)
 
 
 def backup_database(dest: Path) -> None:
