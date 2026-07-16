@@ -179,21 +179,27 @@ def _group_consecutive(values: dict[int, Any]) -> list[tuple[list[int], Any]]:
 
 
 def cutting_success_rate_text() -> str:
-    """예: '0→1·1→2 90% | 2→3·3→4 60% | 4→5 50% | 5→6 30%'"""
-    parts = []
+    """코드블록에 넣을 한 줄 한 항목 표. 예: '0→1·1→2 90%\\n2→3·3→4 60%\\n4→5     50%'
+
+    가장 긴 라벨은 공백 하나만 붙는다. 라벨 폭을 len으로 맞춰도 열이 어긋나지 않는 이유는
+    항목마다 한글 글자 수가 같아서다(강화/없음). 그 전제가 깨지면 표시 폭으로 계산해야 한다.
+    """
+    rows = []
     for levels, rate in _group_consecutive(CUTTING_SUCCESS_RATES):
         steps = "·".join(f"{level}→{level + 1}" for level in levels)
-        parts.append(f"{steps} {rate * 100:.0f}%")
-    return " | ".join(parts)
+        rows.append((steps, f"{rate * 100:.0f}%"))
+    width = max(len(steps) for steps, _ in rows)
+    return "\n".join(f"{steps:<{width}} {value}" for steps, value in rows)
 
 
 def cutting_reward_text() -> str:
-    """예: '0~1강화 +3점 | 2~4강화 +1점 | 5강화 +2점 | 6강화 +4점'"""
-    parts = []
+    """코드블록에 넣을 한 줄 한 항목 표. 예: '0~1강화 +3점\\n2~4강화 +1점\\n5강화   +2점'"""
+    rows = []
     for levels, points in _group_consecutive(CUTTING_REWARD_POINTS):
         span = f"{levels[0]}강화" if len(levels) == 1 else f"{levels[0]}~{levels[-1]}강화"
-        parts.append(f"{span} +{points}점")
-    return " | ".join(parts)
+        rows.append((span, f"+{points}점"))
+    width = max(len(span) for span, _ in rows)
+    return "\n".join(f"{span:<{width}} {value}" for span, value in rows)
 
 
 @contextmanager
@@ -3977,16 +3983,25 @@ def build_cutting_embed(round_id: int, title: str) -> discord.Embed:
         value=" │ ".join(f"{level}강화" for level in CUTTING_LEVEL_CHOICES),
         inline=False,
     )
-    # 확률과 보상은 상수에서 만든다. 손으로 적어두면 상수를 바꿨을 때 안내문만 옛날 값으로 남는다.
     embed.add_field(
         name="📜 규칙",
         value=(
-            f"> 🎲 강화 성공 확률: {cutting_success_rate_text()}\n"
             "> 🎯 처음 실패하기 직전의 강화 단계를 맞히는 게임입니다.\n"
-            f"> 🏆 정답 보상: {cutting_reward_text()}\n"
             "> 🔨 투표 집계가 끝나면 운영자가 직접 세공을 진행합니다."
         ),
         inline=False,
+    )
+    # 확률과 보상은 상수에서 만든다. 손으로 적어두면 상수를 바꿨을 때 안내문만 옛날 값으로 남는다.
+    # 나란히 붙여서 "확률 대비 보상"을 한눈에 비교하게 한다.
+    embed.add_field(
+        name="🎲 강화 성공 확률",
+        value=f"```\n{cutting_success_rate_text()}\n```",
+        inline=True,
+    )
+    embed.add_field(
+        name="🏆 정답 보상",
+        value=f"```\n{cutting_reward_text()}\n```",
+        inline=True,
     )
     return embed
 
