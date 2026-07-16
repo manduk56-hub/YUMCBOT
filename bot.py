@@ -32,33 +32,16 @@ KST_LABEL = "Asia/Seoul"
 DEFUSE_COLORS = [
     {"id": "red", "name": "빨강", "emoji": "🟥"},
     {"id": "blue", "name": "파랑", "emoji": "🟦"},
-    {"id": "black", "name": "검정", "emoji": "⬛"},
-    {"id": "white", "name": "흰색", "emoji": "⬜"},
+    {"id": "green", "name": "초록", "emoji": "🟩"},
 ]
 DEFUSE_COLOR_BY_ID = {color["id"]: color for color in DEFUSE_COLORS}
-DEFUSE_COLOR_ALIASES = {
-    "빨강": "red",
-    "빨간": "red",
-    "빨간색": "red",
-    "빨강색": "red",
-    "red": "red",
-    "파랑": "blue",
-    "파란": "blue",
-    "파란색": "blue",
-    "파랑색": "blue",
-    "blue": "blue",
-    "검정": "black",
-    "검은": "black",
-    "검은색": "black",
-    "검정색": "black",
-    "black": "black",
-    "흰색": "white",
-    "하양": "white",
-    "하얀": "white",
-    "하얀색": "white",
-    "흰": "white",
-    "white": "white",
-}
+# 배포 전에 열린 구방식 라운드의 버튼 응답 문구를 위해서만 남긴다.
+DEFUSE_COLOR_BY_ID.update(
+    {
+        "black": {"id": "black", "name": "검정", "emoji": "⬛"},
+        "white": {"id": "white", "name": "흰색", "emoji": "⬜"},
+    }
+)
 CUTTING_LEVEL_CHOICES = [str(index) for index in range(0, 7)]
 CUTTING_REWARD_POINTS = {
     0: 3,
@@ -93,7 +76,8 @@ MAIN_GAME_TYPES = {"trust", "sand"}
 MINI_GAME_TYPES = {"balance", "defuse4", "cutting", "top3"}
 GAME_NAMES = {
     "balance": "밸런스 게임",
-    "defuse4": "4선 폭탄 해체",
+    # DB 호환을 위해 내부 키는 defuse4를 유지하지만 현재 규칙은 3선 방식이다.
+    "defuse4": "3선 폭탄 게임",
     "cutting": "돌 세공 예측",
     "top3": "상위 3명 견제",
     "trust": "딜레마의 섬",
@@ -1020,7 +1004,7 @@ def anonymous_discussion_view(round_id: int) -> discord.ui.View:
 
 
 def round_game_key(round_row: sqlite3.Row) -> str:
-    """코드상 게임 이름. 4선 폭탄 해체는 DB에 type='bomb'으로 저장되고 extra.mode가 'defuse4'다."""
+    """코드상 게임 이름. 3선 폭탄 게임은 레거시 키 defuse4, DB type bomb을 유지한다."""
     return str(round_extra(round_row).get("mode") or round_row["type"])
 
 
@@ -3202,25 +3186,24 @@ def build_balance_embed(round_id: int, question: str, option_a: str, option_b: s
     return embed
 
 
-def build_defuse_embed(round_id: int, title: str, hint: str) -> discord.Embed:
+def build_defuse_embed(round_id: int, title: str) -> discord.Embed:
     embed = discord.Embed(
         title=title,
         description=title,
         color=discord.Color.dark_red(),
     )
     embed.add_field(
-        name="해체 가능한 버튼",
+        name="선택 가능한 선",
         value=" ".join(f"{color['emoji']} {color['name']}" for color in DEFUSE_COLORS),
         inline=False,
     )
-    embed.add_field(name="관리자의 힌트", value=hint, inline=False)
     embed.add_field(
         name="규칙",
         value=(
-            "4개의 색 버튼 중 단 하나만 안전한 버튼입니다.\n"
-            "관리자가 정한 안전 색은 마감 전까지 공개되지 않습니다.\n"
-            "해체 토론방에서 익명으로 몇 번이든 심리전과 블러핑을 할 수 있습니다.\n"
-            "마감 후 안전한 버튼을 고른 사람에게만 +1점이 지급됩니다."
+            "빨강, 파랑, 초록 중 하나를 선택합니다.\n"
+            "마감 후 가장 많은 표를 받은 선이 폭발하며, 그 선을 고른 사람은 -1점입니다.\n"
+            "최다 득표가 동률이면 공동 1위인 선이 모두 폭발합니다.\n"
+            "해체 토론방에서는 익명으로 몇 번이든 심리전과 블러핑을 할 수 있습니다."
         ),
         inline=False,
     )
@@ -4001,50 +3984,124 @@ def close_round_record(
             embed.add_field(name="정산", value=settlement, inline=False)
         elif round_row["type"] == "bomb":
             wires: dict[str, str] = extra["wires"]
-            safe_wire_ids = set(extra["safe_wire_ids"])
-            safe_users = [row["user_id"] for row in votes if row["choice"] in safe_wire_ids]
-            is_defuse = extra.get("mode") == "defuse4"
-            defuse_hint = str(extra.get("hint", "힌트 없음"))
-
-            for user_id in safe_users:
-                add_score(
-                    conn,
-                    user_id,
-                    member_name(guild, user_id),
-                    1,
-                    f"라운드 #{round_row['id']} 안전선 선택",
-                    round_row["id"],
-                )
-
             grouped: dict[str, list[str]] = {}
             for row in votes:
-                grouped.setdefault(row["choice"], []).append(row["user_id"])
+                if row["choice"] in wires:
+                    grouped.setdefault(row["choice"], []).append(row["user_id"])
 
-            embed = discord.Embed(
-                title=f"결과 · {round_row['title']}",
-                description=round_row["title"],
-                color=discord.Color.green(),
-            )
-            embed.add_field(
-                name="해체 성공 선" if is_defuse else "안전선",
-                value=", ".join(wires[wire_id] for wire_id in extra["safe_wire_ids"]),
-                inline=False,
-            )
-            if is_defuse:
-                embed.add_field(name="관리자의 힌트", value=defuse_hint, inline=False)
-            for wire_id, wire_name in wires.items():
-                users = grouped.get(wire_id, [])
-                marker = "안전" if wire_id in safe_wire_ids else "폭탄"
+            if extra.get("settlement_rule") == "top_vote_penalty":
+                highest_vote_count = max((len(users) for users in grouped.values()), default=0)
+                exploded_wire_ids = {
+                    wire_id
+                    for wire_id, users in grouped.items()
+                    if highest_vote_count > 0 and len(users) == highest_vote_count
+                }
+                penalized_users = [
+                    user_id
+                    for wire_id in exploded_wire_ids
+                    for user_id in grouped.get(wire_id, [])
+                ]
+                for user_id in penalized_users:
+                    add_score(
+                        conn,
+                        user_id,
+                        member_name(guild, user_id),
+                        -1,
+                        f"라운드 #{round_row['id']} 최다 득표 선 선택",
+                        round_row["id"],
+                    )
+
+                embed = discord.Embed(
+                    title=f"결과 · {round_row['title']}",
+                    description=round_row["title"],
+                    color=discord.Color.red() if penalized_users else discord.Color.light_grey(),
+                )
                 embed.add_field(
-                    name=f"{wire_name} ({marker})",
-                    value=f"{len(users)}명\n{mention_list(users)}",
+                    name="폭발한 선",
+                    value=(
+                        ", ".join(
+                            wires[wire_id]
+                            for wire_id in wires
+                            if wire_id in exploded_wire_ids
+                        )
+                        if exploded_wire_ids
+                        else "없음 (투표 없음)"
+                    ),
                     inline=False,
                 )
-            embed.add_field(
-                name="정산",
-                value=f"{'해체 성공자' if is_defuse else '안전선 선택자'} {len(safe_users)}명 전원 +1점",
-                inline=False,
-            )
+                for wire_id, wire_name in wires.items():
+                    users = grouped.get(wire_id, [])
+                    marker = "폭발" if wire_id in exploded_wire_ids else "안전"
+                    embed.add_field(
+                        name=f"{wire_name} ({marker})",
+                        value=f"{len(users)}명\n{mention_list(users)}",
+                        inline=False,
+                    )
+
+                if not penalized_users:
+                    settlement = "투표가 없어 점수 변동이 없습니다."
+                elif len(exploded_wire_ids) == 1:
+                    settlement = (
+                        f"최다 득표 선을 고른 {len(penalized_users)}명 전원 -1점"
+                    )
+                else:
+                    settlement = (
+                        f"최다 득표 {highest_vote_count}표 동률로 공동 1위 "
+                        f"{len(exploded_wire_ids)}개 선이 모두 폭발했습니다. "
+                        f"선택자 {len(penalized_users)}명 전원 -1점"
+                    )
+                embed.add_field(
+                    name="정산",
+                    value=settlement,
+                    inline=False,
+                )
+            else:
+                # 배포 시점에 이미 열려 있던 구방식 라운드는 기존 안전선 규칙으로 마감한다.
+                safe_wire_ids = set(extra["safe_wire_ids"])
+                safe_users = [
+                    row["user_id"] for row in votes if row["choice"] in safe_wire_ids
+                ]
+                is_defuse = extra.get("mode") == "defuse4"
+                defuse_hint = str(extra.get("hint", "힌트 없음"))
+
+                for user_id in safe_users:
+                    add_score(
+                        conn,
+                        user_id,
+                        member_name(guild, user_id),
+                        1,
+                        f"라운드 #{round_row['id']} 안전선 선택",
+                        round_row["id"],
+                    )
+
+                embed = discord.Embed(
+                    title=f"결과 · {round_row['title']}",
+                    description=round_row["title"],
+                    color=discord.Color.green(),
+                )
+                embed.add_field(
+                    name="해체 성공 선" if is_defuse else "안전선",
+                    value=", ".join(wires[wire_id] for wire_id in extra["safe_wire_ids"]),
+                    inline=False,
+                )
+                if is_defuse:
+                    embed.add_field(name="관리자의 힌트", value=defuse_hint, inline=False)
+                for wire_id, wire_name in wires.items():
+                    users = grouped.get(wire_id, [])
+                    marker = "안전" if wire_id in safe_wire_ids else "폭탄"
+                    embed.add_field(
+                        name=f"{wire_name} ({marker})",
+                        value=f"{len(users)}명\n{mention_list(users)}",
+                        inline=False,
+                    )
+                embed.add_field(
+                    name="정산",
+                    value=(
+                        f"{'해체 성공자' if is_defuse else '안전선 선택자'} "
+                        f"{len(safe_users)}명 전원 +1점"
+                    ),
+                    inline=False,
+                )
         elif round_row["type"] == "trust":
             vote_choices = {str(row["user_id"]): str(row["choice"]) for row in votes}
             pairs = conn.execute(
@@ -4383,14 +4440,6 @@ def parse_duration_minutes(value: str) -> int:
     return minutes
 
 
-def parse_defuse_color(value: str) -> str:
-    normalized = value.strip().lower().replace(" ", "")
-    color_id = DEFUSE_COLOR_ALIASES.get(normalized)
-    if not color_id:
-        raise ValueError("안전 색은 빨강, 파랑, 검정, 흰색 중 하나로 입력해주세요.")
-    return color_id
-
-
 async def ensure_pair_thread_permissions(
     interaction: discord.Interaction,
     게임: str,
@@ -4455,20 +4504,6 @@ class StartSetupModal(discord.ui.Modal):
             self.option_b = discord.ui.TextInput(label="B 선택지", max_length=80)
             self.add_item(self.option_a)
             self.add_item(self.option_b)
-        elif game == "defuse4":
-            self.safe_color = discord.ui.TextInput(
-                label="안전 색",
-                placeholder="빨강, 파랑, 검정, 흰색 중 하나",
-                max_length=10,
-            )
-            self.defuse_hint = discord.ui.TextInput(
-                label="관리자의 힌트",
-                placeholder="예: 차가운 쪽이 안전하다",
-                style=discord.TextStyle.paragraph,
-                max_length=500,
-            )
-            self.add_item(self.safe_color)
-            self.add_item(self.defuse_hint)
 
     async def on_submit(self, interaction: discord.Interaction) -> None:
         try:
@@ -4485,17 +4520,6 @@ class StartSetupModal(discord.ui.Modal):
                     title,
                     선택_a=str(self.option_a.value).strip(),
                     선택_b=str(self.option_b.value).strip(),
-                    예정_미니게임=self.planned_mini_game,
-                    단독_미니게임=self.standalone_mini_game,
-                )
-            elif self.game == "defuse4":
-                await create_round_from_setup(
-                    interaction,
-                    self.game,
-                    duration,
-                    title,
-                    안전색=parse_defuse_color(str(self.safe_color.value)),
-                    힌트=str(self.defuse_hint.value).strip(),
                     예정_미니게임=self.planned_mini_game,
                     단독_미니게임=self.standalone_mini_game,
                 )
@@ -4579,7 +4603,7 @@ async def open_event(interaction: discord.Interaction) -> None:
     ],
     미니게임=[
         app_commands.Choice(name="밸런스 게임", value="balance"),
-        app_commands.Choice(name="4선 폭탄 해체", value="defuse4"),
+        app_commands.Choice(name="3선 폭탄 게임", value="defuse4"),
         app_commands.Choice(name="돌 세공 예측", value="cutting"),
         app_commands.Choice(name="상위 3명 견제", value="top3"),
     ],
@@ -4609,7 +4633,7 @@ async def start(interaction: discord.Interaction, 메인게임: str, 미니게�
 @app_commands.choices(
     게임=[
         app_commands.Choice(name="밸런스 게임", value="balance"),
-        app_commands.Choice(name="4선 폭탄 해체", value="defuse4"),
+        app_commands.Choice(name="3선 폭탄 게임", value="defuse4"),
         app_commands.Choice(name="돌 세공 예측", value="cutting"),
         app_commands.Choice(name="상위 3명 견제", value="top3"),
     ]
@@ -4811,29 +4835,15 @@ async def create_round_from_setup(
             embed = build_balance_embed(round_id, 제목, 선택_a, 선택_b)
             view = vote_view(round_id, BALANCE_VOTE_CHOICES)
         elif 게임 == "defuse4":
-            if not 안전색:
-                await interaction.followup.send(
-                    "4선 폭탄 해체 게임은 안전 색이 필요합니다.",
-                    ephemeral=True,
-                )
-                return
-            if not 힌트:
-                await interaction.followup.send(
-                    "4선 폭탄 해체 게임은 관리자의 힌트가 필요합니다.",
-                    ephemeral=True,
-                )
-                return
             wire_map = {
                 color["id"]: f"{color['emoji']} {color['name']}"
                 for color in DEFUSE_COLORS
             }
-            safe_wire_ids = [안전색]
             extra.update(
                 {
                     "mode": "defuse4",
                     "wires": wire_map,
-                    "safe_wire_ids": safe_wire_ids,
-                    "hint": 힌트,
+                    "settlement_rule": "top_vote_penalty",
                 }
             )
 
@@ -4852,7 +4862,7 @@ async def create_round_from_setup(
                 ),
             )
             round_id = int(cursor.lastrowid)
-            embed = build_defuse_embed(round_id, 제목, 힌트)
+            embed = build_defuse_embed(round_id, 제목)
             view = defuse_vote_view(round_id)
         elif 게임 == "trust":
             extra.update(
@@ -5041,8 +5051,8 @@ async def create_round_from_setup(
                 notice_embed = build_thread_notice_embed(
                     round_id,
                     thread,
-                    "해체 토론방이 열렸습니다",
-                    "버튼을 눌러 익명으로 관리자의 힌트를 해석해 안전 색을 추리해보세요. 블러핑과 역추리 모두 가능합니다.",
+                    "폭탄 토론방이 열렸습니다",
+                    "버튼을 눌러 익명으로 표를 분산하거나 상대를 한 선으로 유도해보세요. 블러핑과 역추리 모두 가능합니다.",
                 )
             # 스레드를 잠그면 `스레드 관리` 권한이 없는 유저의 버튼 클릭까지 디스코드가 막는다.
             # 익명성은 on_message의 일반 메시지 삭제로만 지킨다.

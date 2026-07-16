@@ -70,10 +70,10 @@ embed/view 빌더 → `close_round_record`(정산) → 슬래시 명령어 → s
 
 토론 스레드는 라운드 메시지에서 파생시키므로(`message.create_thread`) 그 메시지가 스레드의 **시작 메시지**가 된다.
 시작 메시지의 실체는 부모 채널에 있어서, 스레드 안에서는 그 버튼이 회색으로 뜨고 눌리지 않는다.
-그래서 밸런스·4선 폭탄 해체는 **같은 `custom_id`의 선택 버튼을 스레드 안에도 따로 보낸다**
+그래서 밸런스·3선 폭탄 게임은 **같은 `custom_id`의 선택 버튼을 스레드 안에도 따로 보낸다**
 (`thread_discussion_view()` — 선택지 + 익명 발언하기, 발언마다 맨 아래로 재게시).
 `votes`는 `(round_id, user_id)` upsert라 채널에서 누르든 스레드에서 누르든 마지막 선택 하나만 남는다.
-버튼은 한 줄에 5개가 상한이다 — 4선 폭탄 해체가 색 4 + 익명 1로 이미 꽉 찼다.
+버튼은 한 줄에 5개가 상한이다 — 3선 폭탄 게임은 색 3 + 익명 1을 한 줄에 둔다.
 
 ### 1:1 비공개 방 (딜레마의 섬 · 모래성)
 
@@ -101,7 +101,7 @@ embed/view 빌더 → `close_round_record`(정산) → 슬래시 명령어 → s
 
 `rounds.type` CHECK 제약은 `('balance','bomb','grid','cutting','top3','trust','sand')`인데, 실제 게임 목록과 다르다.
 
-- **미니게임 "4선 폭탄 해체"의 코드상 이름은 `defuse4`이고 DB에는 `bomb`으로 저장된다** (`extra_json.mode = "defuse4"`).
+- **미니게임 "3선 폭탄 게임"의 레거시 코드상 이름은 `defuse4`이고 DB에는 `bomb`으로 저장된다** (`extra_json.mode = "defuse4"`). 새 라운드는 `extra_json.settlement_rule = "top_vote_penalty"`로 구방식 안전선 라운드와 구분한다.
 - **`grid`(관리자 시점 타일)는 제거된 게임이다.** `BASE_SCHEMA`가 불변이라 CHECK 제약에서 뺄 수 없어 값만 남아 있다.
   `close_round_record`의 마지막 `else`가 이런 옛 라운드를 점수 없이 마감한다.
 
