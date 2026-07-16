@@ -3649,41 +3649,50 @@ async def publish_auto_close_countdown(
     action_label: str,
     close_at: float,
 ) -> None:
-    """마감 직전 공지 하나를 10초 알림과 5→1 카운트다운으로 갱신한다."""
+    """10초 전 공지를 남기고, 별도 메시지를 5→1 카운트다운으로 갱신한다."""
     remaining = close_at - time.time()
     if remaining <= 0 or not hasattr(channel, "send"):
         return
 
     warning_seconds = min(AUTO_CLOSE_WARNING_SECONDS, max(1, math.ceil(remaining)))
-    message = None
+    warning_message = None
+    countdown_message = None
     try:
         try:
-            message = await channel.send(
+            warning_message = await channel.send(
                 f"⏳ **{action_label} {warning_seconds}초 전입니다.**"
             )
         except discord.HTTPException:
-            message = None
+            warning_message = None
 
         for seconds in AUTO_CLOSE_COUNTDOWN_SECONDS:
             wait_seconds = close_at - time.time() - seconds
             if wait_seconds <= 0:
                 continue
             await asyncio.sleep(wait_seconds)
-            if message is not None:
+            content = f"⏳ **{action_label}까지 {seconds}**"
+            if countdown_message is None:
                 try:
-                    await message.edit(content=f"⏳ **{action_label}까지 {seconds}**")
+                    countdown_message = await channel.send(content)
                 except discord.HTTPException:
-                    message = None
+                    countdown_message = None
+            else:
+                try:
+                    await countdown_message.edit(content=content)
+                except discord.HTTPException:
+                    countdown_message = None
 
         await asyncio.sleep(max(0, close_at - time.time()))
-        if message is not None:
+        if countdown_message is not None:
             try:
-                await message.edit(content=f"🏁 **{action_label}!**")
+                await countdown_message.edit(content=f"🏁 **{action_label}!**")
             except discord.HTTPException:
                 pass
     except asyncio.CancelledError:
-        # 수동 마감·긴급 연장으로 기존 타이머가 취소되면 낡은 카운트다운도 치운다.
-        if message is not None:
+        # 수동 마감·긴급 연장으로 기존 타이머가 취소되면 낡은 두 메시지를 모두 치운다.
+        for message in (warning_message, countdown_message):
+            if message is None:
+                continue
             try:
                 await message.delete()
             except discord.HTTPException:

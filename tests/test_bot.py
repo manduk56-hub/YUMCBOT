@@ -51,8 +51,11 @@ class BotRegressionTests(unittest.TestCase):
         self.assertEqual(bot.close_time_text(None), "수동 마감")
 
     def test_auto_close_countdown_announces_ten_then_counts_five_to_one(self) -> None:
-        message = SimpleNamespace(edit=AsyncMock(), delete=AsyncMock())
-        channel = SimpleNamespace(send=AsyncMock(return_value=message))
+        warning_message = SimpleNamespace(edit=AsyncMock(), delete=AsyncMock())
+        countdown_message = SimpleNamespace(edit=AsyncMock(), delete=AsyncMock())
+        channel = SimpleNamespace(
+            send=AsyncMock(side_effect=[warning_message, countdown_message])
+        )
 
         with patch.object(bot.time, "time", return_value=990), patch.object(
             bot.asyncio,
@@ -61,11 +64,17 @@ class BotRegressionTests(unittest.TestCase):
         ):
             asyncio.run(bot.publish_auto_close_countdown(channel, "게임 종료", 1000))
 
-        channel.send.assert_awaited_once_with("⏳ **게임 종료 10초 전입니다.**")
         self.assertEqual(
-            [call.kwargs["content"] for call in message.edit.await_args_list],
+            [call.args[0] for call in channel.send.await_args_list],
             [
+                "⏳ **게임 종료 10초 전입니다.**",
                 "⏳ **게임 종료까지 5**",
+            ],
+        )
+        warning_message.edit.assert_not_awaited()
+        self.assertEqual(
+            [call.kwargs["content"] for call in countdown_message.edit.await_args_list],
+            [
                 "⏳ **게임 종료까지 4**",
                 "⏳ **게임 종료까지 3**",
                 "⏳ **게임 종료까지 2**",
