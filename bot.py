@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import csv
 import json
+import math
 import os
 import random
 import signal
@@ -130,6 +131,8 @@ EVENT_STATUS_LABELS = {
 }
 # 참가자가 홀수라 짝이 없는 사람이 생겼을 때, 새 참가자가 긴급 투입되면 전체 마감이 이만큼 밀린다.
 EMERGENCY_EXTENSION_SECONDS = 60
+AUTO_CLOSE_WARNING_SECONDS = 10
+AUTO_CLOSE_COUNTDOWN_SECONDS = (5, 4, 3, 2, 1)
 AFK_TICK_SECONDS = 60
 AFK_COIN_PER_TICK = 1
 SCORE_REVEAL_COST = 30
@@ -1019,7 +1022,10 @@ def count_discussion_messages(conn: sqlite3.Connection, round_id: int) -> int:
     return int(row["count"]) if row else 0
 
 
-def build_anonymous_guide_embed(post_count: int) -> discord.Embed:
+def build_anonymous_guide_embed(
+    post_count: int,
+    close_at: float | None = None,
+) -> discord.Embed:
     embed = discord.Embed(
         title="🕶️ 익명 토론방",
         description=ANONYMOUS_GUIDE_TEXT,
@@ -1031,6 +1037,12 @@ def build_anonymous_guide_embed(post_count: int) -> discord.Embed:
         inline=False,
     )
     embed.add_field(name="누적 발언", value=f"{post_count}개", inline=False)
+    if close_at:
+        embed.add_field(
+            name="⏳ 마감 시각",
+            value=close_time_text(close_at),
+            inline=False,
+        )
     return embed
 
 
@@ -1075,7 +1087,7 @@ def event_join_view(event_session_id: int, participant_count: int = 0) -> discor
         discord.ui.Button(
             label="참여 취소하기",
             emoji="↩️",
-            style=discord.ButtonStyle.secondary,
+            style=discord.ButtonStyle.danger,
             custom_id=f"eventbot:eventcancel:{event_session_id}",
         )
     )
@@ -1351,7 +1363,10 @@ class AnonymousDiscussionModal(discord.ui.Modal):
                 pass
         try:
             new_button = await interaction.channel.send(
-                embed=build_anonymous_guide_embed(post_count),
+                embed=build_anonymous_guide_embed(
+                    post_count,
+                    round_extra(round_row).get("auto_close_at"),
+                ),
                 view=thread_discussion_view(self.round_id, game_key),
             )
         except discord.HTTPException:
@@ -1485,7 +1500,13 @@ def start_trust_decision(round_id: int) -> dict[str, Any] | None:
             (json.dumps(extra, ensure_ascii=False), round_id),
         )
 
-        embed = build_trust_decision_embed(round_id, str(round_row["title"]), pairs, unmatched_user_id)
+        embed = build_trust_decision_embed(
+            round_id,
+            str(round_row["title"]),
+            pairs,
+            unmatched_user_id,
+            close_at=decision_close_at,
+        )
         return {
             "state": "decision",
             "channel_id": str(round_row["channel_id"]),
@@ -1606,13 +1627,20 @@ async def warn_failed_pair_threads(channel: discord.TextChannel, round_id: int, 
         pass
 
 
-def trust_pair_intro(user_a_id: str, user_b_id: str) -> str:
-    return (
+def trust_pair_intro(
+    user_a_id: str,
+    user_b_id: str,
+    close_at: float | None = None,
+) -> str:
+    intro = (
         f"<@{user_a_id}>님과 <@{user_b_id}>님의 비공개 협상방입니다.\n"
         "서로 마음껏 대화한 뒤 아래 버튼으로 `신뢰` 또는 `배신`을 선택하세요. (마감 전까지 몇 번이든 바꿀 수 있습니다)\n"
         "선택은 마감 전까지 상대에게 공개되지 않으며, 마감 후 이 방에서 함께 공개됩니다.\n"
         "*마감까지 고르지 않으면 `신뢰`/`배신` 중 하나가 랜덤으로 배정됩니다."
     )
+    if close_at:
+        intro += f"\n\n⏳ **선택 마감:** {close_time_text(close_at)}"
+    return intro
 
 
 async def create_trust_pair_threads(transition: dict[str, Any]) -> None:
@@ -1634,7 +1662,7 @@ async def create_trust_pair_threads(transition: dict[str, Any]) -> None:
             [user_a_id, user_b_id],
             f"딜레마의 섬 #{round_id} 세트별 비공개 협상방",
             trust_decision_view(round_id),
-            content=trust_pair_intro(user_a_id, user_b_id),
+            content=trust_pair_intro(user_a_id, user_b_id, transition.get("close_at")),
         )
         if created is None:
             failed_pairs += 1
@@ -2130,6 +2158,7 @@ async def refresh_main_trust_board(round_id: int) -> None:
                 pairs,
                 unmatched_user_id,
                 str(extra.get("emergency_user_id") or "") or None,
+                extra.get("decision_close_at"),
             ),
             view=emergency_join_view(round_id) if unmatched_user_id else None,
         )
@@ -2227,7 +2256,7 @@ async def handle_emergency_join(interaction: discord.Interaction, round_id: int)
             [user_a_id, user_b_id],
             f"딜레마의 섬 #{round_id} 긴급 투입 협상방",
             trust_decision_view(round_id),
-            content=trust_pair_intro(user_a_id, user_b_id),
+            content=trust_pair_intro(user_a_id, user_b_id, close_at),
         )
     else:
         created = await create_pair_thread(
@@ -2772,7 +2801,9 @@ class EventBot(discord.Client):
 
     async def auto_close_round(self, round_id: int, close_at: float) -> None:
         try:
-            await asyncio.sleep(max(0, close_at - time.time()))
+            await asyncio.sleep(
+                max(0, close_at - time.time() - AUTO_CLOSE_WARNING_SECONDS)
+            )
             with db() as conn:
                 row = conn.execute(
                     "SELECT * FROM rounds WHERE id = ? AND status = 'open'",
@@ -2789,6 +2820,29 @@ class EventBot(discord.Client):
                 except discord.HTTPException:
                     return
             guild = getattr(channel, "guild", None)
+
+            await publish_auto_close_countdown(
+                channel,
+                auto_close_action_label(row),
+                close_at,
+            )
+
+            # 카운트다운 도중 수동 마감이나 긴급 연장으로 상태가 바뀔 수 있다.
+            # 취소 신호가 늦게 도착해도 오래된 마감 시각으로 정산하지 않도록 다시 확인한다.
+            with db() as conn:
+                fresh_row = conn.execute(
+                    "SELECT * FROM rounds WHERE id = ? AND status = 'open'",
+                    (round_id,),
+                ).fetchone()
+            if not fresh_row:
+                return
+            try:
+                current_close_at = float(round_extra(fresh_row).get("auto_close_at") or 0)
+            except (TypeError, ValueError):
+                return
+            if abs(current_close_at - close_at) > 0.5:
+                return
+            row = fresh_row
 
             if row["type"] == "trust" and round_extra(row).get("trust_phase") == "registration":
                 transition = start_trust_decision(round_id)
@@ -3276,6 +3330,7 @@ def build_trust_decision_embed(
     pairs: list[tuple[str, str]],
     unmatched_user_id: str | None,
     emergency_user_id: str | None = None,
+    close_at: float | None = None,
 ) -> discord.Embed:
     embed = discord.Embed(
         title=title,
@@ -3311,6 +3366,12 @@ def build_trust_decision_embed(
         ),
         inline=False,
     )
+    if close_at:
+        embed.add_field(
+            name="⏳ 선택 마감",
+            value=close_time_text(close_at),
+            inline=False,
+        )
     return embed
 
 
@@ -3569,7 +3630,65 @@ def cutting_action_view(round_id: int, disabled: bool = False) -> discord.ui.Vie
 def close_time_text(close_at: float | None) -> str:
     if not close_at:
         return "수동 마감"
-    return datetime.fromtimestamp(close_at).strftime("%Y-%m-%d %H:%M:%S")
+    timestamp = int(float(close_at))
+    return f"<t:{timestamp}:F>"
+
+
+def auto_close_action_label(round_row: sqlite3.Row | dict[str, Any]) -> str:
+    extra = round_extra(round_row)  # type: ignore[arg-type]
+    if round_row["type"] == "trust" and extra.get("trust_phase") == "registration":
+        return "참가 모집 종료 및 랜덤 매칭"
+    if round_row["type"] == "sand" and extra.get("sand_phase") == "registration":
+        return "참가 모집 종료 및 모래성 게임 시작"
+    game_key = round_game_key(round_row)  # type: ignore[arg-type]
+    return f"{GAME_NAMES.get(game_key, game_key)} 종료"
+
+
+async def publish_auto_close_countdown(
+    channel: Any,
+    action_label: str,
+    close_at: float,
+) -> None:
+    """마감 직전 공지 하나를 10초 알림과 5→1 카운트다운으로 갱신한다."""
+    remaining = close_at - time.time()
+    if remaining <= 0 or not hasattr(channel, "send"):
+        return
+
+    warning_seconds = min(AUTO_CLOSE_WARNING_SECONDS, max(1, math.ceil(remaining)))
+    message = None
+    try:
+        try:
+            message = await channel.send(
+                f"⏳ **{action_label} {warning_seconds}초 전입니다.**"
+            )
+        except discord.HTTPException:
+            message = None
+
+        for seconds in AUTO_CLOSE_COUNTDOWN_SECONDS:
+            wait_seconds = close_at - time.time() - seconds
+            if wait_seconds <= 0:
+                continue
+            await asyncio.sleep(wait_seconds)
+            if message is not None:
+                try:
+                    await message.edit(content=f"⏳ **{action_label}까지 {seconds}**")
+                except discord.HTTPException:
+                    message = None
+
+        await asyncio.sleep(max(0, close_at - time.time()))
+        if message is not None:
+            try:
+                await message.edit(content=f"🏁 **{action_label}!**")
+            except discord.HTTPException:
+                pass
+    except asyncio.CancelledError:
+        # 수동 마감·긴급 연장으로 기존 타이머가 취소되면 낡은 카운트다운도 치운다.
+        if message is not None:
+            try:
+                await message.delete()
+            except discord.HTTPException:
+                pass
+        raise
 
 
 def round_extra(row: sqlite3.Row) -> dict[str, Any]:
@@ -4865,7 +4984,7 @@ async def create_round_from_setup(
             # 보관되면 일반 유저의 버튼 클릭이 막힌다. 라운드가 끝날 때까지 살아 있도록 넉넉히 잡는다.
             thread = await message.create_thread(name=thread_name, auto_archive_duration=1440)
             button_message = await thread.send(
-                embed=build_anonymous_guide_embed(0),
+                embed=build_anonymous_guide_embed(0, close_at),
                 view=thread_discussion_view(round_id, 게임),
             )
             # 발언이 쌓여도 버튼이 항상 맨 아래에 오도록, 발언마다 이 메시지를 지우고 다시 보낸다.

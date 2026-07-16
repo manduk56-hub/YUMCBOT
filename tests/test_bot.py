@@ -41,6 +41,68 @@ class BotRegressionTests(unittest.TestCase):
             [item.custom_id for item in view.children],
             ["eventbot:eventjoin:12", "eventbot:eventcancel:12"],
         )
+        self.assertEqual(view.children[1].style, bot.discord.ButtonStyle.danger)
+
+    def test_close_time_text_shows_exact_discord_time_without_relative_time(self) -> None:
+        rendered = bot.close_time_text(1_800_000_000.9)
+
+        self.assertEqual(rendered, "<t:1800000000:F>")
+        self.assertNotIn(":R>", rendered)
+        self.assertEqual(bot.close_time_text(None), "수동 마감")
+
+    def test_auto_close_countdown_announces_ten_then_counts_five_to_one(self) -> None:
+        message = SimpleNamespace(edit=AsyncMock(), delete=AsyncMock())
+        channel = SimpleNamespace(send=AsyncMock(return_value=message))
+
+        with patch.object(bot.time, "time", return_value=990), patch.object(
+            bot.asyncio,
+            "sleep",
+            new=AsyncMock(),
+        ):
+            asyncio.run(bot.publish_auto_close_countdown(channel, "게임 종료", 1000))
+
+        channel.send.assert_awaited_once_with("⏳ **게임 종료 10초 전입니다.**")
+        self.assertEqual(
+            [call.kwargs["content"] for call in message.edit.await_args_list],
+            [
+                "⏳ **게임 종료까지 5**",
+                "⏳ **게임 종료까지 4**",
+                "⏳ **게임 종료까지 3**",
+                "⏳ **게임 종료까지 2**",
+                "⏳ **게임 종료까지 1**",
+                "🏁 **게임 종료!**",
+            ],
+        )
+
+    def test_timed_game_boards_include_exact_deadline(self) -> None:
+        close_at = 1_800_000_000
+        trust_embed = bot.build_trust_decision_embed(
+            1,
+            "딜레마",
+            [("1", "2")],
+            None,
+            close_at=close_at,
+        )
+        anonymous_embed = bot.build_anonymous_guide_embed(0, close_at)
+        sand_embed = bot.build_sand_pair_embed(
+            "모래성",
+            {
+                "user_a_id": "1",
+                "user_b_id": "2",
+                "phase": "number_selection",
+                "number_a": None,
+                "number_b": None,
+            },
+            {"play_close_at": close_at},
+        )
+
+        deadline = "<t:1800000000:F>"
+        for embed in (trust_embed, anonymous_embed, sand_embed):
+            rendered = json.dumps(embed.to_dict(), ensure_ascii=False)
+            self.assertIn(deadline, rendered)
+            self.assertNotIn(":R>", rendered)
+
+        self.assertIn(deadline, bot.trust_pair_intro("1", "2", close_at))
 
     def test_event_cancel_removes_participant_and_refreshes_count(self) -> None:
         with bot.db() as conn:
