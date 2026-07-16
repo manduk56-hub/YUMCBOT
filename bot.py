@@ -1071,6 +1071,14 @@ def event_join_view(event_session_id: int, participant_count: int = 0) -> discor
             custom_id=f"eventbot:eventjoin:{event_session_id}",
         )
     )
+    view.add_item(
+        discord.ui.Button(
+            label="참여 취소하기",
+            emoji="↩️",
+            style=discord.ButtonStyle.secondary,
+            custom_id=f"eventbot:eventcancel:{event_session_id}",
+        )
+    )
     return view
 
 
@@ -1207,6 +1215,53 @@ async def handle_event_join(interaction: discord.Interaction, event_session_id: 
         "참여 등록 완료! 이번 이벤트의 메인게임과 미니게임에 참여할 수 있습니다.",
         ephemeral=True,
     )
+
+
+async def handle_event_cancel(interaction: discord.Interaction, event_session_id: int) -> None:
+    if interaction.user.bot:
+        await interaction.response.send_message("봇 계정은 이벤트에 참여할 수 없습니다.", ephemeral=True)
+        return
+
+    with db() as conn:
+        event_row = conn.execute(
+            "SELECT status FROM event_sessions WHERE id = ?",
+            (event_session_id,),
+        ).fetchone()
+        if not event_row or event_row["status"] != "recruiting":
+            await interaction.response.send_message(
+                "이 이벤트의 참가 등록은 이미 마감되어 참여를 취소할 수 없습니다.",
+                ephemeral=True,
+            )
+            return
+
+        cursor = conn.execute(
+            """
+            DELETE FROM event_participants
+            WHERE event_session_id = ? AND user_id = ?
+            """,
+            (event_session_id, str(interaction.user.id)),
+        )
+        if cursor.rowcount == 0:
+            await interaction.response.send_message(
+                "이번 이벤트에 참여 등록되어 있지 않습니다.",
+                ephemeral=True,
+            )
+            return
+
+        participant_count = int(
+            conn.execute(
+                """
+                SELECT COUNT(*) AS count FROM event_participants
+                WHERE event_session_id = ?
+                """,
+                (event_session_id,),
+            ).fetchone()["count"]
+        )
+
+    await interaction.response.edit_message(
+        view=event_join_view(event_session_id, participant_count),
+    )
+    await interaction.followup.send("참여가 취소되었습니다.", ephemeral=True)
 
 
 class AnonymousDiscussionModal(discord.ui.Modal):
@@ -2794,6 +2849,15 @@ class EventBot(discord.Client):
                 await interaction.response.send_message("잘못된 이벤트 번호입니다.", ephemeral=True)
                 return
             await handle_event_join(interaction, event_session_id)
+            return
+
+        if action == "eventcancel":
+            try:
+                event_session_id = int(parts[2])
+            except ValueError:
+                await interaction.response.send_message("잘못된 이벤트 번호입니다.", ephemeral=True)
+                return
+            await handle_event_cancel(interaction, event_session_id)
             return
 
         if action == "startmini":

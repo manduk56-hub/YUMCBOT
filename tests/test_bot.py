@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import asyncio
 import csv
 import json
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, patch
 
 import bot
 
@@ -30,6 +32,65 @@ class BotRegressionTests(unittest.TestCase):
                 """,
                 (user_id, display_name, score),
             )
+
+    def test_event_join_view_has_join_and_cancel_buttons(self) -> None:
+        view = bot.event_join_view(12, 3)
+
+        self.assertEqual([item.label for item in view.children], ["참여하기 (3명)", "참여 취소하기"])
+        self.assertEqual(
+            [item.custom_id for item in view.children],
+            ["eventbot:eventjoin:12", "eventbot:eventcancel:12"],
+        )
+
+    def test_event_cancel_removes_participant_and_refreshes_count(self) -> None:
+        with bot.db() as conn:
+            cursor = conn.execute(
+                """
+                INSERT INTO event_sessions (status, channel_id, created_at)
+                VALUES ('recruiting', '10', '2026-01-01 00:00:00')
+                """
+            )
+            event_session_id = int(cursor.lastrowid)
+            conn.executemany(
+                """
+                INSERT INTO users (user_id, display_name, total_score, created_at, updated_at)
+                VALUES (?, ?, 0, '2026-01-01 00:00:00', '2026-01-01 00:00:00')
+                """,
+                [("100", "취소할 사람"), ("200", "남을 사람")],
+            )
+            conn.executemany(
+                """
+                INSERT INTO event_participants (event_session_id, user_id, joined_at)
+                VALUES (?, ?, '2026-01-01 00:00:00')
+                """,
+                [(event_session_id, "100"), (event_session_id, "200")],
+            )
+
+        interaction = SimpleNamespace(
+            user=SimpleNamespace(id=100, bot=False),
+            response=SimpleNamespace(
+                send_message=AsyncMock(),
+                edit_message=AsyncMock(),
+            ),
+            followup=SimpleNamespace(send=AsyncMock()),
+        )
+
+        asyncio.run(bot.handle_event_cancel(interaction, event_session_id))
+
+        with bot.db() as conn:
+            participants = conn.execute(
+                """
+                SELECT user_id FROM event_participants
+                WHERE event_session_id = ? ORDER BY user_id
+                """,
+                (event_session_id,),
+            ).fetchall()
+        self.assertEqual([row["user_id"] for row in participants], ["200"])
+        interaction.response.send_message.assert_not_awaited()
+        interaction.response.edit_message.assert_awaited_once()
+        refreshed_view = interaction.response.edit_message.await_args.kwargs["view"]
+        self.assertEqual(refreshed_view.children[0].label, "참여하기 (1명)")
+        interaction.followup.send.assert_awaited_once_with("참여가 취소되었습니다.", ephemeral=True)
 
     def test_my_score_message_shows_only_scores(self) -> None:
         message = bot.format_my_score_message(7, 5)
