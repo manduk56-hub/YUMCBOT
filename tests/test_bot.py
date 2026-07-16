@@ -50,10 +50,50 @@ class BotRegressionTests(unittest.TestCase):
 
         self.assertEqual(
             [item.custom_id for item in challenge.children],
-            ["eventbot:rouletteaccept:7", "eventbot:roulettedecline:7"],
+            [
+                "eventbot:rouletteaccept:7",
+                "eventbot:roulettedecline:7",
+                "eventbot:roulettescore:7",
+            ],
         )
-        self.assertEqual(betting.children[0].custom_id, "eventbot:roulettebet:7")
-        self.assertEqual(playing.children[0].custom_id, "eventbot:roulettetrigger:7")
+        self.assertEqual(
+            [item.custom_id for item in betting.children],
+            ["eventbot:roulettebet:7", "eventbot:roulettescore:7"],
+        )
+        self.assertEqual(
+            [item.custom_id for item in playing.children],
+            ["eventbot:roulettetrigger:7", "eventbot:roulettescore:7"],
+        )
+
+    def test_roulette_score_message_shows_current_score_and_escrow(self) -> None:
+        self.add_user("1", "도전자", 6)
+        game = {
+            "challenger_id": "1",
+            "target_id": "2",
+            "challenger_bet": 4,
+            "target_bet": 3,
+            "status": "playing",
+        }
+
+        with bot.db() as conn:
+            message = bot.roulette_player_score_message(conn, game, "1")
+
+        self.assertEqual(
+            message,
+            "현재 보유 점수: **6점**\n러시안룰렛 예치 점수: **4점**",
+        )
+
+    def test_roulette_score_message_rejects_spectators(self) -> None:
+        game = {
+            "challenger_id": "1",
+            "target_id": "2",
+            "challenger_bet": None,
+            "target_bet": None,
+            "status": "betting",
+        }
+
+        with bot.db() as conn, self.assertRaisesRegex(ValueError, "플레이어만"):
+            bot.roulette_player_score_message(conn, game, "3")
 
     def test_roulette_escrows_bets_and_awards_the_whole_pot(self) -> None:
         self.add_user("1", "도전자", 10)

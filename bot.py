@@ -2833,6 +2833,14 @@ def roulette_challenge_view(game_id: int, disabled: bool = False) -> discord.ui.
             disabled=disabled,
         )
     )
+    view.add_item(
+        discord.ui.Button(
+            label="내 점수 확인",
+            style=discord.ButtonStyle.secondary,
+            custom_id=f"eventbot:roulettescore:{game_id}",
+            disabled=disabled,
+        )
+    )
     return view
 
 
@@ -2843,6 +2851,14 @@ def roulette_betting_view(game_id: int, disabled: bool = False) -> discord.ui.Vi
             label="베팅 입력",
             style=discord.ButtonStyle.primary,
             custom_id=f"eventbot:roulettebet:{game_id}",
+            disabled=disabled,
+        )
+    )
+    view.add_item(
+        discord.ui.Button(
+            label="내 점수 확인",
+            style=discord.ButtonStyle.secondary,
+            custom_id=f"eventbot:roulettescore:{game_id}",
             disabled=disabled,
         )
     )
@@ -2857,6 +2873,14 @@ def roulette_play_view(game_id: int, disabled: bool = False) -> discord.ui.View:
             emoji="🔫",
             style=discord.ButtonStyle.danger,
             custom_id=f"eventbot:roulettetrigger:{game_id}",
+            disabled=disabled,
+        )
+    )
+    view.add_item(
+        discord.ui.Button(
+            label="내 점수 확인",
+            style=discord.ButtonStyle.secondary,
+            custom_id=f"eventbot:roulettescore:{game_id}",
             disabled=disabled,
         )
     )
@@ -3274,6 +3298,49 @@ async def handle_roulette_bet(interaction: discord.Interaction, game_id: int) ->
     await interaction.response.send_modal(RouletteBetModal(game_id))
 
 
+def roulette_player_score_message(
+    conn: sqlite3.Connection,
+    game: sqlite3.Row | dict[str, Any],
+    user_id: str,
+) -> str:
+    challenger_id = str(game["challenger_id"])
+    target_id = str(game["target_id"])
+    if user_id not in {challenger_id, target_id}:
+        raise ValueError("이 결투의 플레이어만 점수를 확인할 수 있습니다.")
+
+    score_row = conn.execute(
+        "SELECT total_score FROM users WHERE user_id = ?", (user_id,)
+    ).fetchone()
+    score = int(score_row["total_score"]) if score_row else 0
+    message = f"현재 보유 점수: **{score}점**"
+
+    if game["status"] == "playing":
+        bet_column = "challenger_bet" if user_id == challenger_id else "target_bet"
+        message += f"\n러시안룰렛 예치 점수: **{int(game[bet_column])}점**"
+    return message
+
+
+async def handle_roulette_score(interaction: discord.Interaction, game_id: int) -> None:
+    try:
+        with db() as conn:
+            expire_stale_roulette_games(conn)
+            row = conn.execute(
+                "SELECT * FROM russian_roulette_games WHERE id = ?", (game_id,)
+            ).fetchone()
+            if not row or not roulette_interaction_matches(interaction, row):
+                raise ValueError("이 메시지의 유효한 결투가 아닙니다.")
+            if row["status"] not in {"pending", "betting", "playing"}:
+                raise ValueError("이미 종료된 결투입니다.")
+            message = roulette_player_score_message(
+                conn, row, str(interaction.user.id)
+            )
+    except ValueError as exc:
+        await interaction.response.send_message(str(exc), ephemeral=True)
+        return
+
+    await interaction.response.send_message(message, ephemeral=True)
+
+
 async def handle_roulette_trigger(interaction: discord.Interaction, game_id: int) -> None:
     try:
         with db() as conn:
@@ -3493,6 +3560,7 @@ class EventBot(discord.Client):
             "rouletteaccept",
             "roulettedecline",
             "roulettebet",
+            "roulettescore",
             "roulettetrigger",
         }:
             try:
@@ -3506,6 +3574,8 @@ class EventBot(discord.Client):
                 await handle_roulette_decline(interaction, game_id)
             elif action == "roulettebet":
                 await handle_roulette_bet(interaction, game_id)
+            elif action == "roulettescore":
+                await handle_roulette_score(interaction, game_id)
             else:
                 await handle_roulette_trigger(interaction, game_id)
             return
