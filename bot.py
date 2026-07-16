@@ -100,9 +100,27 @@ GAME_NAMES = {
     "sand": "모래성 게임",
 }
 BALANCE_VOTE_CHOICES = [("A 선택", "A"), ("B 선택", "B")]
+ANONYMOUS_EMBED_COLORS = (
+    0xE74C3C,  # red
+    0x3498DB,  # blue
+    0x2ECC71,  # green
+    0xF1C40F,  # yellow
+    0x9B59B6,  # purple
+    0xE67E22,  # orange
+    0x1ABC9C,  # cyan
+    0xE91E63,  # pink
+    0x3F51B5,  # indigo
+    0x8BC34A,  # lime green
+    0xFF4FD8,  # magenta
+    0x00897B,  # teal
+    0xFFB300,  # amber
+    0x1E3A8A,  # navy
+    0xFF7043,  # coral
+    0x78909C,  # blue gray
+)
 ANONYMOUS_GUIDE_TEXT = (
     "아래 버튼으로 익명 발언을 남겨주세요. 일반 메시지는 익명 보호를 위해 삭제됩니다.\n"
-    "발언 횟수 제한은 없으며, 같은 라운드에서는 계속 같은 익명 번호로 표시됩니다."
+    "발언 횟수 제한은 없으며, 같은 라운드에서는 계속 같은 색상으로 표시됩니다."
 )
 SAND_NUMBER_CHOICES = [str(index) for index in range(1, 11)]
 SAND_PLAY_SECONDS = 600
@@ -495,6 +513,16 @@ def assign_anonymous_number(conn: sqlite3.Connection, round_id: int, user_id: st
         (round_id,),
     ).fetchone()
     return int(row["next"])
+
+
+def build_anonymous_message_embed(anon_number: int, content: str) -> discord.Embed:
+    """내부 익명 번호마다 고정 색상을 붙이되 번호는 노출하지 않는 토론 발언 카드."""
+    color = ANONYMOUS_EMBED_COLORS[(anon_number - 1) % len(ANONYMOUS_EMBED_COLORS)]
+    return discord.Embed(
+        title="익명",
+        description=content,
+        color=color,
+    )
 
 
 def ensure_user(conn: sqlite3.Connection, user: discord.abc.User) -> None:
@@ -1338,7 +1366,7 @@ class AnonymousDiscussionModal(discord.ui.Modal):
 
         try:
             posted_message = await interaction.channel.send(
-                f"**익명{anon_number}**\n{content}",
+                embed=build_anonymous_message_embed(anon_number, content),
                 allowed_mentions=discord.AllowedMentions.none(),
             )
         except discord.HTTPException:

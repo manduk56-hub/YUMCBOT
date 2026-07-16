@@ -924,6 +924,30 @@ class BotRegressionTests(unittest.TestCase):
 
     # --- 익명 발언 ----------------------------------------------------------
 
+    def test_anonymous_message_embed_uses_stable_number_color(self) -> None:
+        first = bot.build_anonymous_message_embed(1, "첫 발언").to_dict()
+        same_user_next_post = bot.build_anonymous_message_embed(1, "다음 발언").to_dict()
+        second = bot.build_anonymous_message_embed(2, "다른 발언").to_dict()
+
+        self.assertEqual(first["title"], "익명")
+        self.assertEqual(second["title"], "익명")
+        self.assertNotIn("1", first["title"])
+        self.assertNotIn("2", second["title"])
+        self.assertEqual(first["description"], "첫 발언")
+        self.assertEqual(first["color"], same_user_next_post["color"])
+        self.assertNotEqual(first["color"], second["color"])
+
+    def test_anonymous_message_embed_reuses_palette_safely(self) -> None:
+        palette_size = len(bot.ANONYMOUS_EMBED_COLORS)
+
+        self.assertEqual(palette_size, 16)
+        self.assertEqual(len(set(bot.ANONYMOUS_EMBED_COLORS)), palette_size)
+
+        first = bot.build_anonymous_message_embed(1, "발언").to_dict()
+        wrapped = bot.build_anonymous_message_embed(palette_size + 1, "발언").to_dict()
+
+        self.assertEqual(first["color"], wrapped["color"])
+
     def test_anonymous_numbers_are_stable_per_user(self) -> None:
         with bot.db() as conn:
             cursor = conn.execute(
