@@ -6,6 +6,7 @@ import json
 import math
 import os
 import random
+import secrets
 import signal
 import socket
 import sqlite3
@@ -154,6 +155,8 @@ AUTO_CLOSE_COUNTDOWN_SECONDS = (5, 4, 3, 2, 1)
 AFK_TICK_SECONDS = 60
 AFK_COIN_PER_TICK = 1
 SCORE_REVEAL_COST = 30
+ROULETTE_CHALLENGE_SECONDS = 300
+ROULETTE_BETTING_SECONDS = 600
 
 
 def now_text() -> str:
@@ -338,6 +341,41 @@ MIGRATIONS: dict[int, list[str]] = {
             updated_at TEXT NOT NULL,
             FOREIGN KEY (user_id) REFERENCES users(user_id) ON DELETE CASCADE
         )
+        """,
+    ],
+    # 유저 간 상시 1:1 러시안룰렛. 진행 상태와 예치금을 DB에 보존해 재시작 뒤에도 이어진다.
+    4: [
+        """
+        CREATE TABLE IF NOT EXISTS russian_roulette_games (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            guild_id TEXT NOT NULL,
+            channel_id TEXT NOT NULL,
+            message_id TEXT,
+            challenger_id TEXT NOT NULL,
+            target_id TEXT NOT NULL,
+            challenger_name TEXT NOT NULL,
+            target_name TEXT NOT NULL,
+            status TEXT NOT NULL CHECK (
+                status IN ('pending', 'betting', 'playing', 'finished', 'declined', 'expired')
+            ),
+            challenger_bet INTEGER,
+            target_bet INTEGER,
+            current_player_id TEXT,
+            live_chamber INTEGER CHECK (live_chamber BETWEEN 0 AND 5),
+            shots_fired INTEGER NOT NULL DEFAULT 0 CHECK (shots_fired BETWEEN 0 AND 6),
+            winner_id TEXT,
+            loser_id TEXT,
+            created_at TEXT NOT NULL,
+            expires_at REAL,
+            accepted_at TEXT,
+            finished_at TEXT,
+            FOREIGN KEY (challenger_id) REFERENCES users(user_id) ON DELETE CASCADE,
+            FOREIGN KEY (target_id) REFERENCES users(user_id) ON DELETE CASCADE
+        )
+        """,
+        """
+        CREATE INDEX IF NOT EXISTS idx_roulette_active_users
+        ON russian_roulette_games(status, challenger_id, target_id)
         """,
     ],
 }
@@ -2743,6 +2781,513 @@ async def handle_sand_action(
     await refresh_or_finish_sand_round(interaction, round_id, private_message, public_message)
 
 
+def expire_stale_roulette_games(conn: sqlite3.Connection, now: float | None = None) -> None:
+    """수락 또는 베팅을 오래 방치한 게임을 닫는다. 이 단계에는 아직 예치금이 없다."""
+    current = time.time() if now is None else now
+    conn.execute(
+        """
+        UPDATE russian_roulette_games
+        SET status = 'expired', finished_at = ?
+        WHERE status IN ('pending', 'betting') AND expires_at IS NOT NULL AND expires_at <= ?
+        """,
+        (now_text(), current),
+    )
+
+
+def active_roulette_game_for_user(
+    conn: sqlite3.Connection, user_id: str
+) -> sqlite3.Row | None:
+    return conn.execute(
+        """
+        SELECT * FROM russian_roulette_games
+        WHERE status IN ('pending', 'betting', 'playing')
+          AND (challenger_id = ? OR target_id = ?)
+        ORDER BY id DESC
+        LIMIT 1
+        """,
+        (user_id, user_id),
+    ).fetchone()
+
+
+def roulette_challenge_view(game_id: int, disabled: bool = False) -> discord.ui.View:
+    view = discord.ui.View(timeout=None)
+    view.add_item(
+        discord.ui.Button(
+            label="수락",
+            style=discord.ButtonStyle.success,
+            custom_id=f"eventbot:rouletteaccept:{game_id}",
+            disabled=disabled,
+        )
+    )
+    view.add_item(
+        discord.ui.Button(
+            label="거절",
+            style=discord.ButtonStyle.danger,
+            custom_id=f"eventbot:roulettedecline:{game_id}",
+            disabled=disabled,
+        )
+    )
+    return view
+
+
+def roulette_betting_view(game_id: int, disabled: bool = False) -> discord.ui.View:
+    view = discord.ui.View(timeout=None)
+    view.add_item(
+        discord.ui.Button(
+            label="베팅 입력",
+            style=discord.ButtonStyle.primary,
+            custom_id=f"eventbot:roulettebet:{game_id}",
+            disabled=disabled,
+        )
+    )
+    return view
+
+
+def roulette_play_view(game_id: int, disabled: bool = False) -> discord.ui.View:
+    view = discord.ui.View(timeout=None)
+    view.add_item(
+        discord.ui.Button(
+            label="방아쇠 당기기",
+            emoji="🔫",
+            style=discord.ButtonStyle.danger,
+            custom_id=f"eventbot:roulettetrigger:{game_id}",
+            disabled=disabled,
+        )
+    )
+    return view
+
+
+def roulette_view(game: sqlite3.Row | dict[str, Any]) -> discord.ui.View | None:
+    status = str(game["status"])
+    game_id = int(game["id"])
+    if status == "pending":
+        return roulette_challenge_view(game_id)
+    if status == "betting":
+        return roulette_betting_view(game_id)
+    if status == "playing":
+        return roulette_play_view(game_id)
+    return None
+
+
+def build_roulette_embed(game: sqlite3.Row | dict[str, Any]) -> discord.Embed:
+    challenger_id = str(game["challenger_id"])
+    target_id = str(game["target_id"])
+    status = str(game["status"])
+    title = "🔫 러시안룰렛 1:1"
+
+    if status == "pending":
+        expires_at = int(float(game["expires_at"]))
+        description = (
+            f"<@{challenger_id}>님이 <@{target_id}>님에게 결투를 신청했습니다.\n\n"
+            "지목받은 플레이어만 수락하거나 거절할 수 있습니다.\n"
+            f"요청 만료: <t:{expires_at}:R>"
+        )
+        color = discord.Color.orange()
+    elif status == "betting":
+        challenger_bet = game["challenger_bet"]
+        target_bet = game["target_bet"]
+        challenger_text = f"**{challenger_bet}점**" if challenger_bet is not None else "입력 대기 중"
+        target_text = f"**{target_bet}점**" if target_bet is not None else "입력 대기 중"
+        expires_at = int(float(game["expires_at"]))
+        description = (
+            "두 플레이어가 각자 베팅할 점수를 입력합니다. 베팅은 현재 점수의 일부 또는 전부이며 "
+            "최소 1점입니다. 둘 다 입력하면 즉시 게임이 시작됩니다.\n\n"
+            f"<@{challenger_id}>: {challenger_text}\n"
+            f"<@{target_id}>: {target_text}\n\n"
+            f"베팅 입력 만료: <t:{expires_at}:R>"
+        )
+        color = discord.Color.blurple()
+    elif status == "playing":
+        shots_fired = int(game["shots_fired"])
+        remaining = 6 - shots_fired
+        current_player_id = str(game["current_player_id"])
+        pot = int(game["challenger_bet"]) + int(game["target_bet"])
+        description = (
+            f"<@{challenger_id}> **{game['challenger_bet']}점** vs "
+            f"<@{target_id}> **{game['target_bet']}점**\n"
+            f"총 예치금: **{pot}점**\n\n"
+            f"격발 횟수: **{shots_fired}/6**\n"
+            f"남은 탄창: **{remaining}칸** (실탄 1발)\n\n"
+            f"지금 차례: <@{current_player_id}>"
+        )
+        color = discord.Color.red()
+    elif status == "finished":
+        loser_id = str(game["loser_id"])
+        stolen_points = (
+            int(game["challenger_bet"])
+            if loser_id == challenger_id
+            else int(game["target_bet"])
+        )
+        description = (
+            f"💥 <@{game['loser_id']}>님에게서 총이 격발되었습니다.\n\n"
+            f"🏆 <@{game['winner_id']}>님이 <@{game['loser_id']}>님의 "
+            f"**{stolen_points}점**을 빼앗았습니다."
+        )
+        color = discord.Color.gold()
+    elif status == "declined":
+        description = f"<@{target_id}>님이 결투 요청을 거절했습니다."
+        color = discord.Color.light_grey()
+    else:
+        description = "정해진 시간 안에 응답하지 않아 결투가 만료되었습니다."
+        color = discord.Color.light_grey()
+
+    embed = discord.Embed(title=title, description=description, color=color)
+    embed.set_footer(text=f"게임 #{game['id']} · 6칸 중 실탄 1발 · 발사 후 탄창을 다시 돌리지 않음")
+    return embed
+
+
+def submit_roulette_bet(
+    conn: sqlite3.Connection,
+    game_id: int,
+    user_id: str,
+    amount: int,
+) -> tuple[str, dict[str, Any]]:
+    """베팅을 저장하고 둘 다 준비됐으면 점수를 예치한 뒤 게임을 시작한다."""
+    expire_stale_roulette_games(conn)
+    row = conn.execute(
+        "SELECT * FROM russian_roulette_games WHERE id = ?", (game_id,)
+    ).fetchone()
+    if not row:
+        raise ValueError("존재하지 않는 게임입니다.")
+    if row["status"] != "betting":
+        raise ValueError("베팅을 입력할 수 있는 상태가 아닙니다.")
+    if user_id not in {str(row["challenger_id"]), str(row["target_id"])}:
+        raise ValueError("이 결투의 플레이어만 베팅할 수 있습니다.")
+
+    balance_row = conn.execute(
+        "SELECT total_score FROM users WHERE user_id = ?", (user_id,)
+    ).fetchone()
+    balance = int(balance_row["total_score"]) if balance_row else 0
+    if amount < 1:
+        raise ValueError("베팅 점수는 최소 1점입니다.")
+    if amount > balance:
+        raise ValueError(f"현재 점수는 {balance}점입니다. 가진 점수보다 많이 걸 수 없습니다.")
+
+    column = "challenger_bet" if user_id == str(row["challenger_id"]) else "target_bet"
+    conn.execute(
+        f"UPDATE russian_roulette_games SET {column} = ? WHERE id = ?",
+        (amount, game_id),
+    )
+    row = conn.execute(
+        "SELECT * FROM russian_roulette_games WHERE id = ?", (game_id,)
+    ).fetchone()
+    if row["challenger_bet"] is None or row["target_bet"] is None:
+        return "waiting", dict(row)
+
+    player_ids = [str(row["challenger_id"]), str(row["target_id"])]
+    balances = {
+        str(item["user_id"]): int(item["total_score"])
+        for item in conn.execute(
+            "SELECT user_id, total_score FROM users WHERE user_id IN (?, ?)", player_ids
+        ).fetchall()
+    }
+    bets = {
+        player_ids[0]: int(row["challenger_bet"]),
+        player_ids[1]: int(row["target_bet"]),
+    }
+    invalid_ids = [uid for uid in player_ids if balances.get(uid, 0) < bets[uid]]
+    if invalid_ids:
+        for invalid_id in invalid_ids:
+            invalid_column = "challenger_bet" if invalid_id == player_ids[0] else "target_bet"
+            conn.execute(
+                f"UPDATE russian_roulette_games SET {invalid_column} = NULL WHERE id = ?",
+                (game_id,),
+            )
+        fresh = conn.execute(
+            "SELECT * FROM russian_roulette_games WHERE id = ?", (game_id,)
+        ).fetchone()
+        return "balance_changed", dict(fresh)
+
+    add_score(
+        conn,
+        player_ids[0],
+        str(row["challenger_name"]),
+        -bets[player_ids[0]],
+        f"러시안룰렛 #{game_id} 베팅 예치",
+    )
+    add_score(
+        conn,
+        player_ids[1],
+        str(row["target_name"]),
+        -bets[player_ids[1]],
+        f"러시안룰렛 #{game_id} 베팅 예치",
+    )
+    current_player_id = player_ids[secrets.randbelow(2)]
+    live_chamber = secrets.randbelow(6)
+    conn.execute(
+        """
+        UPDATE russian_roulette_games
+        SET status = 'playing', current_player_id = ?, live_chamber = ?,
+            shots_fired = 0, expires_at = NULL
+        WHERE id = ? AND status = 'betting'
+        """,
+        (current_player_id, live_chamber, game_id),
+    )
+    fresh = conn.execute(
+        "SELECT * FROM russian_roulette_games WHERE id = ?", (game_id,)
+    ).fetchone()
+    return "started", dict(fresh)
+
+
+def pull_roulette_trigger(
+    conn: sqlite3.Connection, game_id: int, user_id: str
+) -> tuple[str, dict[str, Any]]:
+    row = conn.execute(
+        "SELECT * FROM russian_roulette_games WHERE id = ?", (game_id,)
+    ).fetchone()
+    if not row:
+        raise ValueError("존재하지 않는 게임입니다.")
+    if row["status"] != "playing":
+        raise ValueError("현재 진행 중인 게임이 아닙니다.")
+    if str(row["current_player_id"]) != user_id:
+        raise ValueError("지금은 상대방의 차례입니다.")
+
+    challenger_id = str(row["challenger_id"])
+    target_id = str(row["target_id"])
+    if int(row["shots_fired"]) == int(row["live_chamber"]):
+        loser_id = user_id
+        winner_id = target_id if user_id == challenger_id else challenger_id
+        winner_name = (
+            str(row["target_name"]) if winner_id == target_id else str(row["challenger_name"])
+        )
+        pot = int(row["challenger_bet"]) + int(row["target_bet"])
+        add_score(
+            conn,
+            winner_id,
+            winner_name,
+            pot,
+            f"러시안룰렛 #{game_id} 승리",
+        )
+        conn.execute(
+            """
+            UPDATE russian_roulette_games
+            SET status = 'finished', shots_fired = shots_fired + 1,
+                winner_id = ?, loser_id = ?, finished_at = ?
+            WHERE id = ? AND status = 'playing'
+            """,
+            (winner_id, loser_id, now_text(), game_id),
+        )
+        state = "fired"
+    else:
+        next_player_id = target_id if user_id == challenger_id else challenger_id
+        conn.execute(
+            """
+            UPDATE russian_roulette_games
+            SET shots_fired = shots_fired + 1, current_player_id = ?
+            WHERE id = ? AND status = 'playing'
+            """,
+            (next_player_id, game_id),
+        )
+        state = "blank"
+
+    fresh = conn.execute(
+        "SELECT * FROM russian_roulette_games WHERE id = ?", (game_id,)
+    ).fetchone()
+    return state, dict(fresh)
+
+
+def roulette_interaction_matches(
+    interaction: discord.Interaction,
+    game: sqlite3.Row | dict[str, Any],
+    *,
+    require_message: bool = True,
+) -> bool:
+    if interaction.guild is None or str(interaction.guild.id) != str(game["guild_id"]):
+        return False
+    if interaction.channel is None or str(interaction.channel.id) != str(game["channel_id"]):
+        return False
+    if require_message:
+        message = interaction.message
+        return message is not None and (
+            not game["message_id"] or str(message.id) == str(game["message_id"])
+        )
+    return True
+
+
+async def refresh_roulette_message(
+    client: discord.Client, game: sqlite3.Row | dict[str, Any]
+) -> None:
+    channel = client.get_channel(int(game["channel_id"]))
+    if channel is None:
+        try:
+            channel = await client.fetch_channel(int(game["channel_id"]))
+        except discord.HTTPException:
+            return
+    if not hasattr(channel, "fetch_message") or not game["message_id"]:
+        return
+    try:
+        message = await channel.fetch_message(int(game["message_id"]))
+        await message.edit(
+            content=None if game["status"] != "pending" else message.content,
+            embed=build_roulette_embed(game),
+            view=roulette_view(game),
+        )
+    except discord.HTTPException:
+        return
+
+
+class RouletteBetModal(discord.ui.Modal):
+    def __init__(self, game_id: int) -> None:
+        self.game_id = game_id
+        super().__init__(title="러시안룰렛 베팅")
+        self.amount = discord.ui.TextInput(
+            label="베팅할 점수",
+            placeholder="최소 1점부터 현재 점수 전부까지",
+            min_length=1,
+            max_length=12,
+        )
+        self.add_item(self.amount)
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        value = str(self.amount.value).strip()
+        if not value.isdigit():
+            await interaction.response.send_message("베팅 점수는 양의 정수로 입력해주세요.", ephemeral=True)
+            return
+        try:
+            with db() as conn:
+                row = conn.execute(
+                    "SELECT * FROM russian_roulette_games WHERE id = ?", (self.game_id,)
+                ).fetchone()
+                if not row or not roulette_interaction_matches(
+                    interaction, row, require_message=False
+                ):
+                    raise ValueError("이 채널의 유효한 결투가 아닙니다.")
+                state, game = submit_roulette_bet(
+                    conn, self.game_id, str(interaction.user.id), int(value)
+                )
+        except ValueError as exc:
+            await interaction.response.send_message(str(exc), ephemeral=True)
+            return
+
+        if state == "started":
+            message = "베팅을 예치했고 게임을 시작했습니다. 진행판에서 차례를 확인해주세요."
+        elif state == "balance_changed":
+            message = "게임 시작 직전 점수가 바뀐 플레이어의 베팅을 취소했습니다. 해당 플레이어가 다시 입력해주세요."
+        else:
+            message = "베팅을 저장했습니다. 상대방의 입력을 기다립니다."
+        await interaction.response.send_message(message, ephemeral=True)
+        await refresh_roulette_message(interaction.client, game)
+
+
+async def handle_roulette_accept(interaction: discord.Interaction, game_id: int) -> None:
+    with db() as conn:
+        expire_stale_roulette_games(conn)
+        row = conn.execute(
+            "SELECT * FROM russian_roulette_games WHERE id = ?", (game_id,)
+        ).fetchone()
+        if not row or not roulette_interaction_matches(interaction, row):
+            await interaction.response.send_message("이 메시지의 유효한 결투가 아닙니다.", ephemeral=True)
+            return
+        if str(interaction.user.id) != str(row["target_id"]):
+            await interaction.response.send_message("지목받은 플레이어만 수락할 수 있습니다.", ephemeral=True)
+            return
+        if row["status"] != "pending":
+            await interaction.response.send_message("이미 처리되었거나 만료된 결투입니다.", ephemeral=True)
+            return
+        scores = conn.execute(
+            "SELECT user_id, total_score FROM users WHERE user_id IN (?, ?)",
+            (str(row["challenger_id"]), str(row["target_id"])),
+        ).fetchall()
+        if len(scores) != 2 or any(int(score["total_score"]) < 1 for score in scores):
+            await interaction.response.send_message(
+                "두 플레이어 모두 최소 1점이 있어야 게임을 시작할 수 있습니다.", ephemeral=True
+            )
+            return
+        conn.execute(
+            """
+            UPDATE russian_roulette_games
+            SET status = 'betting', accepted_at = ?, expires_at = ?
+            WHERE id = ? AND status = 'pending'
+            """,
+            (now_text(), time.time() + ROULETTE_BETTING_SECONDS, game_id),
+        )
+        game = dict(
+            conn.execute(
+                "SELECT * FROM russian_roulette_games WHERE id = ?", (game_id,)
+            ).fetchone()
+        )
+    await interaction.response.edit_message(
+        content=None,
+        embed=build_roulette_embed(game),
+        view=roulette_view(game),
+    )
+
+
+async def handle_roulette_decline(interaction: discord.Interaction, game_id: int) -> None:
+    with db() as conn:
+        expire_stale_roulette_games(conn)
+        row = conn.execute(
+            "SELECT * FROM russian_roulette_games WHERE id = ?", (game_id,)
+        ).fetchone()
+        if not row or not roulette_interaction_matches(interaction, row):
+            await interaction.response.send_message("이 메시지의 유효한 결투가 아닙니다.", ephemeral=True)
+            return
+        if str(interaction.user.id) != str(row["target_id"]):
+            await interaction.response.send_message("지목받은 플레이어만 거절할 수 있습니다.", ephemeral=True)
+            return
+        if row["status"] != "pending":
+            await interaction.response.send_message("이미 처리되었거나 만료된 결투입니다.", ephemeral=True)
+            return
+        conn.execute(
+            "UPDATE russian_roulette_games SET status = 'declined', finished_at = ? WHERE id = ?",
+            (now_text(), game_id),
+        )
+        game = dict(
+            conn.execute(
+                "SELECT * FROM russian_roulette_games WHERE id = ?", (game_id,)
+            ).fetchone()
+        )
+    await interaction.response.edit_message(
+        content=None,
+        embed=build_roulette_embed(game),
+        view=None,
+    )
+
+
+async def handle_roulette_bet(interaction: discord.Interaction, game_id: int) -> None:
+    with db() as conn:
+        expire_stale_roulette_games(conn)
+        row = conn.execute(
+            "SELECT * FROM russian_roulette_games WHERE id = ?", (game_id,)
+        ).fetchone()
+        valid = bool(row) and roulette_interaction_matches(interaction, row)
+        is_player = bool(row) and str(interaction.user.id) in {
+            str(row["challenger_id"]),
+            str(row["target_id"]),
+        }
+        is_betting = bool(row) and row["status"] == "betting"
+    if not valid:
+        await interaction.response.send_message("이 메시지의 유효한 결투가 아닙니다.", ephemeral=True)
+        return
+    if not is_player:
+        await interaction.response.send_message("이 결투의 플레이어만 베팅할 수 있습니다.", ephemeral=True)
+        return
+    if not is_betting:
+        await interaction.response.send_message("베팅 입력 시간이 끝났습니다.", ephemeral=True)
+        return
+    await interaction.response.send_modal(RouletteBetModal(game_id))
+
+
+async def handle_roulette_trigger(interaction: discord.Interaction, game_id: int) -> None:
+    try:
+        with db() as conn:
+            row = conn.execute(
+                "SELECT * FROM russian_roulette_games WHERE id = ?", (game_id,)
+            ).fetchone()
+            if not row or not roulette_interaction_matches(interaction, row):
+                raise ValueError("이 메시지의 유효한 결투가 아닙니다.")
+            state, game = pull_roulette_trigger(conn, game_id, str(interaction.user.id))
+    except ValueError as exc:
+        await interaction.response.send_message(str(exc), ephemeral=True)
+        return
+
+    await interaction.response.edit_message(
+        content=None,
+        embed=build_roulette_embed(game),
+        view=roulette_view(game),
+    )
+
+
 class EventBot(discord.Client):
     def __init__(self) -> None:
         intents = discord.Intents.default()
@@ -2938,6 +3483,27 @@ class EventBot(discord.Client):
             return
 
         _, action = parts[:2]
+        if action in {
+            "rouletteaccept",
+            "roulettedecline",
+            "roulettebet",
+            "roulettetrigger",
+        }:
+            try:
+                game_id = int(parts[2])
+            except ValueError:
+                await interaction.response.send_message("잘못된 러시안룰렛 게임 번호입니다.", ephemeral=True)
+                return
+            if action == "rouletteaccept":
+                await handle_roulette_accept(interaction, game_id)
+            elif action == "roulettedecline":
+                await handle_roulette_decline(interaction, game_id)
+            elif action == "roulettebet":
+                await handle_roulette_bet(interaction, game_id)
+            else:
+                await handle_roulette_trigger(interaction, game_id)
+            return
+
         if action == "eventjoin":
             try:
                 event_session_id = int(parts[2])
@@ -5780,6 +6346,126 @@ async def list_events(interaction: discord.Interaction) -> None:
         inline=False,
     )
     await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+@bot.tree.command(name="러시안룰렛", description="한 플레이어에게 점수를 건 1:1 러시안룰렛을 신청합니다.")
+@app_commands.describe(플레이어="결투를 신청할 플레이어")
+async def russian_roulette(
+    interaction: discord.Interaction, 플레이어: discord.Member
+) -> None:
+    if interaction.guild is None:
+        await interaction.response.send_message(
+            "서버의 공개 텍스트 채널에서만 러시안룰렛을 시작할 수 있습니다.", ephemeral=True
+        )
+        return
+    if not isinstance(interaction.channel, discord.TextChannel):
+        await interaction.response.send_message(
+            "러시안룰렛은 비공개 스레드나 공개 스레드가 아닌 일반 텍스트 채널에서만 시작할 수 있습니다.",
+            ephemeral=True,
+        )
+        return
+    if not interaction.channel.permissions_for(interaction.guild.default_role).view_channel:
+        await interaction.response.send_message(
+            "이 채널은 모든 서버 멤버가 볼 수 있는 공개 공간이 아닙니다. "
+            "`@everyone`이 채널을 볼 수 있는 일반 텍스트 채널에서 실행해주세요.",
+            ephemeral=True,
+        )
+        return
+    if 플레이어.bot:
+        await interaction.response.send_message("봇에게는 결투를 신청할 수 없습니다.", ephemeral=True)
+        return
+    if 플레이어.id == interaction.user.id:
+        await interaction.response.send_message("자기 자신에게는 결투를 신청할 수 없습니다.", ephemeral=True)
+        return
+
+    challenger_id = str(interaction.user.id)
+    target_id = str(플레이어.id)
+    with db() as conn:
+        ensure_user(conn, interaction.user)
+        ensure_user(conn, 플레이어)
+        expire_stale_roulette_games(conn)
+
+        challenger_active = active_roulette_game_for_user(conn, challenger_id)
+        target_active = active_roulette_game_for_user(conn, target_id)
+        if challenger_active:
+            await interaction.response.send_message(
+                "이미 진행 중이거나 응답을 기다리는 러시안룰렛이 있습니다.", ephemeral=True
+            )
+            return
+        if target_active:
+            await interaction.response.send_message(
+                "상대방이 이미 다른 러시안룰렛에 참여 중입니다.", ephemeral=True
+            )
+            return
+
+        score_rows = conn.execute(
+            "SELECT user_id, total_score FROM users WHERE user_id IN (?, ?)",
+            (challenger_id, target_id),
+        ).fetchall()
+        scores = {str(row["user_id"]): int(row["total_score"]) for row in score_rows}
+        if scores.get(challenger_id, 0) < 1:
+            await interaction.response.send_message(
+                "러시안룰렛을 신청하려면 최소 1점이 필요합니다.", ephemeral=True
+            )
+            return
+        target_score = scores.get(target_id, 0)
+        if target_score < 1:
+            await interaction.response.send_message(
+                f"선택한 상대방은 현재 점수가 **{target_score}점**이라 베팅할 점수가 없습니다. "
+                "최소 1점이 있어야 결투를 신청할 수 있습니다.",
+                ephemeral=True,
+            )
+            return
+
+        cursor = conn.execute(
+            """
+            INSERT INTO russian_roulette_games (
+                guild_id, channel_id, challenger_id, target_id,
+                challenger_name, target_name, status, created_at, expires_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?)
+            """,
+            (
+                str(interaction.guild.id),
+                str(interaction.channel.id),
+                challenger_id,
+                target_id,
+                getattr(interaction.user, "display_name", interaction.user.name),
+                플레이어.display_name,
+                now_text(),
+                time.time() + ROULETTE_CHALLENGE_SECONDS,
+            ),
+        )
+        game_id = int(cursor.lastrowid)
+        game = dict(
+            conn.execute(
+                "SELECT * FROM russian_roulette_games WHERE id = ?", (game_id,)
+            ).fetchone()
+        )
+
+    try:
+        await interaction.response.send_message(
+            content=f"<@{target_id}>님, 러시안룰렛 결투 요청이 도착했습니다.",
+            embed=build_roulette_embed(game),
+            view=roulette_view(game),
+            allowed_mentions=discord.AllowedMentions(
+                everyone=False, roles=False, users=True, replied_user=False
+            ),
+        )
+        message = await interaction.original_response()
+    except discord.HTTPException:
+        with db() as conn:
+            conn.execute(
+                "UPDATE russian_roulette_games SET status = 'expired', finished_at = ? WHERE id = ?",
+                (now_text(), game_id),
+            )
+        raise
+
+    with db() as conn:
+        conn.execute(
+            "UPDATE russian_roulette_games SET message_id = ? WHERE id = ?",
+            (str(message.id), game_id),
+        )
 
 
 @bot.tree.command(name="잠수", description="내 잠수 코인을 확인합니다.")

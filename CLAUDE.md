@@ -115,7 +115,7 @@ embed/view 빌더 → `close_round_record`(정산) → 슬래시 명령어 → s
 수정하면 새로 만든 DB와 운영 DB의 스키마가 조용히 갈라진다.
 
 스키마 추가는 `MIGRATIONS`에 등록한다. `SCHEMA_VERSION`은 자동 계산되고, 부팅 시 `init_db()`가
-`PRAGMA user_version`을 보고 밀린 것만 적용한다. 현재 최신은 **v3**(`afk_coins` 테이블).
+`PRAGMA user_version`을 보고 밀린 것만 적용한다. 현재 최신은 **v4**(`russian_roulette_games` 테이블).
 
 ```python
 MIGRATIONS: dict[int, list[str]] = {

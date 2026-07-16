@@ -43,6 +43,85 @@ class BotRegressionTests(unittest.TestCase):
         )
         self.assertEqual(view.children[1].style, bot.discord.ButtonStyle.danger)
 
+    def test_roulette_views_have_persistent_custom_ids(self) -> None:
+        challenge = bot.roulette_challenge_view(7)
+        betting = bot.roulette_betting_view(7)
+        playing = bot.roulette_play_view(7)
+
+        self.assertEqual(
+            [item.custom_id for item in challenge.children],
+            ["eventbot:rouletteaccept:7", "eventbot:roulettedecline:7"],
+        )
+        self.assertEqual(betting.children[0].custom_id, "eventbot:roulettebet:7")
+        self.assertEqual(playing.children[0].custom_id, "eventbot:roulettetrigger:7")
+
+    def test_roulette_escrows_bets_and_awards_the_whole_pot(self) -> None:
+        self.add_user("1", "도전자", 10)
+        self.add_user("2", "상대", 8)
+        with bot.db() as conn:
+            cursor = conn.execute(
+                """
+                INSERT INTO russian_roulette_games (
+                    guild_id, channel_id, challenger_id, target_id,
+                    challenger_name, target_name, status, created_at, expires_at
+                )
+                VALUES ('10', '20', '1', '2', '도전자', '상대', 'betting', ?, ?)
+                """,
+                (bot.now_text(), 9_999_999_999),
+            )
+            game_id = int(cursor.lastrowid)
+
+            state, _ = bot.submit_roulette_bet(conn, game_id, "1", 4)
+            self.assertEqual(state, "waiting")
+            with patch.object(bot.secrets, "randbelow", side_effect=[0, 2]):
+                state, game = bot.submit_roulette_bet(conn, game_id, "2", 3)
+
+            self.assertEqual(state, "started")
+            self.assertEqual(game["current_player_id"], "1")
+            self.assertEqual(game["live_chamber"], 2)
+            scores = {
+                row["user_id"]: row["total_score"]
+                for row in conn.execute(
+                    "SELECT user_id, total_score FROM users WHERE user_id IN ('1', '2')"
+                )
+            }
+            self.assertEqual(scores, {"1": 6, "2": 5})
+
+            self.assertEqual(bot.pull_roulette_trigger(conn, game_id, "1")[0], "blank")
+            self.assertEqual(bot.pull_roulette_trigger(conn, game_id, "2")[0], "blank")
+            result, finished = bot.pull_roulette_trigger(conn, game_id, "1")
+            self.assertEqual(result, "fired")
+            self.assertEqual(finished["winner_id"], "2")
+            self.assertEqual(finished["loser_id"], "1")
+            rendered = json.dumps(bot.build_roulette_embed(finished).to_dict(), ensure_ascii=False)
+            self.assertIn("<@2>님이 <@1>님의 **4점**을 빼앗았습니다", rendered)
+
+            final_scores = {
+                row["user_id"]: row["total_score"]
+                for row in conn.execute(
+                    "SELECT user_id, total_score FROM users WHERE user_id IN ('1', '2')"
+                )
+            }
+            self.assertEqual(final_scores, {"1": 6, "2": 12})
+            self.assertEqual(sum(final_scores.values()), 18)
+
+    def test_roulette_rejects_a_bet_over_the_current_balance(self) -> None:
+        self.add_user("1", "도전자", 2)
+        self.add_user("2", "상대", 3)
+        with bot.db() as conn:
+            cursor = conn.execute(
+                """
+                INSERT INTO russian_roulette_games (
+                    guild_id, channel_id, challenger_id, target_id,
+                    challenger_name, target_name, status, created_at, expires_at
+                )
+                VALUES ('10', '20', '1', '2', '도전자', '상대', 'betting', ?, ?)
+                """,
+                (bot.now_text(), 9_999_999_999),
+            )
+            with self.assertRaisesRegex(ValueError, "가진 점수보다 많이"):
+                bot.submit_roulette_bet(conn, int(cursor.lastrowid), "1", 3)
+
     def test_close_time_text_shows_exact_discord_time_without_relative_time(self) -> None:
         rendered = bot.close_time_text(1_800_000_000.9)
 

@@ -131,7 +131,7 @@ sudo /opt/yumcbot/runner/svc.sh status   # 러너 상태
 
 `yumcbot-deploy`가 하는 일:
 
-1. **배포 게이트** — `check_idle.py`로 진행 중인 라운드/이벤트가 있는지 확인.
+1. **배포 게이트** — `check_idle.py`로 진행 중인 라운드/이벤트/1:1 게임이 있는지 확인.
    있으면 **배포하지 않고 실패**한다.
 2. 릴리스 생성 (`releases/<sha>` + 전용 venv에 의존성 설치)
 3. **DB 백업** (온라인 백업 API. 봇이 돌고 있어도 안전)
