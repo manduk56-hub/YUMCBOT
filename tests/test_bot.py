@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import asyncio
 import csv
 import json
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, patch
 
 import bot
 
@@ -30,6 +32,255 @@ class BotRegressionTests(unittest.TestCase):
                 """,
                 (user_id, display_name, score),
             )
+
+    def test_event_join_view_has_join_and_cancel_buttons(self) -> None:
+        view = bot.event_join_view(12, 3)
+
+        self.assertEqual([item.label for item in view.children], ["참여하기 (3명)", "참여 취소하기"])
+        self.assertEqual(
+            [item.custom_id for item in view.children],
+            ["eventbot:eventjoin:12", "eventbot:eventcancel:12"],
+        )
+        self.assertEqual(view.children[1].style, bot.discord.ButtonStyle.danger)
+
+    def test_roulette_views_have_persistent_custom_ids(self) -> None:
+        challenge = bot.roulette_challenge_view(7)
+        betting = bot.roulette_betting_view(7)
+        playing = bot.roulette_play_view(7)
+
+        self.assertEqual(
+            [item.custom_id for item in challenge.children],
+            [
+                "eventbot:rouletteaccept:7",
+                "eventbot:roulettedecline:7",
+                "eventbot:roulettescore:7",
+            ],
+        )
+        self.assertEqual(
+            [item.custom_id for item in betting.children],
+            ["eventbot:roulettebet:7", "eventbot:roulettescore:7"],
+        )
+        self.assertEqual(
+            [item.custom_id for item in playing.children],
+            ["eventbot:roulettetrigger:7", "eventbot:roulettescore:7"],
+        )
+
+    def test_roulette_score_message_shows_current_score_and_escrow(self) -> None:
+        self.add_user("1", "도전자", 6)
+        game = {
+            "challenger_id": "1",
+            "target_id": "2",
+            "challenger_bet": 4,
+            "target_bet": 3,
+            "status": "playing",
+        }
+
+        with bot.db() as conn:
+            message = bot.roulette_player_score_message(conn, game, "1")
+
+        self.assertEqual(
+            message,
+            "현재 보유 점수: **6점**\n러시안룰렛 예치 점수: **4점**",
+        )
+
+    def test_roulette_score_message_rejects_spectators(self) -> None:
+        game = {
+            "challenger_id": "1",
+            "target_id": "2",
+            "challenger_bet": None,
+            "target_bet": None,
+            "status": "betting",
+        }
+
+        with bot.db() as conn, self.assertRaisesRegex(ValueError, "플레이어만"):
+            bot.roulette_player_score_message(conn, game, "3")
+
+    def test_roulette_escrows_bets_and_awards_the_whole_pot(self) -> None:
+        self.add_user("1", "도전자", 10)
+        self.add_user("2", "상대", 8)
+        with bot.db() as conn:
+            cursor = conn.execute(
+                """
+                INSERT INTO russian_roulette_games (
+                    guild_id, channel_id, challenger_id, target_id,
+                    challenger_name, target_name, status, created_at, expires_at
+                )
+                VALUES ('10', '20', '1', '2', '도전자', '상대', 'betting', ?, ?)
+                """,
+                (bot.now_text(), 9_999_999_999),
+            )
+            game_id = int(cursor.lastrowid)
+
+            state, _ = bot.submit_roulette_bet(conn, game_id, "1", 4)
+            self.assertEqual(state, "waiting")
+            with patch.object(bot.secrets, "randbelow", side_effect=[0, 2]):
+                state, game = bot.submit_roulette_bet(conn, game_id, "2", 3)
+
+            self.assertEqual(state, "started")
+            self.assertEqual(game["current_player_id"], "1")
+            self.assertEqual(game["live_chamber"], 2)
+            scores = {
+                row["user_id"]: row["total_score"]
+                for row in conn.execute(
+                    "SELECT user_id, total_score FROM users WHERE user_id IN ('1', '2')"
+                )
+            }
+            self.assertEqual(scores, {"1": 6, "2": 5})
+
+            self.assertEqual(bot.pull_roulette_trigger(conn, game_id, "1")[0], "blank")
+            self.assertEqual(bot.pull_roulette_trigger(conn, game_id, "2")[0], "blank")
+            result, finished = bot.pull_roulette_trigger(conn, game_id, "1")
+            self.assertEqual(result, "fired")
+            self.assertEqual(finished["winner_id"], "2")
+            self.assertEqual(finished["loser_id"], "1")
+            rendered = json.dumps(bot.build_roulette_embed(finished).to_dict(), ensure_ascii=False)
+            self.assertIn("<@2>님이 <@1>님의 **4점**을 빼앗았습니다", rendered)
+
+            final_scores = {
+                row["user_id"]: row["total_score"]
+                for row in conn.execute(
+                    "SELECT user_id, total_score FROM users WHERE user_id IN ('1', '2')"
+                )
+            }
+            self.assertEqual(final_scores, {"1": 6, "2": 12})
+            self.assertEqual(sum(final_scores.values()), 18)
+
+    def test_roulette_rejects_a_bet_over_the_current_balance(self) -> None:
+        self.add_user("1", "도전자", 2)
+        self.add_user("2", "상대", 3)
+        with bot.db() as conn:
+            cursor = conn.execute(
+                """
+                INSERT INTO russian_roulette_games (
+                    guild_id, channel_id, challenger_id, target_id,
+                    challenger_name, target_name, status, created_at, expires_at
+                )
+                VALUES ('10', '20', '1', '2', '도전자', '상대', 'betting', ?, ?)
+                """,
+                (bot.now_text(), 9_999_999_999),
+            )
+            with self.assertRaisesRegex(ValueError, "가진 점수보다 많이"):
+                bot.submit_roulette_bet(conn, int(cursor.lastrowid), "1", 3)
+
+    def test_close_time_text_shows_exact_discord_time_without_relative_time(self) -> None:
+        rendered = bot.close_time_text(1_800_000_000.9)
+
+        self.assertEqual(rendered, "<t:1800000000:F>")
+        self.assertNotIn(":R>", rendered)
+        self.assertEqual(bot.close_time_text(None), "수동 마감")
+
+    def test_auto_close_countdown_announces_ten_then_counts_five_to_one(self) -> None:
+        warning_message = SimpleNamespace(edit=AsyncMock(), delete=AsyncMock())
+        countdown_message = SimpleNamespace(edit=AsyncMock(), delete=AsyncMock())
+        channel = SimpleNamespace(
+            send=AsyncMock(side_effect=[warning_message, countdown_message])
+        )
+
+        with patch.object(bot.time, "time", return_value=990), patch.object(
+            bot.asyncio,
+            "sleep",
+            new=AsyncMock(),
+        ):
+            asyncio.run(bot.publish_auto_close_countdown(channel, "게임 종료", 1000))
+
+        self.assertEqual(
+            [call.args[0] for call in channel.send.await_args_list],
+            [
+                "⏳ **게임 종료 10초 전입니다.**",
+                "⏳ **게임 종료까지 5**",
+            ],
+        )
+        warning_message.edit.assert_not_awaited()
+        self.assertEqual(
+            [call.kwargs["content"] for call in countdown_message.edit.await_args_list],
+            [
+                "⏳ **게임 종료까지 4**",
+                "⏳ **게임 종료까지 3**",
+                "⏳ **게임 종료까지 2**",
+                "⏳ **게임 종료까지 1**",
+                "🏁 **게임 종료!**",
+            ],
+        )
+
+    def test_timed_game_boards_include_exact_deadline(self) -> None:
+        close_at = 1_800_000_000
+        trust_embed = bot.build_trust_decision_embed(
+            1,
+            "딜레마",
+            [("1", "2")],
+            None,
+            close_at=close_at,
+        )
+        anonymous_embed = bot.build_anonymous_guide_embed(0, close_at)
+        sand_embed = bot.build_sand_pair_embed(
+            "모래성",
+            {
+                "user_a_id": "1",
+                "user_b_id": "2",
+                "phase": "number_selection",
+                "number_a": None,
+                "number_b": None,
+            },
+            {"play_close_at": close_at},
+        )
+
+        deadline = "<t:1800000000:F>"
+        for embed in (trust_embed, anonymous_embed, sand_embed):
+            rendered = json.dumps(embed.to_dict(), ensure_ascii=False)
+            self.assertIn(deadline, rendered)
+            self.assertNotIn(":R>", rendered)
+
+        self.assertIn(deadline, bot.trust_pair_intro("1", "2", close_at))
+
+    def test_event_cancel_removes_participant_and_refreshes_count(self) -> None:
+        with bot.db() as conn:
+            cursor = conn.execute(
+                """
+                INSERT INTO event_sessions (status, channel_id, created_at)
+                VALUES ('recruiting', '10', '2026-01-01 00:00:00')
+                """
+            )
+            event_session_id = int(cursor.lastrowid)
+            conn.executemany(
+                """
+                INSERT INTO users (user_id, display_name, total_score, created_at, updated_at)
+                VALUES (?, ?, 0, '2026-01-01 00:00:00', '2026-01-01 00:00:00')
+                """,
+                [("100", "취소할 사람"), ("200", "남을 사람")],
+            )
+            conn.executemany(
+                """
+                INSERT INTO event_participants (event_session_id, user_id, joined_at)
+                VALUES (?, ?, '2026-01-01 00:00:00')
+                """,
+                [(event_session_id, "100"), (event_session_id, "200")],
+            )
+
+        interaction = SimpleNamespace(
+            user=SimpleNamespace(id=100, bot=False),
+            response=SimpleNamespace(
+                send_message=AsyncMock(),
+                edit_message=AsyncMock(),
+            ),
+            followup=SimpleNamespace(send=AsyncMock()),
+        )
+
+        asyncio.run(bot.handle_event_cancel(interaction, event_session_id))
+
+        with bot.db() as conn:
+            participants = conn.execute(
+                """
+                SELECT user_id FROM event_participants
+                WHERE event_session_id = ? ORDER BY user_id
+                """,
+                (event_session_id,),
+            ).fetchall()
+        self.assertEqual([row["user_id"] for row in participants], ["200"])
+        interaction.response.send_message.assert_not_awaited()
+        interaction.response.edit_message.assert_awaited_once()
+        refreshed_view = interaction.response.edit_message.await_args.kwargs["view"]
+        self.assertEqual(refreshed_view.children[0].label, "참여하기 (1명)")
+        interaction.followup.send.assert_awaited_once_with("참여가 취소되었습니다.", ephemeral=True)
 
     def test_my_score_message_shows_only_scores(self) -> None:
         message = bot.format_my_score_message(7, 5)
@@ -126,10 +377,60 @@ class BotRegressionTests(unittest.TestCase):
 
         self.assertEqual([row["user_id"] for row in rows], ["300"])
 
-    def test_ranking_command_is_removed(self) -> None:
-        self.assertFalse(hasattr(bot, "shuffle_tied_ranking_rows"))
-        self.assertFalse(hasattr(bot, "format_ranking_lines"))
-        self.assertIsNone(bot.bot.tree.get_command("랭킹"))
+    def test_public_ranking_lines_show_users_and_scores(self) -> None:
+        rows = [
+            {"user_id": "200", "display_name": "1등", "total_score": 9},
+            {"user_id": "300", "display_name": "2등", "total_score": 7},
+        ]
+
+        self.assertEqual(
+            bot.format_public_ranking_lines(rows),
+            ["1. <@200> - **9점**", "2. <@300> - **7점**"],
+        )
+        self.assertEqual(
+            bot.format_public_ranking_lines([rows[1]], start_rank=2),
+            ["2. <@300> - **7점**"],
+        )
+
+    def test_ranking_command_is_admin_only(self) -> None:
+        command = bot.bot.tree.get_command("랭킹")
+
+        self.assertIsNotNone(command)
+        self.assertEqual(command.default_permissions.value, 0)
+        self.assertEqual(len(command.checks), 1)
+        rank_parameter = command.parameters[0]
+        self.assertEqual(rank_parameter.name, "등수")
+        self.assertFalse(rank_parameter.required)
+        self.assertEqual(rank_parameter.min_value, 1)
+        self.assertEqual(rank_parameter.max_value, 1000)
+
+    def test_anonymous_ranking_hides_all_user_information(self) -> None:
+        rows = [
+            {"user_id": "200", "display_name": "1등 이름", "total_score": 9},
+            {"user_id": "300", "display_name": "2등 이름", "total_score": 7},
+        ]
+
+        lines = bot.format_anonymous_ranking_lines(rows)
+        self.assertEqual(lines, ["1등 - **9점**", "2등 - **7점**"])
+        self.assertNotIn("200", "".join(lines))
+        self.assertNotIn("300", "".join(lines))
+        self.assertNotIn("이름", "".join(lines))
+        self.assertEqual(
+            bot.format_anonymous_ranking_lines([rows[1]], start_rank=2),
+            ["2등 - **7점**"],
+        )
+
+    def test_anonymous_ranking_command_is_admin_only(self) -> None:
+        command = bot.bot.tree.get_command("익명랭킹")
+
+        self.assertIsNotNone(command)
+        self.assertEqual(command.default_permissions.value, 0)
+        self.assertEqual(len(command.checks), 1)
+        rank_parameter = command.parameters[0]
+        self.assertEqual(rank_parameter.name, "등수")
+        self.assertFalse(rank_parameter.required)
+        self.assertEqual(rank_parameter.min_value, 1)
+        self.assertEqual(rank_parameter.max_value, 1000)
 
     def test_admin_score_report_records_user_names_and_scores(self) -> None:
         report_path = Path(self.temp_dir.name) / "score_report.csv"
@@ -232,7 +533,9 @@ class BotRegressionTests(unittest.TestCase):
 
         self.assertIsNotNone(result)
         rendered = json.dumps(result[1].to_dict(), ensure_ascii=False)
-        self.assertIn("신뢰 : 0 · 단독 배신 : 1 · 동시 배신 : 0", rendered)
+        self.assertIn("신뢰      : 0", rendered)
+        self.assertIn("단독 배신 : 1", rendered)
+        self.assertIn("동시 배신 : 0", rendered)
         self.assertNotIn("쌍", rendered)
         self.assertNotIn("짝별 결과", rendered)
         self.assertNotIn("<@1>", rendered)
@@ -411,7 +714,7 @@ class BotRegressionTests(unittest.TestCase):
         self.assertIn(f"#{main_round_id}", rendered)
         self.assertIn("딜레마의 섬", rendered)
         self.assertIn("밸런스 게임", rendered)
-        self.assertIn("점수 합계 +1점", rendered)
+        self.assertIn("점수 합계 **+1점**", rendered)
         with bot.db() as conn:
             event_row = conn.execute(
                 "SELECT status, closed_at FROM event_sessions WHERE id = ?", (event_id,)
@@ -446,10 +749,10 @@ class BotRegressionTests(unittest.TestCase):
         embed = bot.build_sand_registration_embed(1, "모래성", 2)
         rendered = json.dumps(embed.to_dict(), ensure_ascii=False)
         for expected in (
-            "둘 다 포기 선택 시: 서로 -1점",
-            "덜기 성공: A는 -1점, B는 +2점",
-            "무너짐: B는 -1점, A는 +1점",
-            "서로 덜기를 하다 무너진 경우: 그 턴의 사람이 -1점",
+            "둘 다 포기 선택 시: **서로 -1점**",
+            "덜기 성공: A는 **-1점**, B는 **+2점**",
+            "무너짐: B는 **-1점**, A는 **+1점**",
+            "서로 덜기를 하다 무너진 경우: 그 턴의 사람이 **-1점**",
         ):
             self.assertIn(expected, rendered)
 
@@ -524,6 +827,264 @@ class BotRegressionTests(unittest.TestCase):
 
         self.assertEqual(self.score_of("1"), 3)
 
+    def create_minority_balance_round(self, votes: list[tuple[str, str]]) -> int:
+        extra = {
+            "mode": "minority_balance",
+            "balance_phase": "initial",
+            "duration_minutes": 1,
+            "auto_close_at": 1,
+        }
+        with bot.db() as conn:
+            cursor = conn.execute(
+                """
+                INSERT INTO rounds
+                    (type, title, question, option_a, option_b, status, channel_id, extra_json, created_at)
+                VALUES ('balance', '밸런스 게임 라운드', '선택', '짜장', '짬뽕', 'open', '10', ?,
+                        '2026-01-01 00:00:00')
+                """,
+                (json.dumps(extra, ensure_ascii=False),),
+            )
+            round_id = int(cursor.lastrowid)
+            conn.executemany(
+                """
+                INSERT INTO votes (round_id, user_id, choice, created_at, updated_at)
+                VALUES (?, ?, ?, '2026-01-01 00:00:00', '2026-01-01 00:00:00')
+                """,
+                [(round_id, user_id, choice) for user_id, choice in votes],
+            )
+        return round_id
+
+    def test_minority_balance_initial_guide_is_identical_to_normal_balance(self) -> None:
+        normal = bot.build_balance_embed(1, "선택", "짜장", "짬뽕").to_dict()
+        disguised = bot.build_balance_embed(2, "선택", "짜장", "짬뽕").to_dict()
+
+        self.assertIn("balance", bot.MINI_GAME_TYPES)
+        self.assertIn("minority_balance", bot.MINI_GAME_TYPES)
+        self.assertNotEqual("balance", "minority_balance")
+        self.assertEqual(normal, disguised)
+        self.assertNotIn("소수", json.dumps(disguised, ensure_ascii=False))
+        self.assertEqual(bot.GAME_NAMES["minority_balance"], "밸런스 게임")
+
+        round_id = self.create_minority_balance_round([])
+        with bot.db() as conn:
+            row = conn.execute("SELECT * FROM rounds WHERE id = ?", (round_id,)).fetchone()
+        self.assertEqual(bot.round_game_key(row), "minority_balance")
+
+    def test_minority_balance_first_tally_keeps_votes_and_starts_revote(self) -> None:
+        round_id = self.create_minority_balance_round(
+            [("1", "A"), ("2", "A"), ("3", "B")]
+        )
+
+        transition = bot.start_minority_balance_revote(round_id)
+
+        self.assertIsNotNone(transition)
+        self.assertEqual(transition["first_a_count"], 2)
+        self.assertEqual(transition["first_b_count"], 1)
+        with bot.db() as conn:
+            row = conn.execute("SELECT * FROM rounds WHERE id = ?", (round_id,)).fetchone()
+            vote_count = conn.execute(
+                "SELECT COUNT(*) AS count FROM votes WHERE round_id = ?", (round_id,)
+            ).fetchone()["count"]
+        self.assertEqual(row["status"], "open")
+        self.assertEqual(bot.round_extra(row)["balance_phase"], "revote")
+        self.assertEqual(vote_count, 3)
+
+        rendered = json.dumps(
+            bot.build_minority_balance_revote_embed(
+                transition,
+                transition["first_a_count"],
+                transition["first_b_count"],
+                transition["close_at"],
+            ).to_dict(),
+            ensure_ascii=False,
+        )
+        self.assertIn("🅰️ 짜장", rendered)
+        self.assertIn("2명", rendered)
+        self.assertIn("인원이 더 적은 선택지", rendered)
+        self.assertIn("1차 선택은 그대로 유지", rendered)
+
+    def test_minority_balance_rewards_only_final_minority(self) -> None:
+        for user_id in ("1", "2", "3"):
+            self.add_user(user_id, f"참가자{user_id}", 0)
+        round_id = self.create_minority_balance_round(
+            [("1", "A"), ("2", "A"), ("3", "B")]
+        )
+        bot.start_minority_balance_revote(round_id)
+        with bot.db() as conn:
+            # 1번은 1차 선택(A)을 유지하고, 2번만 A에서 B로 바꾼다.
+            conn.execute(
+                """
+                INSERT INTO votes (round_id, user_id, choice, created_at, updated_at)
+                VALUES (?, ?, ?, '2026-01-01 00:01:00', '2026-01-01 00:01:00')
+                ON CONFLICT(round_id, user_id) DO UPDATE SET
+                    choice = excluded.choice,
+                    updated_at = excluded.updated_at
+                """,
+                (round_id, "2", "B"),
+            )
+
+        result = bot.close_round_record(round_id, None)
+
+        self.assertEqual(self.score_of("1"), 1)
+        self.assertEqual(self.score_of("2"), 0)
+        self.assertEqual(self.score_of("3"), 0)
+        self.assertIn("소수파 `A`", json.dumps(result[1].to_dict(), ensure_ascii=False))
+
+    def test_minority_balance_tie_and_empty_side_score_nothing(self) -> None:
+        for user_id in ("1", "2"):
+            self.add_user(user_id, f"참가자{user_id}", 0)
+
+        tied_round = self.create_minority_balance_round([])
+        bot.start_minority_balance_revote(tied_round)
+        with bot.db() as conn:
+            conn.executemany(
+                """
+                INSERT INTO votes (round_id, user_id, choice, created_at, updated_at)
+                VALUES (?, ?, ?, '2026-01-01', '2026-01-01')
+                """,
+                [(tied_round, "1", "A"), (tied_round, "2", "B")],
+            )
+        bot.close_round_record(tied_round, None)
+
+        empty_side_round = self.create_minority_balance_round([])
+        bot.start_minority_balance_revote(empty_side_round)
+        with bot.db() as conn:
+            conn.executemany(
+                """
+                INSERT INTO votes (round_id, user_id, choice, created_at, updated_at)
+                VALUES (?, ?, ?, '2026-01-01', '2026-01-01')
+                """,
+                [(empty_side_round, "1", "A"), (empty_side_round, "2", "A")],
+            )
+        bot.close_round_record(empty_side_round, None)
+
+        self.assertEqual(self.score_of("1"), 0)
+        self.assertEqual(self.score_of("2"), 0)
+
+    # --- 3선 폭탄 게임 ------------------------------------------------------
+
+    def create_defuse_round(self, votes: list[tuple[str, str]]) -> int:
+        wires = {
+            color["id"]: f"{color['emoji']} {color['name']}"
+            for color in bot.DEFUSE_COLORS
+        }
+        extra = {
+            "mode": "defuse4",
+            "wires": wires,
+            "settlement_rule": "top_vote_penalty",
+        }
+        with bot.db() as conn:
+            cursor = conn.execute(
+                """
+                INSERT INTO rounds
+                    (type, title, question, status, channel_id, extra_json, created_at)
+                VALUES ('bomb', '3선 폭탄', '3선 폭탄', 'open', '10', ?, '2026-01-01 00:00:00')
+                """,
+                (json.dumps(extra, ensure_ascii=False),),
+            )
+            round_id = int(cursor.lastrowid)
+            conn.executemany(
+                """
+                INSERT INTO votes (round_id, user_id, choice, created_at, updated_at)
+                VALUES (?, ?, ?, '2026-01-01 00:00:00', '2026-01-01 00:00:00')
+                """,
+                [(round_id, user_id, choice) for user_id, choice in votes],
+            )
+        return round_id
+
+    def test_defuse_penalizes_only_unique_top_voters(self) -> None:
+        for user_id in ("1", "2", "3", "4"):
+            self.add_user(user_id, f"참가자 {user_id}", 0)
+        round_id = self.create_defuse_round(
+            [("1", "red"), ("2", "red"), ("3", "blue"), ("4", "green")]
+        )
+
+        result = bot.close_round_record(round_id, None)
+
+        self.assertEqual(self.score_of("1"), -1)
+        self.assertEqual(self.score_of("2"), -1)
+        self.assertEqual(self.score_of("3"), 0)
+        self.assertEqual(self.score_of("4"), 0)
+        rendered = json.dumps(result[1].to_dict(), ensure_ascii=False)
+        self.assertIn("최다 득표 선을 고른 2명 전원 -1점", rendered)
+
+    def test_defuse_two_way_top_tie_penalizes_both_lines(self) -> None:
+        for user_id in ("1", "2", "3", "4", "5"):
+            self.add_user(user_id, f"참가자 {user_id}", 0)
+        round_id = self.create_defuse_round(
+            [
+                ("1", "red"),
+                ("2", "red"),
+                ("3", "blue"),
+                ("4", "blue"),
+                ("5", "green"),
+            ]
+        )
+
+        result = bot.close_round_record(round_id, None)
+
+        for user_id in ("1", "2", "3", "4"):
+            self.assertEqual(self.score_of(user_id), -1)
+        self.assertEqual(self.score_of("5"), 0)
+        rendered = json.dumps(result[1].to_dict(), ensure_ascii=False)
+        self.assertIn("공동 1위 2개 선이 모두 폭발", rendered)
+
+    def test_defuse_three_way_top_tie_penalizes_every_voter(self) -> None:
+        for user_id in ("1", "2", "3"):
+            self.add_user(user_id, f"참가자 {user_id}", 0)
+        round_id = self.create_defuse_round(
+            [("1", "red"), ("2", "blue"), ("3", "green")]
+        )
+
+        result = bot.close_round_record(round_id, None)
+
+        for user_id in ("1", "2", "3"):
+            self.assertEqual(self.score_of(user_id), -1)
+        rendered = json.dumps(result[1].to_dict(), ensure_ascii=False)
+        self.assertIn("공동 1위 3개 선이 모두 폭발", rendered)
+
+    def test_defuse_without_votes_scores_nothing(self) -> None:
+        self.add_user("1", "참가자", 3)
+        round_id = self.create_defuse_round([])
+
+        result = bot.close_round_record(round_id, None)
+
+        self.assertEqual(self.score_of("1"), 3)
+        rendered = json.dumps(result[1].to_dict(), ensure_ascii=False)
+        self.assertIn("투표가 없어 점수 변동이 없습니다", rendered)
+
+    def test_legacy_defuse_round_still_uses_its_safe_wire(self) -> None:
+        self.add_user("1", "참가자", 0)
+        self.add_user("2", "참가자", 0)
+        extra = {
+            "mode": "defuse4",
+            "wires": {"red": "🟥 빨강", "black": "⬛ 검정"},
+            "safe_wire_ids": ["black"],
+            "hint": "구방식 힌트",
+        }
+        with bot.db() as conn:
+            cursor = conn.execute(
+                """
+                INSERT INTO rounds
+                    (type, title, question, status, channel_id, extra_json, created_at)
+                VALUES ('bomb', '구방식 폭탄', '구방식 폭탄', 'open', '10', ?, '2026-01-01 00:00:00')
+                """,
+                (json.dumps(extra, ensure_ascii=False),),
+            )
+            round_id = int(cursor.lastrowid)
+            conn.executemany(
+                """
+                INSERT INTO votes (round_id, user_id, choice, created_at, updated_at)
+                VALUES (?, ?, ?, '2026-01-01 00:00:00', '2026-01-01 00:00:00')
+                """,
+                [(round_id, "1", "black"), (round_id, "2", "red")],
+            )
+
+        bot.close_round_record(round_id, None)
+
+        self.assertEqual(self.score_of("1"), 1)
+        self.assertEqual(self.score_of("2"), 0)
+
     # --- 상위 3명 -----------------------------------------------------------
 
     def create_top3_round(self, votes: list[tuple[str, str]]) -> int:
@@ -590,6 +1151,98 @@ class BotRegressionTests(unittest.TestCase):
 
         self.assertEqual(self.score_of("2"), 8)
         self.assertEqual(self.score_of("1"), 9)
+
+    # --- 유일 숫자 게임 ----------------------------------------------------
+
+    def create_unique_number_round(self, votes: list[tuple[str, str]]) -> int:
+        with bot.db() as conn:
+            cursor = conn.execute(
+                """
+                INSERT INTO rounds (type, title, question, status, channel_id, extra_json, created_at)
+                VALUES ('grid', '유일 숫자', '유일 숫자', 'open', '10', ?,
+                        '2026-01-01 00:00:00')
+                """,
+                (json.dumps({"mode": "unique_number"}),),
+            )
+            round_id = int(cursor.lastrowid)
+            conn.executemany(
+                """
+                INSERT INTO votes (round_id, user_id, choice, created_at, updated_at)
+                VALUES (?, ?, ?, '2026-01-01 00:00:00', '2026-01-01 00:00:00')
+                """,
+                [(round_id, user_id, choice) for user_id, choice in votes],
+            )
+        return round_id
+
+    def test_unique_number_example_rewards_nine_after_duplicate_elevens_are_removed(self) -> None:
+        for user_id in ("1", "2", "3", "4", "5"):
+            self.add_user(user_id, f"참가자{user_id}", 0)
+        round_id = self.create_unique_number_round(
+            [("1", "4"), ("2", "6"), ("3", "9"), ("4", "11"), ("5", "11")]
+        )
+
+        result = bot.close_round_record(round_id, None)
+
+        self.assertIsNotNone(result)
+        self.assertEqual(self.score_of("1"), 0)
+        self.assertEqual(self.score_of("2"), 0)
+        self.assertEqual(self.score_of("3"), 2)
+        self.assertEqual(self.score_of("4"), 0)
+        self.assertEqual(self.score_of("5"), 0)
+        rendered = json.dumps(result[1].to_dict(), ensure_ascii=False)
+        self.assertIn("최고 유일 숫자 **9**", rendered)
+        self.assertIn("**+2점**", rendered)
+        self.assertIn("중복 제외", rendered)
+
+    def test_unique_number_reward_tiers(self) -> None:
+        expected = {
+            1: 1,
+            5: 1,
+            6: 2,
+            10: 2,
+            11: 3,
+            15: 3,
+        }
+        for number, points in expected.items():
+            with self.subTest(number=number):
+                self.assertEqual(bot.unique_number_reward(number), points)
+
+    def test_unique_number_all_duplicates_score_nothing(self) -> None:
+        for user_id in ("1", "2", "3", "4"):
+            self.add_user(user_id, f"참가자{user_id}", 0)
+        round_id = self.create_unique_number_round(
+            [("1", "15"), ("2", "15"), ("3", "4"), ("4", "4")]
+        )
+
+        result = bot.close_round_record(round_id, None)
+
+        for user_id in ("1", "2", "3", "4"):
+            self.assertEqual(self.score_of(user_id), 0)
+        self.assertIn(
+            "모든 선택 숫자가 중복",
+            json.dumps(result[1].to_dict(), ensure_ascii=False),
+        )
+
+    def test_unique_number_view_uses_three_rows_of_five_buttons(self) -> None:
+        buttons = bot.unique_number_vote_view(7).children
+
+        self.assertEqual(len(buttons), 15)
+        self.assertEqual([button.row for button in buttons], [0] * 5 + [1] * 5 + [2] * 5)
+        self.assertEqual(
+            {button.custom_id for button in buttons},
+            {f"eventbot:vote:7:{number}" for number in range(1, 16)},
+        )
+        rendered = json.dumps(bot.build_unique_number_embed(7, "숫자").to_dict(), ensure_ascii=False)
+        self.assertIn("중복되지 않은 숫자 중", rendered)
+        self.assertIn("11~15: **+3점**", rendered)
+
+    def test_unique_number_round_uses_mode_to_distinguish_it_from_legacy_grid(self) -> None:
+        round_id = self.create_unique_number_round([])
+        with bot.db() as conn:
+            row = conn.execute("SELECT * FROM rounds WHERE id = ?", (round_id,)).fetchone()
+
+        self.assertEqual(row["type"], "grid")
+        self.assertEqual(bot.round_game_key(row), "unique_number")
 
     # --- 신뢰 거래 ----------------------------------------------------------
 
@@ -742,6 +1395,46 @@ class BotRegressionTests(unittest.TestCase):
 
     # --- 익명 발언 ----------------------------------------------------------
 
+    def test_anonymous_message_embed_uses_stable_number_color(self) -> None:
+        first = bot.build_anonymous_message_embed(1, "첫 발언").to_dict()
+        same_user_next_post = bot.build_anonymous_message_embed(1, "다음 발언").to_dict()
+        second = bot.build_anonymous_message_embed(2, "다른 발언").to_dict()
+
+        self.assertNotIn("title", first)
+        self.assertNotIn("title", second)
+        self.assertEqual(first["description"], "첫 발언")
+        self.assertEqual(first["color"], same_user_next_post["color"])
+        self.assertNotEqual(first["color"], second["color"])
+
+    def test_anonymous_message_embed_reuses_palette_safely(self) -> None:
+        palette_size = len(bot.ANONYMOUS_EMBED_COLORS)
+
+        self.assertEqual(palette_size, 20)
+        self.assertEqual(len(set(bot.ANONYMOUS_EMBED_COLORS)), palette_size)
+
+        def rgb(color: int) -> tuple[int, int, int]:
+            return ((color >> 16) & 0xFF, (color >> 8) & 0xFF, color & 0xFF)
+
+        def distance(left: int, right: int) -> float:
+            return sum(
+                (left_channel - right_channel) ** 2
+                for left_channel, right_channel in zip(rgb(left), rgb(right))
+            ) ** 0.5
+
+        adjacent_distances = [
+            distance(left, right)
+            for left, right in zip(
+                bot.ANONYMOUS_EMBED_COLORS,
+                bot.ANONYMOUS_EMBED_COLORS[1:],
+            )
+        ]
+        self.assertGreater(min(adjacent_distances), 100)
+
+        first = bot.build_anonymous_message_embed(1, "발언").to_dict()
+        wrapped = bot.build_anonymous_message_embed(palette_size + 1, "발언").to_dict()
+
+        self.assertEqual(first["color"], wrapped["color"])
+
     def test_anonymous_numbers_are_stable_per_user(self) -> None:
         with bot.db() as conn:
             cursor = conn.execute(
@@ -782,6 +1475,7 @@ class BotRegressionTests(unittest.TestCase):
         self.assertNotIn("grid", bot.MINI_GAME_TYPES)
         self.assertNotIn("grid", bot.GAME_NAMES)
         self.assertFalse(hasattr(bot, "build_grid_embed"))
+        self.assertIn("unique_number", bot.MINI_GAME_TYPES)
 
     def test_legacy_grid_round_closes_without_scoring(self) -> None:
         """CHECK 제약에 남아 있는 옛 grid 라운드가 열려 있어도 마감이 터지지 않아야 한다."""
@@ -819,14 +1513,30 @@ class BotRegressionTests(unittest.TestCase):
         self.assertIn("eventbot:anonymous:7", thread_ids)
 
     def test_defuse_thread_view_fits_in_one_action_row(self) -> None:
-        """색 4개 + 익명 1개 = 5개. 한 줄에 5개가 상한이라 하나만 더 늘어도 터진다."""
+        """색 3개 + 익명 1개가 한 줄에 들어가며, 현재 세 색만 투표할 수 있어야 한다."""
         buttons = bot.thread_discussion_view(7, "defuse4").children
 
-        self.assertEqual(len(buttons), 5)
+        self.assertEqual(len(buttons), 4)
         self.assertEqual(
             {button.custom_id for button in buttons if button.custom_id.startswith("eventbot:vote")},
             {f"eventbot:vote:7:{color['id']}" for color in bot.DEFUSE_COLORS},
         )
+
+    def test_defuse_setup_only_asks_for_title_and_duration(self) -> None:
+        modal = bot.StartSetupModal("defuse4", standalone_mini_game=True)
+
+        self.assertEqual(len(modal.children), 2)
+        self.assertFalse(hasattr(modal, "safe_color"))
+        self.assertFalse(hasattr(modal, "defuse_hint"))
+
+    def test_defuse_rules_explain_top_vote_and_tie_penalties(self) -> None:
+        rendered = json.dumps(
+            bot.build_defuse_embed(7, "폭탄").to_dict(), ensure_ascii=False
+        )
+
+        self.assertIn("가장 많은 표를 받은 선이 폭발", rendered)
+        self.assertIn("공동 1위인 선이 모두 폭발", rendered)
+        self.assertIn("-1점", rendered)
 
     def test_round_game_key_maps_bomb_rows_back_to_defuse4(self) -> None:
         with bot.db() as conn:

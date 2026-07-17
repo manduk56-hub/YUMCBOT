@@ -81,6 +81,20 @@ class FreshDatabaseTest(unittest.TestCase):
         self.assertIn("anon_number", columns)
         self.assertIn("content", columns)
 
+    def test_russian_roulette_table_is_created(self) -> None:
+        """v4 마이그레이션. 재시작 뒤에도 1:1 게임 상태와 예치금을 복구할 수 있어야 한다."""
+        bot.init_db()
+        with bot.db() as conn:
+            columns = {
+                row["name"]
+                for row in conn.execute(
+                    "PRAGMA table_info(russian_roulette_games)"
+                ).fetchall()
+            }
+        self.assertIn("challenger_bet", columns)
+        self.assertIn("live_chamber", columns)
+        self.assertIn("winner_id", columns)
+
     def test_init_db_is_idempotent(self) -> None:
         bot.init_db()
         bot.init_db()
