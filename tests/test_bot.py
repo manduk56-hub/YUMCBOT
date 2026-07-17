@@ -1190,7 +1190,7 @@ class BotRegressionTests(unittest.TestCase):
         rendered = json.dumps(result[1].to_dict(), ensure_ascii=False)
         self.assertIn("최고 유일 숫자 **9**", rendered)
         self.assertIn("**+2점**", rendered)
-        self.assertIn("중복 제외", rendered)
+        self.assertIn("중복 숫자 선택", rendered)
 
     def test_unique_number_reward_tiers(self) -> None:
         expected = {
