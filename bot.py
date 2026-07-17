@@ -5010,18 +5010,22 @@ def close_round_record(
                     round_row["id"],
                 )
 
+            # 마커 이모지+라벨을 줄 맨 앞에 둬서 우승/중복/유일이 한눈에 구분되게 한다.
             result_lines = []
             for number in sorted(grouped, reverse=True):
                 users = grouped[number]
                 if number == winning_number:
-                    marker = "🏆 최고 유일 숫자"
+                    result_lines.append(
+                        f"🏆최고 유일 숫자 : {number} · {mention_list(users)}"
+                    )
                 elif len(users) > 1:
-                    marker = "중복 제외"
+                    result_lines.append(
+                        f"❌중복 숫자 선택 : {number} · {mention_list(users)}"
+                    )
                 else:
-                    marker = "유일 숫자"
-                result_lines.append(
-                    f"**{number}** · {len(users)}명 · {marker} · {mention_list(users)}"
-                )
+                    result_lines.append(
+                        f"▫️유일하기만 한 숫자 : {number} · {mention_list(users)}"
+                    )
 
             embed = discord.Embed(
                 title=f"결과 · {round_row['title']}",
@@ -5029,10 +5033,11 @@ def close_round_record(
                 color=discord.Color.green() if winner_id else discord.Color.light_grey(),
             )
             embed.add_field(
-                name="숫자별 선택 결과",
+                name="🔢 숫자별 결과",
                 value=field_text(result_lines, empty="선택한 사람이 없습니다."),
                 inline=False,
             )
+            add_field_divider(embed)
             if winner_id is None:
                 settlement = (
                     "선택한 사람이 없어 점수가 지급되지 않았습니다."
@@ -5041,7 +5046,7 @@ def close_round_record(
                 )
             else:
                 settlement = f"<@{winner_id}>님이 최고 유일 숫자 **{winning_number}**으로 **+{reward}점**"
-            embed.add_field(name="정산", value=settlement, inline=False)
+            embed.add_field(name="💰 정산", value=settlement, inline=False)
         elif round_row["type"] == "trust":
             vote_choices = {str(row["user_id"]): str(row["choice"]) for row in votes}
             pairs = conn.execute(
