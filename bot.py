@@ -88,10 +88,10 @@ GAME_NAMES = {
     # 참가자에게는 1차 집계가 끝날 때까지 일반 밸런스 게임으로 보여야 한다.
     "minority_balance": "밸런스 게임",
     # DB 호환을 위해 내부 키는 defuse4를 유지하지만 현재 규칙은 3선 방식이다.
-    "defuse4": "3선 폭탄 게임",
+    "defuse4": "몰리면 터진다!",
     "cutting": "돌 세공 예측",
     "top3": "상위 3명 견제",
-    "unique_number": "유일 숫자 게임",
+    "unique_number": "홍피겔만의 황금금고",
     "trust": "딜레마의 섬",
     "sand": "모래성 게임",
 }
@@ -3784,7 +3784,7 @@ class EventBot(discord.Client):
             game_key = round_game_key(round_row)
             if game_key == "unique_number" and choice not in UNIQUE_NUMBER_CHOICES:
                 await interaction.response.send_message(
-                    "유일 숫자 게임에서는 1~15 중 하나만 선택할 수 있습니다.",
+                    "홍피겔만의 황금금고에서는 1~15 중 하나만 선택할 수 있습니다.",
                     ephemeral=True,
                 )
                 return
@@ -4116,7 +4116,7 @@ def build_top3_embed(round_id: int, title: str, candidates: list[dict[str, Any]]
 def unique_number_reward(number: int) -> int:
     """1~5는 1점, 6~10은 2점, 11~15는 3점이다."""
     if not 1 <= number <= 15:
-        raise ValueError("유일 숫자 게임의 숫자는 1~15여야 합니다.")
+        raise ValueError("홍피겔만의 황금금고의 숫자는 1~15여야 합니다.")
     return ((number - 1) // 5) + 1
 
 
@@ -5593,10 +5593,10 @@ async def open_event(interaction: discord.Interaction) -> None:
     미니게임=[
         app_commands.Choice(name="밸런스 게임", value="balance"),
         app_commands.Choice(name="소수파 밸런스 (1차 위장)", value="minority_balance"),
-        app_commands.Choice(name="3선 폭탄 게임", value="defuse4"),
+        app_commands.Choice(name="몰리면 터진다!", value="defuse4"),
         app_commands.Choice(name="돌 세공 예측", value="cutting"),
         app_commands.Choice(name="상위 3명 견제", value="top3"),
-        app_commands.Choice(name="유일 숫자 게임", value="unique_number"),
+        app_commands.Choice(name="홍피겔만의 황금금고", value="unique_number"),
     ],
 )
 @app_commands.describe(메인게임="먼저 진행할 메인게임", 미니게임="메인게임 뒤에 진행할 미니게임")
@@ -5625,10 +5625,10 @@ async def start(interaction: discord.Interaction, 메인게임: str, 미니게�
     게임=[
         app_commands.Choice(name="밸런스 게임", value="balance"),
         app_commands.Choice(name="소수파 밸런스 (1차 위장)", value="minority_balance"),
-        app_commands.Choice(name="3선 폭탄 게임", value="defuse4"),
+        app_commands.Choice(name="몰리면 터진다!", value="defuse4"),
         app_commands.Choice(name="돌 세공 예측", value="cutting"),
         app_commands.Choice(name="상위 3명 견제", value="top3"),
-        app_commands.Choice(name="유일 숫자 게임", value="unique_number"),
+        app_commands.Choice(name="홍피겔만의 황금금고", value="unique_number"),
     ]
 )
 @app_commands.describe(게임="바로 시작할 미니게임")
