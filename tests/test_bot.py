@@ -710,11 +710,9 @@ class BotRegressionTests(unittest.TestCase):
         channel_id, embed = result
         self.assertEqual(channel_id, "10")
         rendered = json.dumps(embed.to_dict(), ensure_ascii=False)
-        self.assertIn("이벤트 종료 · 최종 결과 요약", rendered)
-        self.assertIn(f"#{main_round_id}", rendered)
-        self.assertIn("딜레마의 섬", rendered)
-        self.assertIn("밸런스 게임", rendered)
-        self.assertIn("점수 합계 **+1점**", rendered)
+        self.assertIn("이벤트 종료", rendered)
+        self.assertIn("예정된 게임이 모두 종료", rendered)
+        self.assertIn("수고하셨습니다", rendered)
         with bot.db() as conn:
             event_row = conn.execute(
                 "SELECT status, closed_at FROM event_sessions WHERE id = ?", (event_id,)

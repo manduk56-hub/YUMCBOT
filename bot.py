@@ -747,82 +747,26 @@ def build_event_summary_embed(
     *,
     force_closed: bool = False,
 ) -> discord.Embed:
-    """종료 시점에 메인 채널에 남길 이벤트 단위 최종 요약."""
-    participant_count = int(
-        conn.execute(
-            "SELECT COUNT(*) AS count FROM event_participants WHERE event_session_id = ?",
-            (int(event_row["id"]),),
-        ).fetchone()["count"]
-    )
-    score_by_round: dict[int, tuple[int, int]] = {}
-    if round_rows:
-        placeholders = ", ".join("?" for _ in round_rows)
-        score_rows = conn.execute(
-            f"""
-            SELECT round_id, COALESCE(SUM(delta), 0) AS delta,
-                   COUNT(DISTINCT user_id) AS affected_users
-            FROM score_logs
-            WHERE round_id IN ({placeholders})
-            GROUP BY round_id
-            """,
-            tuple(int(row["id"]) for row in round_rows),
-        ).fetchall()
-        score_by_round = {
-            int(row["round_id"]): (int(row["delta"]), int(row["affected_users"]))
-            for row in score_rows
-        }
-
-    result_lines: list[str] = []
-    completed_count = 0
-    cancelled_count = 0
-    for round_row in round_rows:
-        extra = round_extra(round_row)
-        was_cancelled = bool(extra.get("force_closed")) or (
-            extra.get("trust_phase") == "cancelled" or extra.get("sand_phase") == "cancelled"
+    """종료 시점에 메인 채널에 남길 이벤트 종료 알림. 세부 정산은 각 게임 메시지에 이미 있다."""
+    if force_closed:
+        return discord.Embed(
+            title="⛔ 이벤트 강제 종료",
+            description=(
+                "남은 게임을 정산하지 않고 이벤트를 종료했습니다.\n"
+                "진행 기록과 스레드는 그대로 보관됩니다.\n"
+                "수고하셨습니다!"
+            ),
+            color=discord.Color.orange(),
         )
-        if was_cancelled:
-            status_text = "취소"
-            cancelled_count += 1
-        elif round_row["type"] == "cutting" and "cutting_result_level" not in extra:
-            status_text = "결과 미확정"
-        else:
-            status_text = "완료"
-            completed_count += 1
-
-        delta, affected_users = score_by_round.get(int(round_row["id"]), (0, 0))
-        delta_text = f"+{delta}" if delta > 0 else str(delta)
-        result_lines.append(
-            f"`#{round_row['id']}` **{GAME_NAMES.get(round_game_key(round_row), round_game_key(round_row))}**"
-            f" · {round_row['title']}\n"
-            f"　└ {status_text} · 점수 합계 **{delta_text}점** ({affected_users}명 반영)"
-        )
-
-    ended_at = str(event_row["closed_at"] or now_text())
-    embed = discord.Embed(
-        title="⛔ 이벤트 강제 종료 · 최종 요약" if force_closed else "🏁 이벤트 종료 · 최종 결과 요약",
+    return discord.Embed(
+        title="🏁 이벤트 종료",
         description=(
-            "남은 게임을 정산하지 않고 이벤트를 종료했습니다. 진행 기록과 스레드는 그대로 보관됩니다."
-            if force_closed
-            else "예정된 게임이 모두 종료되었습니다. 진행 기록과 최종 정산 현황을 확인하세요."
+            "예정된 게임이 모두 종료되었습니다.\n"
+            "세부 결과는 각 게임 메시지와 보관된 스레드에서 확인할 수 있습니다.\n"
+            "수고하셨습니다!"
         ),
-        color=discord.Color.orange() if force_closed else discord.Color.gold(),
+        color=discord.Color.gold(),
     )
-    embed.add_field(
-        name="📊 이벤트 현황",
-        value=(
-            f"참가자 **{participant_count}명** · 완료 **{completed_count}개**"
-            f"{f' · 취소 **{cancelled_count}개**' if cancelled_count else ''}\n"
-            f"> 시작: {event_row['created_at']}\n> 종료: {ended_at}"
-        ),
-        inline=False,
-    )
-    embed.add_field(
-        name="🎮 진행한 게임 최종 결과",
-        value=field_text(result_lines, empty="진행된 게임이 없습니다."),
-        inline=False,
-    )
-    embed.set_footer(text=f"이벤트 #{event_row['id']} · 세부 결과는 각 게임 메시지와 보관된 스레드에서 확인할 수 있습니다.")
-    return embed
 
 
 def close_completed_event(event_session_id: int) -> tuple[str, discord.Embed] | None:
@@ -910,6 +854,15 @@ def mention_list(user_ids: list[str], limit: int = 40, sep: str = ", ") -> str:
     mentions = [f"<@{user_id}>" for user_id in user_ids[:limit]]
     suffix = f"\n외 {len(user_ids) - limit}명" if len(user_ids) > limit else ""
     return sep.join(mentions) + suffix
+
+
+def add_field_divider(embed: discord.Embed) -> None:
+    """임베드 필드 사이에 가로 구분선을 넣어 섹션 경계를 분명히 한다.
+
+    임베드는 필드 사이에 굵은 가로줄을 못 넣으므로, 이름이 빈(폭 0 공백) 전체폭 필드에
+    선 문자를 채워 대신한다.
+    """
+    embed.add_field(name="​", value="━" * 15, inline=False)
 
 
 def format_my_score_message(third_score: int | None, my_score: int) -> str:
@@ -4959,6 +4912,7 @@ def close_round_record(
                     value=f"**{exploded_names}**" if exploded_wire_ids else "없음 (투표 없음)",
                     inline=False,
                 )
+                add_field_divider(embed)
                 # 세 선을 inline 필드로 나란히(가로) 배치한다. 폭발선은 위 헤드라인이 알려주므로
                 # 이름은 색만, 값은 선택자 멘션을 세로로 쌓아 칸을 좁게 유지한다(모바일에서 가로로 잘 붙게).
                 for wire_id, wire_name in wires.items():
@@ -4968,6 +4922,7 @@ def close_round_record(
                         value=mention_list(users, sep="\n"),
                         inline=True,
                     )
+                add_field_divider(embed)
 
                 if not penalized_users:
                     settlement = "투표가 없어 점수 변동이 없습니다."
