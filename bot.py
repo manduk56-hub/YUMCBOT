@@ -904,12 +904,12 @@ def can_join_round(conn: sqlite3.Connection, round_id: int, user_id: str) -> boo
     return is_event_participant(conn, int(event_session_id), user_id)
 
 
-def mention_list(user_ids: list[str], limit: int = 40) -> str:
+def mention_list(user_ids: list[str], limit: int = 40, sep: str = ", ") -> str:
     if not user_ids:
         return "없음"
     mentions = [f"<@{user_id}>" for user_id in user_ids[:limit]]
     suffix = f"\n외 {len(user_ids) - limit}명" if len(user_ids) > limit else ""
-    return ", ".join(mentions) + suffix
+    return sep.join(mentions) + suffix
 
 
 def format_my_score_message(third_score: int | None, my_score: int) -> str:
@@ -4959,20 +4959,15 @@ def close_round_record(
                     value=f"**{exploded_names}**" if exploded_wire_ids else "없음 (투표 없음)",
                     inline=False,
                 )
-                # 선마다 💥/✅를 줄 맨 앞에 붙여 폭발선이 한눈에 튀게 하고, 선택자는 ┗로 묶는다.
-                tally_blocks = []
+                # 세 선을 inline 필드로 나란히(가로) 배치한다. 폭발선은 위 헤드라인이 알려주므로
+                # 이름은 색만, 값은 선택자 멘션을 세로로 쌓아 칸을 좁게 유지한다(모바일에서 가로로 잘 붙게).
                 for wire_id, wire_name in wires.items():
                     users = grouped.get(wire_id, [])
-                    mark = "💥" if wire_id in exploded_wire_ids else "✅"
-                    tally_blocks.append(
-                        f"{mark} **{wire_name}** — {len(users)}명\n"
-                        f"┗ {mention_list(users)}"
+                    embed.add_field(
+                        name=wire_name,
+                        value=mention_list(users, sep="\n"),
+                        inline=True,
                     )
-                embed.add_field(
-                    name="📊 선별 집계",
-                    value="\n\n".join(tally_blocks),
-                    inline=False,
-                )
 
                 if not penalized_users:
                     settlement = "투표가 없어 점수 변동이 없습니다."
