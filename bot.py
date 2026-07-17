@@ -4127,17 +4127,17 @@ def build_unique_number_embed(round_id: int, title: str) -> discord.Embed:
         color=discord.Color.purple(),
     )
     embed.add_field(
-        name="배점",
-        value="1~5: **+1점** · 6~10: **+2점** · 11~15: **+3점**",
+        name="📜 규칙",
+        value=(
+            "> 👥 같은 숫자를 고른 사람이 2명 이상이면 그 숫자의 선택자는 모두 제외됩니다.\n"
+            "> 🏆 중복되지 않은 숫자 중 **가장 높은 숫자**를 고른 단 한 명만 해당 구간의 점수를 받습니다.\n"
+            "> ❌ 중복되지 않은 숫자가 없으면 점수는 지급되지 않습니다."
+        ),
         inline=False,
     )
     embed.add_field(
-        name="규칙",
-        value=(
-            "같은 숫자를 고른 사람이 2명 이상이면 그 숫자의 선택자는 모두 제외됩니다.\n"
-            "중복되지 않은 숫자 중 **가장 높은 숫자**를 고른 단 한 명만 해당 구간의 점수를 받습니다.\n"
-            "중복되지 않은 숫자가 없으면 점수는 지급되지 않습니다."
-        ),
+        name="🎯 배점",
+        value="```\n1~5     +1점\n6~10    +2점\n11~15   +3점\n```",
         inline=False,
     )
     return embed
@@ -4951,29 +4951,28 @@ def close_round_record(
                     description=round_row["title"],
                     color=discord.Color.red() if penalized_users else discord.Color.light_grey(),
                 )
+                exploded_names = ", ".join(
+                    wires[wire_id] for wire_id in wires if wire_id in exploded_wire_ids
+                )
                 embed.add_field(
                     name="💥 폭발한 선",
-                    value=(
-                        "**"
-                        + ", ".join(
-                            wires[wire_id]
-                            for wire_id in wires
-                            if wire_id in exploded_wire_ids
-                        )
-                        + "**"
-                        if exploded_wire_ids
-                        else "없음 (투표 없음)"
-                    ),
+                    value=f"**{exploded_names}**" if exploded_wire_ids else "없음 (투표 없음)",
                     inline=False,
                 )
+                # 선마다 💥/✅를 줄 맨 앞에 붙여 폭발선이 한눈에 튀게 하고, 선택자는 ┗로 묶는다.
+                tally_blocks = []
                 for wire_id, wire_name in wires.items():
                     users = grouped.get(wire_id, [])
-                    marker = "💥 폭발" if wire_id in exploded_wire_ids else "✅ 안전"
-                    embed.add_field(
-                        name=f"{wire_name} ({marker})",
-                        value=f"**{len(users)}명**\n{mention_list(users)}",
-                        inline=False,
+                    mark = "💥" if wire_id in exploded_wire_ids else "✅"
+                    tally_blocks.append(
+                        f"{mark} **{wire_name}** — {len(users)}명\n"
+                        f"┗ {mention_list(users)}"
                     )
+                embed.add_field(
+                    name="📊 선별 집계",
+                    value="\n\n".join(tally_blocks),
+                    inline=False,
+                )
 
                 if not penalized_users:
                     settlement = "투표가 없어 점수 변동이 없습니다."
