@@ -904,12 +904,12 @@ def can_join_round(conn: sqlite3.Connection, round_id: int, user_id: str) -> boo
     return is_event_participant(conn, int(event_session_id), user_id)
 
 
-def mention_list(user_ids: list[str], limit: int = 40) -> str:
+def mention_list(user_ids: list[str], limit: int = 40, sep: str = ", ") -> str:
     if not user_ids:
         return "없음"
     mentions = [f"<@{user_id}>" for user_id in user_ids[:limit]]
     suffix = f"\n외 {len(user_ids) - limit}명" if len(user_ids) > limit else ""
-    return ", ".join(mentions) + suffix
+    return sep.join(mentions) + suffix
 
 
 def format_my_score_message(third_score: int | None, my_score: int) -> str:
@@ -4127,17 +4127,17 @@ def build_unique_number_embed(round_id: int, title: str) -> discord.Embed:
         color=discord.Color.purple(),
     )
     embed.add_field(
-        name="배점",
-        value="1~5: **+1점** · 6~10: **+2점** · 11~15: **+3점**",
+        name="📜 규칙",
+        value=(
+            "> 👥 같은 숫자를 고른 사람이 2명 이상이면 그 숫자의 선택자는 모두 제외됩니다.\n"
+            "> 🏆 중복되지 않은 숫자 중 **가장 높은 숫자**를 고른 단 한 명만 해당 구간의 점수를 받습니다.\n"
+            "> ❌ 중복되지 않은 숫자가 없으면 점수는 지급되지 않습니다."
+        ),
         inline=False,
     )
     embed.add_field(
-        name="규칙",
-        value=(
-            "같은 숫자를 고른 사람이 2명 이상이면 그 숫자의 선택자는 모두 제외됩니다.\n"
-            "중복되지 않은 숫자 중 **가장 높은 숫자**를 고른 단 한 명만 해당 구간의 점수를 받습니다.\n"
-            "중복되지 않은 숫자가 없으면 점수는 지급되지 않습니다."
-        ),
+        name="🎯 배점",
+        value="```\n1~5     +1점\n6~10    +2점\n11~15   +3점\n```",
         inline=False,
     )
     return embed
@@ -4951,28 +4951,22 @@ def close_round_record(
                     description=round_row["title"],
                     color=discord.Color.red() if penalized_users else discord.Color.light_grey(),
                 )
+                exploded_names = ", ".join(
+                    wires[wire_id] for wire_id in wires if wire_id in exploded_wire_ids
+                )
                 embed.add_field(
                     name="💥 폭발한 선",
-                    value=(
-                        "**"
-                        + ", ".join(
-                            wires[wire_id]
-                            for wire_id in wires
-                            if wire_id in exploded_wire_ids
-                        )
-                        + "**"
-                        if exploded_wire_ids
-                        else "없음 (투표 없음)"
-                    ),
+                    value=f"**{exploded_names}**" if exploded_wire_ids else "없음 (투표 없음)",
                     inline=False,
                 )
+                # 세 선을 inline 필드로 나란히(가로) 배치한다. 폭발선은 위 헤드라인이 알려주므로
+                # 이름은 색만, 값은 선택자 멘션을 세로로 쌓아 칸을 좁게 유지한다(모바일에서 가로로 잘 붙게).
                 for wire_id, wire_name in wires.items():
                     users = grouped.get(wire_id, [])
-                    marker = "💥 폭발" if wire_id in exploded_wire_ids else "✅ 안전"
                     embed.add_field(
-                        name=f"{wire_name} ({marker})",
-                        value=f"**{len(users)}명**\n{mention_list(users)}",
-                        inline=False,
+                        name=wire_name,
+                        value=mention_list(users, sep="\n"),
+                        inline=True,
                     )
 
                 if not penalized_users:

@@ -1234,7 +1234,8 @@ class BotRegressionTests(unittest.TestCase):
         )
         rendered = json.dumps(bot.build_unique_number_embed(7, "숫자").to_dict(), ensure_ascii=False)
         self.assertIn("중복되지 않은 숫자 중", rendered)
-        self.assertIn("11~15: **+3점**", rendered)
+        self.assertIn("11~15", rendered)
+        self.assertIn("+3점", rendered)
 
     def test_unique_number_round_uses_mode_to_distinguish_it_from_legacy_grid(self) -> None:
         round_id = self.create_unique_number_round([])
