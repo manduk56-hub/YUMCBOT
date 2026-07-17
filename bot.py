@@ -1027,11 +1027,12 @@ def thread_discussion_view(round_id: int, game_key: str) -> discord.ui.View:
     채널에서 누르든 스레드에서 누르든 마지막 선택 하나만 남는다.
     """
     view = discord.ui.View(timeout=None)
-    vote_buttons = (
-        vote_view(round_id, BALANCE_VOTE_CHOICES)
-        if game_key in {"balance", "minority_balance"}
-        else defuse_vote_view(round_id)
-    )
+    if game_key in {"balance", "minority_balance"}:
+        vote_buttons = vote_view(round_id, BALANCE_VOTE_CHOICES)
+    elif game_key == "unique_number":
+        vote_buttons = unique_number_vote_view(round_id)
+    else:
+        vote_buttons = defuse_vote_view(round_id)
     for button in [*vote_buttons.children, *anonymous_discussion_view(round_id).children]:
         view.add_item(button)
     return view
@@ -4084,7 +4085,8 @@ def build_unique_number_embed(round_id: int, title: str) -> discord.Embed:
         value=(
             "> 👥 같은 숫자를 고른 사람이 2명 이상이면 그 숫자의 선택자는 모두 제외됩니다.\n"
             "> 🏆 중복되지 않은 숫자 중 **가장 높은 숫자**를 고른 단 한 명만 해당 구간의 점수를 받습니다.\n"
-            "> ❌ 중복되지 않은 숫자가 없으면 점수는 지급되지 않습니다."
+            "> ❌ 중복되지 않은 숫자가 없으면 점수는 지급되지 않습니다.\n"
+            "> 🕶️ 토론 스레드에서 익명으로 몇 번이든 심리전을 펼칠 수 있습니다."
         ),
         inline=False,
     )
@@ -6000,7 +6002,7 @@ async def create_round_from_setup(
     message = await main_channel.send(embed=embed, view=view)
 
     discussion_thread_id = None
-    if 게임 in {"balance", "minority_balance", "defuse4"}:
+    if 게임 in {"balance", "minority_balance", "defuse4", "unique_number"}:
         try:
             thread_name = f"{제목} | 토론방"[:100]
             # 보관되면 일반 유저의 버튼 클릭이 막힌다. 라운드가 끝날 때까지 살아 있도록 넉넉히 잡는다.
@@ -6017,6 +6019,13 @@ async def create_round_from_setup(
                     thread,
                     "토론방이 열렸습니다",
                     "버튼을 눌러 익명으로 설득, 블러핑, 진실 말하기를 할 수 있습니다. 횟수 제한은 없습니다.",
+                )
+            elif 게임 == "unique_number":
+                notice_embed = build_thread_notice_embed(
+                    round_id,
+                    thread,
+                    "토론방이 열렸습니다",
+                    "버튼을 눌러 익명으로 심리전과 눈치싸움을 펼쳐보세요. 블러핑과 유도 모두 가능합니다. 횟수 제한은 없습니다.",
                 )
             else:
                 notice_embed = build_thread_notice_embed(
