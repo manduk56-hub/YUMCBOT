@@ -1360,7 +1360,6 @@ class AnonymousDiscussionModal(discord.ui.Modal):
                 (self.round_id, user_id, anon_number, content, now_text()),
             )
             post_id = int(cursor.lastrowid)
-            old_button_message_id = str(round_extra(round_row).get("anon_button_message_id") or "")
             game_key = round_game_key(round_row)
 
         try:
@@ -1379,39 +1378,47 @@ class AnonymousDiscussionModal(discord.ui.Modal):
                 "UPDATE discussion_messages SET message_id = ? WHERE id = ?",
                 (str(posted_message.id), post_id),
             )
-            post_count = count_discussion_messages(conn, self.round_id)
 
         # 버튼이 발언에 밀려 위로 올라가지 않도록, 옛 버튼을 지우고 맨 아래에 다시 붙인다.
-        if old_button_message_id:
-            try:
-                old_button = await interaction.channel.fetch_message(int(old_button_message_id))
-                await old_button.delete()
-            except (discord.NotFound, discord.HTTPException, ValueError):
-                pass
-        try:
-            new_button = await interaction.channel.send(
-                embed=build_anonymous_guide_embed(
-                    post_count,
-                    round_extra(round_row).get("auto_close_at"),
-                ),
-                view=thread_discussion_view(self.round_id, game_key),
-            )
-        except discord.HTTPException:
-            # 버튼 재게시에 실패해도 발언 자체는 이미 올라갔다. 발언을 되돌리지는 않는다.
-            new_button = None
-
-        if new_button:
+        # 여러 명이 동시에 발언하면 각자 옛 스냅샷에서 버튼 id를 읽어 버튼판이 여러 개로 갈린다.
+        # 그래서 스레드별 락을 잡고, 락 안에서 현재 버튼 id를 DB에서 다시 읽는다. (모래성과 같은 방식)
+        async with bot.anon_board_lock(interaction.channel.id):
             with db() as conn:
                 fresh_row = conn.execute(
                     "SELECT extra_json FROM rounds WHERE id = ?", (self.round_id,)
                 ).fetchone()
-                if fresh_row:
-                    extra = round_extra(fresh_row)
-                    extra["anon_button_message_id"] = str(new_button.id)
-                    conn.execute(
-                        "UPDATE rounds SET extra_json = ? WHERE id = ?",
-                        (json.dumps(extra, ensure_ascii=False), self.round_id),
-                    )
+                fresh_extra = round_extra(fresh_row) if fresh_row else {}
+                current_button_id = str(fresh_extra.get("anon_button_message_id") or "")
+                current_auto_close_at = fresh_extra.get("auto_close_at")
+                post_count = count_discussion_messages(conn, self.round_id)
+
+            if current_button_id:
+                try:
+                    old_button = await interaction.channel.fetch_message(int(current_button_id))
+                    await old_button.delete()
+                except (discord.NotFound, discord.HTTPException, ValueError):
+                    pass
+            try:
+                new_button = await interaction.channel.send(
+                    embed=build_anonymous_guide_embed(post_count, current_auto_close_at),
+                    view=thread_discussion_view(self.round_id, game_key),
+                )
+            except discord.HTTPException:
+                # 버튼 재게시에 실패해도 발언 자체는 이미 올라갔다. 발언을 되돌리지는 않는다.
+                new_button = None
+
+            if new_button:
+                with db() as conn:
+                    fresh_row = conn.execute(
+                        "SELECT extra_json FROM rounds WHERE id = ?", (self.round_id,)
+                    ).fetchone()
+                    if fresh_row:
+                        extra = round_extra(fresh_row)
+                        extra["anon_button_message_id"] = str(new_button.id)
+                        conn.execute(
+                            "UPDATE rounds SET extra_json = ? WHERE id = ?",
+                            (json.dumps(extra, ensure_ascii=False), self.round_id),
+                        )
 
         # 발언자를 드러내지 않도록 확인 문구를 남기지 않고 defer한 ephemeral만 조용히 지운다.
         try:
@@ -3324,10 +3331,15 @@ class EventBot(discord.Client):
         self.auto_close_restored = False
         self.afk_coin_task: asyncio.Task[None] | None = None
         self.sand_board_locks: dict[int, asyncio.Lock] = {}
+        self.anon_board_locks: dict[int, asyncio.Lock] = {}
 
     def sand_board_lock(self, thread_id: int) -> asyncio.Lock:
         """방별 진행판 재게시를 직렬화한다. 두 사람이 동시에 눌러도 진행판이 하나만 남는다."""
         return self.sand_board_locks.setdefault(thread_id, asyncio.Lock())
+
+    def anon_board_lock(self, thread_id: int) -> asyncio.Lock:
+        """익명 토론방 버튼판 재게시를 직렬화한다. 여러 명이 동시에 발언해도 버튼판이 하나만 남는다."""
+        return self.anon_board_locks.setdefault(thread_id, asyncio.Lock())
 
     async def setup_hook(self) -> None:
         guild_id = os.getenv("GUILD_ID", "").strip()
@@ -6414,14 +6426,14 @@ async def russian_roulette(
         return
     if not isinstance(interaction.channel, discord.TextChannel):
         await interaction.response.send_message(
-            "러시안룰렛은 비공개 스레드나 공개 스레드가 아닌 일반 텍스트 채널에서만 시작할 수 있습니다.",
+            "러시안룰렛은 일반 텍스트 채널에서만 시작할 수 있습니다.",
             ephemeral=True,
         )
         return
-    if not interaction.channel.permissions_for(interaction.guild.default_role).view_channel:
+    if not interaction.channel.permissions_for(플레이어).view_channel:
         await interaction.response.send_message(
-            "이 채널은 모든 서버 멤버가 볼 수 있는 공개 공간이 아닙니다. "
-            "`@everyone`이 채널을 볼 수 있는 일반 텍스트 채널에서 실행해주세요.",
+            "선택한 상대방이 이 채널을 볼 수 없어 결투 요청을 받을 수 없습니다. "
+            "상대방이 접근할 수 있는 채널에서 실행해주세요.",
             ephemeral=True,
         )
         return
