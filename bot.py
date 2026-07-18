@@ -51,7 +51,7 @@ CUTTING_REWARD_POINTS = {
     3: 1,
     4: 1,
     5: 2,
-    6: 4,
+    6: 6,
 }
 CUTTING_SUCCESS_RATES = {
     0: 0.9,
@@ -59,7 +59,7 @@ CUTTING_SUCCESS_RATES = {
     2: 0.6,
     3: 0.6,
     4: 0.5,
-    5: 0.3,
+    5: 0.15,
 }
 TOP3_NONE_CHOICE = "__none__"
 UNIQUE_NUMBER_CHOICES = [str(index) for index in range(1, 16)]
@@ -131,11 +131,11 @@ SAND_RULES_TEXT = (
     "(예: 9와 7이면 차이가 2 → 2번까지는 성공, 3번째에 붕괴. 차이가 0이면 첫 덜기에서 붕괴)\n"
     "**3** ─ 참여자는 번갈아가며 `포기하기` 또는 `모래 덜기`를 결정합니다.\n"
     "**4** ─ 숫자를 안 내거나 제한 시간 안에 끝내지 못하면 마감 때 랜덤으로 자동 진행됩니다.\n\n"
-    "> 🏳️ 둘 다 포기 선택 시: **서로 -1점**\n"
+    "> 🏳️ 둘 다 포기 선택 시: **서로 -3점**\n"
     "> ⚖️ 한 명이 포기(A), 다른 한 명이 모래 덜기(B) 선택 시:\n"
-    "> 　├ 덜기 성공: A는 **-1점**, B는 **+2점**\n"
-    "> 　└ 무너짐: B는 **-1점**, A는 **+1점**\n"
-    "> 💥 서로 덜기를 하다 무너진 경우: 그 턴의 사람이 **-1점**"
+    "> 　├ 덜기 성공: A는 **-3점**, B는 **+5점**\n"
+    "> 　└ 무너짐: B는 **-3점**, A는 **+2점**\n"
+    "> 💥 서로 덜기를 하다 무너진 경우: 그 턴의 사람이 **-3점**"
 )
 SAND_OUTCOME_LABELS = {
     "mutual_quit": "둘 다 포기",
@@ -1718,12 +1718,12 @@ def build_trust_pair_result_embed(
     if not user_a_choice or not user_b_choice:
         outcome = "미선택 포함 · 점수 변동 없음"
     elif user_a_choice == "trust" and user_b_choice == "trust":
-        outcome = "상호 신뢰 · 두 사람 모두 +1점"
+        outcome = "상호 신뢰 · 두 사람 모두 +2점"
     elif user_a_choice == "betray" and user_b_choice == "betray":
-        outcome = "동시 배신 · 두 사람 모두 -1점"
+        outcome = "동시 배신 · 두 사람 모두 -3점"
     else:
         betrayer_id = user_a_id if user_a_choice == "betray" else user_b_id
-        outcome = f"단독 배신 · <@{betrayer_id}> +2점, 상대 0점"
+        outcome = f"단독 배신 · <@{betrayer_id}> +5점, 상대 0점"
 
     embed = discord.Embed(
         title=f"세트 결과 · {title}",
@@ -1983,13 +1983,13 @@ def sand_pair_settlement_text(pair: dict[str, Any]) -> str:
     outcome = str(pair.get("outcome") or "")
     result = pair.get("result", {})
     if outcome == "mutual_quit":
-        return "각 -1점"
+        return "각 -3점"
     if outcome == "quit_success":
-        return f"<@{result['winner']}> +2점 · <@{result['quitter']}> -1점"
+        return f"<@{result['winner']}> +5점 · <@{result['quitter']}> -3점"
     if outcome == "quit_collapse":
-        return f"<@{result['winner']}> +1점 · <@{result['collapsed_user']}> -1점"
+        return f"<@{result['winner']}> +2점 · <@{result['collapsed_user']}> -3점"
     if outcome == "plain_collapse":
-        return f"<@{result['collapsed_user']}> -1점"
+        return f"<@{result['collapsed_user']}> -3점"
     return "점수 변동 없음"
 
 
@@ -2404,7 +2404,7 @@ def apply_sand_action(pair: dict[str, Any], user_id: str, action: str) -> str:
                     "result": {"losers": [quitter_id, user_id]},
                 }
             )
-            return "상대의 포기에 함께 포기했습니다. 두 사람 모두 -1점입니다."
+            return "상대의 포기에 함께 포기했습니다. 두 사람 모두 -3점입니다."
         pair.update(
             {
                 "phase": "awaiting_quit_response",
@@ -2428,7 +2428,7 @@ def apply_sand_action(pair: dict[str, Any], user_id: str, action: str) -> str:
                     "raw_difference": raw_difference,
                 }
             )
-            return "모래를 덜다가 무너졌습니다. 나는 -1점, 먼저 포기한 상대는 +1점입니다."
+            return "모래를 덜다가 무너졌습니다. 나는 -3점, 먼저 포기한 상대는 +2점입니다."
         pair.update(
             {
                 "phase": "resolved",
@@ -2438,7 +2438,7 @@ def apply_sand_action(pair: dict[str, Any], user_id: str, action: str) -> str:
                 "raw_difference": raw_difference,
             }
         )
-        return "-1점입니다."
+        return "-3점입니다."
 
     if phase == "awaiting_quit_response":
         quitter_id = str(pair["quitter_id"])
@@ -2451,7 +2451,7 @@ def apply_sand_action(pair: dict[str, Any], user_id: str, action: str) -> str:
                 "raw_difference": raw_difference,
             }
         )
-        return "마지막 모래 덜기에 성공했습니다. 나는 +2점, 먼저 포기한 상대는 -1점입니다."
+        return "마지막 모래 덜기에 성공했습니다. 나는 +5점, 먼저 포기한 상대는 -3점입니다."
 
     pair.update(
         {
@@ -3821,6 +3821,7 @@ def build_balance_embed(round_id: int, question: str, option_a: str, option_b: s
             "> 🔒 투표 현황은 마감 전까지 비공개입니다.\n"
             "> 🕶️ 토론 스레드에서 익명으로 몇 번이든 발언할 수 있습니다.\n"
             "> 🏆 마감 후 다수파 선택자에게 **+1점**이 지급됩니다.\n"
+            "> ✨ 단, 한 선택지를 단 1명만 골랐다면 그 사람만 **+2점**, 다수파는 **0점**입니다.\n"
             "> ⚠️ 단, 한쪽이 0명이면 밸런스가 성립하지 않으므로 고른 사람 전원 **-2점**입니다."
         ),
         inline=False,
@@ -4126,9 +4127,9 @@ def build_trust_registration_embed(round_id: int, title: str, registration_minut
         value=(
             "무작위로 매칭된 두 명의 참가자가 신뢰와 배신을 선택합니다.\n"
             "```\n"
-            "상호 신뢰 시   : 각 +1점\n"
-            "한명만 배신 시 : 배신자 +2점\n"
-            "동시 배신 시   : 각 -1점\n"
+            "상호 신뢰 시   : 각 +2점\n"
+            "한명만 배신 시 : 배신자 +5점, 상대 0점\n"
+            "동시 배신 시   : 각 -3점\n"
             "```\n"
             "선택은 마감 전까지 바꿀 수 있고, 끝까지 고르지 않으면 랜덤으로 배정됩니다."
         ),
@@ -4851,17 +4852,36 @@ def close_round_record(
                 else:
                     winner = "A" if len(a_users) > len(b_users) else "B"
                     winner_users = a_users if winner == "A" else b_users
-                    for user_id in winner_users:
+                    minority = "B" if winner == "A" else "A"
+                    minority_users = b_users if winner == "A" else a_users
+                    if len(minority_users) == 1:
+                        minority_user_id = minority_users[0]
                         add_score(
                             conn,
-                            user_id,
-                            member_name(guild, user_id),
-                            1,
-                            f"라운드 #{round_row['id']} 다수파 선택",
+                            minority_user_id,
+                            member_name(guild, minority_user_id),
+                            2,
+                            f"라운드 #{round_row['id']} 단독 소수파 선택",
                             round_row["id"],
                         )
+                    else:
+                        for user_id in winner_users:
+                            add_score(
+                                conn,
+                                user_id,
+                                member_name(guild, user_id),
+                                1,
+                                f"라운드 #{round_row['id']} 다수파 선택",
+                                round_row["id"],
+                            )
                     scored = True
-                    settlement = f"다수파 `{winner}` 선택자 전원 +1점"
+                    if len(minority_users) == 1:
+                        settlement = (
+                            f"소수파 `{minority}` 단독 선택자만 +2점 · "
+                            f"다수파 `{winner}` 선택자는 점수 없음"
+                        )
+                    else:
+                        settlement = f"다수파 `{winner}` 선택자 전원 +1점"
 
             embed = discord.Embed(
                 title=(
@@ -5111,7 +5131,7 @@ def close_round_record(
                             conn,
                             user_id,
                             member_name(guild, user_id),
-                            1,
+                            2,
                             f"라운드 #{round_row['id']} 딜레마의 섬 상호 신뢰",
                             round_row["id"],
                         )
@@ -5122,7 +5142,7 @@ def close_round_record(
                             conn,
                             user_id,
                             member_name(guild, user_id),
-                            -1,
+                            -3,
                             f"라운드 #{round_row['id']} 딜레마의 섬 동시 배신",
                             round_row["id"],
                         )
@@ -5133,7 +5153,7 @@ def close_round_record(
                         conn,
                         betrayer_id,
                         member_name(guild, betrayer_id),
-                        2,
+                        5,
                         f"라운드 #{round_row['id']} 딜레마의 섬 단독 배신",
                         round_row["id"],
                     )
@@ -5177,7 +5197,7 @@ def close_round_record(
                 )
             embed.add_field(
                 name="💰 정산",
-                value="상호 신뢰는 각 +1점, 단독 배신은 배신자 +2점·상대 0점, 동시 배신은 각 -1점입니다.",
+                value="상호 신뢰는 각 +2점, 단독 배신은 배신자 +5점·상대 0점, 동시 배신은 각 -3점입니다.",
                 inline=False,
             )
         elif round_row["type"] == "sand":
@@ -5206,35 +5226,35 @@ def close_round_record(
                 if outcome == "mutual_quit":
                     for user_id in (user_a_id, user_b_id):
                         add_score(
-                            conn, user_id, member_name(guild, user_id), -1,
+                            conn, user_id, member_name(guild, user_id), -3,
                             f"라운드 #{round_row['id']} 모래성 둘 다 포기", round_row["id"],
                         )
                 elif outcome == "quit_success":
                     winner_id = str(result["winner"])
                     quitter_id = str(result["quitter"])
                     add_score(
-                        conn, winner_id, member_name(guild, winner_id), 2,
+                        conn, winner_id, member_name(guild, winner_id), 5,
                         f"라운드 #{round_row['id']} 모래성 포기 후 덜기 성공", round_row["id"],
                     )
                     add_score(
-                        conn, quitter_id, member_name(guild, quitter_id), -1,
+                        conn, quitter_id, member_name(guild, quitter_id), -3,
                         f"라운드 #{round_row['id']} 모래성 단독 포기", round_row["id"],
                     )
                 elif outcome == "quit_collapse":
                     winner_id = str(result["winner"])
                     collapsed_user_id = str(result["collapsed_user"])
                     add_score(
-                        conn, winner_id, member_name(guild, winner_id), 1,
+                        conn, winner_id, member_name(guild, winner_id), 2,
                         f"라운드 #{round_row['id']} 모래성 상대 붕괴", round_row["id"],
                     )
                     add_score(
-                        conn, collapsed_user_id, member_name(guild, collapsed_user_id), -1,
+                        conn, collapsed_user_id, member_name(guild, collapsed_user_id), -3,
                         f"라운드 #{round_row['id']} 모래성 마지막 덜기 붕괴", round_row["id"],
                     )
                 elif outcome == "plain_collapse":
                     collapsed_user_id = str(result["collapsed_user"])
                     add_score(
-                        conn, collapsed_user_id, member_name(guild, collapsed_user_id), -1,
+                        conn, collapsed_user_id, member_name(guild, collapsed_user_id), -3,
                         f"라운드 #{round_row['id']} 모래성 일반 붕괴", round_row["id"],
                     )
                 else:

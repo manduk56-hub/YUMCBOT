@@ -548,6 +548,52 @@ class BotRegressionTests(unittest.TestCase):
         self.assertIn("<@1>: **신뢰**", rendered)
         self.assertIn("<@2>: **배신**", rendered)
         self.assertIn("단독 배신", rendered)
+        self.assertIn("<@2> +5점, 상대 0점", rendered)
+
+    def test_trust_scoring_uses_revised_payoff_table(self) -> None:
+        for user_id in ("1", "2", "3", "4", "5", "6"):
+            self.add_user(user_id, f"참가자{user_id}", 0)
+        with bot.db() as conn:
+            cursor = conn.execute(
+                """
+                INSERT INTO rounds (type, title, question, status, channel_id, extra_json, created_at)
+                VALUES ('trust', '점수표 테스트', '점수표 테스트', 'open', '10', ?, '2026-01-01 00:00:00')
+                """,
+                (json.dumps({"trust_phase": "decision"}),),
+            )
+            round_id = int(cursor.lastrowid)
+            conn.executemany(
+                """
+                INSERT INTO trust_pairings (round_id, user_a_id, user_b_id, created_at)
+                VALUES (?, ?, ?, '2026-01-01 00:00:00')
+                """,
+                [
+                    (round_id, "1", "2"),
+                    (round_id, "3", "4"),
+                    (round_id, "5", "6"),
+                ],
+            )
+            conn.executemany(
+                """
+                INSERT INTO votes (round_id, user_id, choice, created_at, updated_at)
+                VALUES (?, ?, ?, '2026-01-01 00:00:00', '2026-01-01 00:00:00')
+                """,
+                [
+                    (round_id, "1", "trust"),
+                    (round_id, "2", "trust"),
+                    (round_id, "3", "betray"),
+                    (round_id, "4", "trust"),
+                    (round_id, "5", "betray"),
+                    (round_id, "6", "betray"),
+                ],
+            )
+
+        bot.close_round_record(round_id, None)
+
+        self.assertEqual(
+            {user_id: self.score_of(user_id) for user_id in ("1", "2", "3", "4", "5", "6")},
+            {"1": 2, "2": 2, "3": 5, "4": 0, "5": -3, "6": -3},
+        )
 
     def test_trust_pairings_schema_stores_private_thread(self) -> None:
         with bot.db() as conn:
@@ -747,10 +793,10 @@ class BotRegressionTests(unittest.TestCase):
         embed = bot.build_sand_registration_embed(1, "모래성", 2)
         rendered = json.dumps(embed.to_dict(), ensure_ascii=False)
         for expected in (
-            "둘 다 포기 선택 시: **서로 -1점**",
-            "덜기 성공: A는 **-1점**, B는 **+2점**",
-            "무너짐: B는 **-1점**, A는 **+1점**",
-            "서로 덜기를 하다 무너진 경우: 그 턴의 사람이 **-1점**",
+            "둘 다 포기 선택 시: **서로 -3점**",
+            "덜기 성공: A는 **-3점**, B는 **+5점**",
+            "무너짐: B는 **-3점**, A는 **+2점**",
+            "서로 덜기를 하다 무너진 경우: 그 턴의 사람이 **-3점**",
         ):
             self.assertIn(expected, rendered)
 
@@ -795,16 +841,39 @@ class BotRegressionTests(unittest.TestCase):
             self.assertEqual(self.score_of(user_id), -2)
         self.assertIn("-2점", json.dumps(result[1].to_dict(), ensure_ascii=False))
 
-    def test_balance_majority_still_gets_one_point(self) -> None:
+    def test_balance_only_lone_minority_gets_two_points(self) -> None:
         for user_id in ("1", "2", "3"):
             self.add_user(user_id, f"참가자{user_id}", 0)
         round_id = self.create_balance_round([("1", "A"), ("2", "A"), ("3", "B")])
+
+        result = bot.close_round_record(round_id, None)
+
+        self.assertEqual(self.score_of("1"), 0)
+        self.assertEqual(self.score_of("2"), 0)
+        self.assertEqual(self.score_of("3"), 2)
+        self.assertIn(
+            "소수파 `B` 단독 선택자만 +2점",
+            json.dumps(result[1].to_dict(), ensure_ascii=False),
+        )
+        self.assertIn(
+            "다수파 `A` 선택자는 점수 없음",
+            json.dumps(result[1].to_dict(), ensure_ascii=False),
+        )
+
+    def test_balance_minority_with_multiple_voters_gets_no_bonus(self) -> None:
+        for user_id in ("1", "2", "3", "4", "5"):
+            self.add_user(user_id, f"참가자{user_id}", 0)
+        round_id = self.create_balance_round(
+            [("1", "A"), ("2", "A"), ("3", "A"), ("4", "B"), ("5", "B")]
+        )
 
         bot.close_round_record(round_id, None)
 
         self.assertEqual(self.score_of("1"), 1)
         self.assertEqual(self.score_of("2"), 1)
-        self.assertEqual(self.score_of("3"), 0)
+        self.assertEqual(self.score_of("3"), 1)
+        self.assertEqual(self.score_of("4"), 0)
+        self.assertEqual(self.score_of("5"), 0)
 
     def test_balance_result_hides_who_voted_what(self) -> None:
         for user_id in ("1", "2"):
@@ -1286,8 +1355,8 @@ class BotRegressionTests(unittest.TestCase):
         self.assertIn("미선택 랜덤 배정", rendered)
         self.assertIn("단독 배신 : 1", rendered)
         self.assertNotIn("미선택 : ", rendered)
-        # 랜덤 배정된 2번이 단독 배신자가 되어 +2점.
-        self.assertEqual(self.score_of("2"), 2)
+        # 랜덤 배정된 2번이 단독 배신자가 되어 +5점.
+        self.assertEqual(self.score_of("2"), 5)
 
     # --- 모래성 -------------------------------------------------------------
 
@@ -1373,13 +1442,68 @@ class BotRegressionTests(unittest.TestCase):
         self.assertIn("자동 진행", rendered)
         self.assertNotIn("미완료", rendered)
 
+    def test_sand_scoring_matches_trust_game_score_range(self) -> None:
+        for user_id in ("1", "2", "3", "4", "5", "6", "7", "8"):
+            self.add_user(user_id, f"참가자{user_id}", 0)
+        pairs = [
+            {
+                **self.sand_pair(9, 7),
+                "user_a_id": "1",
+                "user_b_id": "2",
+                "phase": "resolved",
+                "outcome": "mutual_quit",
+                "result": {"losers": ["1", "2"]},
+            },
+            {
+                **self.sand_pair(9, 7),
+                "user_a_id": "3",
+                "user_b_id": "4",
+                "phase": "resolved",
+                "outcome": "quit_success",
+                "result": {"winner": "3", "quitter": "4"},
+            },
+            {
+                **self.sand_pair(9, 7),
+                "user_a_id": "5",
+                "user_b_id": "6",
+                "phase": "resolved",
+                "outcome": "quit_collapse",
+                "result": {"winner": "5", "collapsed_user": "6"},
+            },
+            {
+                **self.sand_pair(9, 7),
+                "user_a_id": "7",
+                "user_b_id": "8",
+                "phase": "resolved",
+                "outcome": "plain_collapse",
+                "result": {"collapsed_user": "7"},
+            },
+        ]
+        with bot.db() as conn:
+            cursor = conn.execute(
+                """
+                INSERT INTO rounds (type, title, question, status, channel_id, extra_json, created_at)
+                VALUES ('sand', '점수표 테스트', '점수표 테스트', 'open', '10', ?, '2026-01-01 00:00:00')
+                """,
+                (json.dumps({"sand_phase": "playing", "sand_pairs": pairs}),),
+            )
+            round_id = int(cursor.lastrowid)
+
+        bot.close_round_record(round_id, None)
+
+        self.assertEqual(
+            {user_id: self.score_of(user_id) for user_id in ("1", "2", "3", "4", "5", "6", "7", "8")},
+            {"1": -3, "2": -3, "3": 5, "4": -3, "5": 2, "6": -3, "7": -3, "8": 0},
+        )
+
     # --- 돌 세공 ------------------------------------------------------------
 
     def test_cutting_tables_match_requested_values(self) -> None:
         self.assertEqual(bot.CUTTING_SUCCESS_RATES[0], 0.9)
         self.assertEqual(bot.CUTTING_SUCCESS_RATES[1], 0.9)
+        self.assertEqual(bot.CUTTING_SUCCESS_RATES[5], 0.15)
         self.assertEqual(
-            bot.CUTTING_REWARD_POINTS, {0: 3, 1: 3, 2: 1, 3: 1, 4: 1, 5: 2, 6: 4}
+            bot.CUTTING_REWARD_POINTS, {0: 3, 1: 3, 2: 1, 3: 1, 4: 1, 5: 2, 6: 6}
         )
 
     def test_cutting_embed_text_is_generated_from_constants(self) -> None:
