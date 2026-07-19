@@ -38,6 +38,19 @@ Copy-Item .env.example .env
 
 ## 2. 서버 셋업 (Rocky Linux, 1회)
 
+### 서버 실물 스펙
+
+운영 봇이 도는 물리 서버 한 대. 봇은 `yumcbot` 계정으로 `/opt`에서 systemd로 돈다.
+
+| 항목   | 값                                                                    |
+| ------ | --------------------------------------------------------------------- |
+| OS     | Rocky Linux 8.10 (Green Obsidian), 커널 `el8_10`                      |
+| CPU    | Intel Core i5-11600K (6코어 12스레드)                                 |
+| RAM    | 125 GiB (Swap 4 GiB)                                                  |
+| 디스크 | LVM `rl-root` 920 GB (DB·백업 여유 충분)                              |
+| 타임존 | Asia/Seoul (KST). 이벤트가 요일·시간에 맞춰 도므로 UTC로 바꾸지 말 것 |
+| Python | 3.12 (el8 appstream. `bootstrap.sh`가 `dnf install python3.12`)       |
+
 ```bash
 sudo dnf install -y git
 sudo git clone -b main https://github.com/manduk56-hub/YUMCBOT.git /usr/local/src/YUMCBOT
@@ -51,17 +64,17 @@ sudo vi /etc/yumcbot/yumcbot.env   # DISCORD_TOKEN(운영 봇), GUILD_ID 입력
 
 `bootstrap.sh`가 만드는 것:
 
-| 경로 | 용도 |
-|---|---|
-| `/opt/yumcbot/releases/<sha>/` | 릴리스별 코드 + 전용 venv |
-| `/opt/yumcbot/current` | 현재 릴리스를 가리키는 심볼릭 링크 |
-| `/opt/yumcbot/runner/` | GitHub Actions self-hosted runner |
-| `/var/lib/yumcbot/data/` | **DB. 코드 디렉터리 밖이라 배포로 덮이지 않는다** |
-| `/var/lib/yumcbot/backups/` | 배포 직전 DB 백업 |
-| `/etc/yumcbot/yumcbot.env` | 운영 토큰 (root:yumcbot 0640) |
-| `/usr/local/bin/yumcbot-deploy` | 배포 스크립트 |
-| `/usr/local/bin/yumcbot-setup-runner` | 러너 등록 스크립트 |
-| `/home/yumcbot-app`, `/home/yumcbot-data` | 위 두 경로를 가리키는 이정표 링크 (사람용) |
+| 경로                                      | 용도                                              |
+| ----------------------------------------- | ------------------------------------------------- |
+| `/opt/yumcbot/releases/<sha>/`            | 릴리스별 코드 + 전용 venv                         |
+| `/opt/yumcbot/current`                    | 현재 릴리스를 가리키는 심볼릭 링크                |
+| `/opt/yumcbot/runner/`                    | GitHub Actions self-hosted runner                 |
+| `/var/lib/yumcbot/data/`                  | **DB. 코드 디렉터리 밖이라 배포로 덮이지 않는다** |
+| `/var/lib/yumcbot/backups/`               | 배포 직전 DB 백업                                 |
+| `/etc/yumcbot/yumcbot.env`                | 운영 토큰 (root:yumcbot 0640)                     |
+| `/usr/local/bin/yumcbot-deploy`           | 배포 스크립트                                     |
+| `/usr/local/bin/yumcbot-setup-runner`     | 러너 등록 스크립트                                |
+| `/home/yumcbot-app`, `/home/yumcbot-data` | 위 두 경로를 가리키는 이정표 링크 (사람용)        |
 
 **코드(`/opt`) · 데이터(`/var/lib`) · 설정(`/etc`)을 분리**한 것이 핵심입니다.
 배포는 `/opt/yumcbot/releases/`에 새 디렉터리를 만들고 `current` 링크만 갈아끼웁니다.
@@ -215,10 +228,12 @@ sudo systemctl restart yumcbot
 ## 6. 브랜치 보호 설정 (GitHub Settings → Branches)
 
 **`main`**
+
 - Require a pull request before merging (승인 1명 이상)
 - Require status checks to pass → `test`
 - Do not allow bypassing the above settings
 
 **`develop`**
+
 - Require a pull request before merging
 - Require status checks to pass → `test`

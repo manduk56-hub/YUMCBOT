@@ -139,9 +139,9 @@ MIGRATIONS: dict[int, list[str]] = {
 
 ## DB 위치
 
-| | 경로 |
-|---|---|
-| 로컬 | `data/event_game.sqlite3` (gitignore) |
+|      | 경로                                                                                               |
+| ---- | -------------------------------------------------------------------------------------------------- |
+| 로컬 | `data/event_game.sqlite3` (gitignore)                                                              |
 | 운영 | `/var/lib/yumcbot/data/event_game.sqlite3` — 코드 트리(`/opt/yumcbot`) 밖이라 배포로 덮이지 않는다 |
 
 ## 브랜치 / 배포
@@ -156,6 +156,6 @@ main       운영 봇. PR 머지 시 자동 배포
 (Actions에서 `force: true`로 무시 가능).
 
 `deploy/` 아래 스크립트와 `yumcbot.service`는 **배포로 갱신되지 않는다.** 배포가 갈아끼우는 건 앱 코드뿐이다.
-수정했다면 서버에서 `bootstrap.sh`를 다시 돌려야 한다. 서버 셋업/배포 동작 상세는 `deploy/README.md`.
+수정했다면 서버에서 `bootstrap.sh`를 다시 돌려야 한다. 서버 셋업/배포 동작 상세와 **서버 실물 스펙(Rocky Linux 8.10, i5-11600K, 125GiB RAM, KST)**은 `deploy/README.md`.
 
 `.gitattributes`가 `*.sh` / `*.service` / `deploy/*.py`를 LF로 고정한다. CRLF로 체크아웃되면 shebang이 깨진다.
