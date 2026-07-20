@@ -3390,6 +3390,9 @@ def pull_roulette_trigger(
             "roulette",
             "shot",
             actor_user_id=user_id,
+            # 승자를 target으로 걸어야 승자 쪽 타임라인에서도 이 격발이 보인다.
+            # (actor/target 어느 쪽이든 걸리게 조회하므로, 비워두면 이긴 사람 기록에서 빠진다)
+            target_user_id=winner_id,
             payload={
                 "game_id": game_id,
                 "shot_index": int(row["shots_fired"]),

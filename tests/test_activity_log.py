@@ -299,6 +299,37 @@ class ActivityLogTests(unittest.TestCase):
         self.assertEqual(shots[-1]["payload"]["winner_id"], "200")
         self.assertEqual(shots[-1]["payload"]["loser_id"], "100")
         self.assertEqual(shots[-1]["payload"]["pot"], 6)
+        # 승자를 target으로 걸어야 '이긴 사람'의 타임라인에서도 이 격발이 보인다.
+        self.assertEqual(shots[-1]["target_user_id"], "200")
+
+    def test_winning_shot_appears_in_winner_timeline(self) -> None:
+        """actor/target 어느 쪽이든 걸리게 조회하므로, 이긴 사람도 결정적 격발을 볼 수 있어야 한다."""
+        self.add_user("100", "도전자", 10)
+        self.add_user("200", "상대", 10)
+        with bot.db() as conn:
+            game_id = int(
+                conn.execute(
+                    """
+                    INSERT INTO russian_roulette_games (
+                        guild_id, channel_id, challenger_id, target_id,
+                        challenger_name, target_name, status, challenger_bet, target_bet,
+                        current_player_id, live_chamber, shots_fired, created_at
+                    )
+                    VALUES ('1', '10', '100', '200', '도전자', '상대', 'playing', 5, 5,
+                            '100', 0, 0, '2026-01-01 00:00:00')
+                    """
+                ).lastrowid
+            )
+            # live_chamber=0 이므로 첫 격발에서 100번이 지고 200번이 이긴다.
+            bot.pull_roulette_trigger(conn, game_id, "100")
+
+            winner_view = conn.execute(
+                """
+                SELECT COUNT(*) AS c FROM activity_logs
+                WHERE actor_user_id = '200' OR target_user_id = '200'
+                """
+            ).fetchone()["c"]
+        self.assertEqual(winner_view, 1, "이긴 사람 타임라인에도 결정적 격발이 남아야 한다")
 
 
 if __name__ == "__main__":
