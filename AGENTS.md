@@ -109,13 +109,46 @@ embed/view 빌더 → `close_round_record`(정산) → 슬래시 명령어 → s
 
 권위 있는 목록은 `MAIN_GAME_TYPES` / `MINI_GAME_TYPES` / `GAME_NAMES` 상수다. CHECK 제약이 아니다.
 
+### 활동 로그 (`activity_logs`)
+
+사후 분석(SQL·에이전트)용 **append-only 이벤트 스트림**. `log_activity()` 하나로만 쓴다.
+**절대 UPDATE/DELETE 하지 않는다.**
+
+존재 이유가 곧 사용 기준이다. 기존 테이블 대부분은 *현재 상태*라 덮어쓰기·삭제가 일어난다:
+
+| 상태 테이블 | 잃어버리는 것 |
+| --- | --- |
+| `votes` (choice upsert) | 선택 **변경 이력**. 소수파 밸런스 1차 선택이 재선택으로 덮인다 |
+| `event_participants` (취소 시 DELETE) | 참여했다 취소한 사실 |
+| `russian_roulette_games` (`shots_fired` 카운터) | 누가 몇 번째에 격발했는지 |
+| `extra_json` (통째로 교체) | 진행 중간 상태 |
+| `event_sessions` | `recruiting→active` 전이 시각, 정상 완료/강제 마감 구분 |
+
+**그래서 상태를 덮어쓰기 직전에 로그를 남긴다.** 새 기능을 추가할 때 그 기능이 위 표처럼
+상태를 덮어쓴다면 `log_activity()` 호출을 함께 넣어야 한다.
+
+이미 append-only인 것(`score_logs`, `discussion_messages`)은 **내용을 중복 저장하지 않는다.**
+익명 발언은 `payload.discussion_message_id`로 참조만 남겨 타임라인 순서만 확보한다.
+점수도 개별 델타는 `score_logs`에 그대로 두고, 라운드당 `score:round_settled` 요약 1건만 남긴다
+(요약은 분기별 `settlement` 문구가 아니라 실제 적용된 `score_logs`를 역산해서 만든다).
+
+`payload_json`에 게임별 세부를 담으므로 **새 게임이 추가돼도 스키마 마이그레이션이 필요 없다.**
+
+**규칙 스냅샷**: 라운드 생성/정산 시 `game_settings_snapshot()`이 튜닝 가능한 상수
+(`CUTTING_REWARD_POINTS` 등)를 값으로 남긴다. 밸런스 몰표 -2점처럼 `close_round_record`에
+하드코딩된 규칙은 값으로 뜰 수 없어서 `bot_version`(배포 커밋 SHA)을 항상 함께 남긴다 —
+그 커밋을 열면 당시 정산 규칙을 그대로 확인할 수 있다. `BOT_VERSION`은 릴리스 디렉터리
+이름(`/opt/yumcbot/releases/<sha>/`)에서 뽑는다.
+
+운영자용 조회 UI는 아직 없다 (`bot.py`의 `TODO(activity-log)`). 서버에서 직접 조회한다.
+
 ### 스키마 변경
 
 **`BASE_SCHEMA`(v1)는 절대 수정하지 않는다.** `tests/test_schema.py`가 SHA256 체크섬으로 고정해두었다.
 수정하면 새로 만든 DB와 운영 DB의 스키마가 조용히 갈라진다.
 
 스키마 추가는 `MIGRATIONS`에 등록한다. `SCHEMA_VERSION`은 자동 계산되고, 부팅 시 `init_db()`가
-`PRAGMA user_version`을 보고 밀린 것만 적용한다. 현재 최신은 **v4**(`russian_roulette_games` 테이블).
+`PRAGMA user_version`을 보고 밀린 것만 적용한다. 현재 최신은 **v5**(`activity_logs` 테이블).
 
 ```python
 MIGRATIONS: dict[int, list[str]] = {
