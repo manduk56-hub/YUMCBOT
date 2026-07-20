@@ -30,6 +30,25 @@ load_dotenv(BASE_DIR / ".env")
 DATA_DIR = Path(os.getenv("YUMCBOT_DATA_DIR") or (BASE_DIR / "data")).resolve()
 DB_PATH = DATA_DIR / (os.getenv("YUMCBOT_DB_NAME") or "event_game.sqlite3")
 KST_LABEL = "Asia/Seoul"
+
+
+def _detect_bot_version() -> str:
+    """활동 로그에 남길 코드 버전. '어느 코드로 돈 게임인가'를 사후에 알기 위한 것.
+
+    배포는 릴리스를 /opt/yumcbot/releases/<sha>/ 에 풀고 current 링크를 갈아끼운다.
+    따라서 운영에서는 코드 디렉터리 이름이 곧 커밋 SHA다 (deploy/deploy.sh 참고).
+    로컬 체크아웃에서는 그렇지 않으므로 'dev'로 둔다. 부팅 시 한 번만 계산한다.
+    """
+    override = os.getenv("YUMCBOT_VERSION")
+    if override:
+        return override
+    name = BASE_DIR.name
+    if len(name) >= 7 and all(char in "0123456789abcdef" for char in name):
+        return name[:12]
+    return "dev"
+
+
+BOT_VERSION = _detect_bot_version()
 DEFUSE_COLORS = [
     {"id": "red", "name": "빨강", "emoji": "🟥"},
     {"id": "blue", "name": "파랑", "emoji": "🟦"},
@@ -384,6 +403,43 @@ MIGRATIONS: dict[int, list[str]] = {
         ON russian_roulette_games(status, challenger_id, target_id)
         """,
     ],
+    # 활동 로그. 사후 분석(SQL/에이전트)용 append-only 이벤트 스트림.
+    #
+    # 기존 테이블 대부분은 '현재 상태'라 덮어쓰기·삭제가 일어난다
+    # (votes는 choice를 upsert, event_participants는 취소 시 DELETE,
+    #  russian_roulette_games는 shots_fired 카운터만 증가, extra_json은 통째로 교체).
+    # 그래서 '무슨 일이 있었는지'는 그 테이블들만으로 복원할 수 없다.
+    # 이 테이블은 일어난 순간을 그대로 적재해 그 구멍을 메운다. UPDATE/DELETE 하지 않는다.
+    #
+    # FK를 걸지 않는 이유: 로그는 참조 대상이 지워져도 남아야 하고(score_logs가
+    # ON DELETE SET NULL을 쓰는 것과 같은 이유), append 비용도 줄인다.
+    5: [
+        """
+        CREATE TABLE IF NOT EXISTS activity_logs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            created_at TEXT NOT NULL,
+            category TEXT NOT NULL,
+            action TEXT NOT NULL,
+            event_session_id INTEGER,
+            round_id INTEGER,
+            actor_user_id TEXT,
+            target_user_id TEXT,
+            payload_json TEXT NOT NULL DEFAULT '{}'
+        )
+        """,
+        """
+        CREATE INDEX IF NOT EXISTS idx_activity_event
+        ON activity_logs(event_session_id, created_at)
+        """,
+        """
+        CREATE INDEX IF NOT EXISTS idx_activity_round
+        ON activity_logs(round_id, created_at)
+        """,
+        """
+        CREATE INDEX IF NOT EXISTS idx_activity_actor
+        ON activity_logs(actor_user_id, created_at)
+        """,
+    ],
 }
 
 SCHEMA_VERSION = max([BASELINE_VERSION, *MIGRATIONS])
@@ -615,6 +671,90 @@ def add_score(
     )
 
 
+# TODO(activity-log): 운영자용 조회/내보내기 수단이 아직 없다.
+# 당분간은 서버에서 직접 조회한다:
+#   sqlite3 /var/lib/yumcbot/data/event_game.sqlite3 \
+#     "SELECT created_at, category, action, actor_user_id, payload_json
+#      FROM activity_logs WHERE event_session_id = 12 ORDER BY created_at"
+# 필요해지면 /로그 슬래시 명령이나 CSV 내보내기를 붙인다.
+def user_display_name(user: discord.abc.User) -> str | None:
+    """로그에 남길 표시 이름. 로깅 때문에 게임이 죽으면 안 되므로 속성이 없어도 견딘다."""
+    return getattr(user, "display_name", None) or getattr(user, "name", None)
+
+
+def log_activity(
+    conn: sqlite3.Connection,
+    category: str,
+    action: str,
+    *,
+    event_session_id: int | None = None,
+    round_id: int | None = None,
+    actor_user_id: str | None = None,
+    target_user_id: str | None = None,
+    payload: dict[str, Any] | None = None,
+) -> None:
+    """활동 로그 한 줄. 사후 분석용 append-only 기록이라 절대 UPDATE/DELETE 하지 않는다.
+
+    호출자가 이미 쥐고 있는 conn에 얹어서 같은 트랜잭션으로 커밋한다. 별도 커넥션을
+    열지 않으므로 추가 fsync가 없고, 본 작업이 롤백되면 로그도 같이 롤백돼 어긋나지 않는다.
+
+    로깅 실패가 게임 진행을 막으면 안 되므로 여기서 예외를 삼킨다. 다만 조용히 사라지면
+    누락을 눈치챌 수 없으니 stderr에는 남긴다.
+
+    category: event|round|match|participation|score|roulette|vote|thread
+    payload: JSON 직렬화 가능한 세부. 게임마다 다른 값은 전부 여기에 넣어
+             새 게임이 추가돼도 스키마 마이그레이션이 필요 없게 한다.
+    """
+    try:
+        conn.execute(
+            """
+            INSERT INTO activity_logs
+                (created_at, category, action, event_session_id, round_id,
+                 actor_user_id, target_user_id, payload_json)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                now_text(),
+                category,
+                action,
+                event_session_id,
+                round_id,
+                actor_user_id,
+                target_user_id,
+                json.dumps(payload or {}, ensure_ascii=False, default=str),
+            ),
+        )
+    except sqlite3.Error as error:
+        print(f"활동 로그 기록 실패({category}:{action}): {error}", flush=True)
+
+
+def game_settings_snapshot(game_key: str) -> dict[str, Any]:
+    """라운드가 시작될 때의 규칙값. 규칙을 조정해도 과거 라운드를 당시 기준으로 해석하기 위한 것.
+
+    점수 규칙 일부(밸런스 몰표 -2점, 소수파 +2점 등)는 상수가 아니라
+    close_round_record 분기에 하드코딩돼 있어 여기서 값으로 뜰 수 없다.
+    그래서 bot_version(배포 커밋 SHA)을 항상 함께 남긴다 — 그 커밋을 열면
+    당시 정산 규칙을 그대로 확인할 수 있다. 튜닝 가능한 상수는 값으로도 남긴다.
+    """
+    settings: dict[str, Any] = {"bot_version": BOT_VERSION}
+
+    if game_key == "cutting":
+        settings["reward_points"] = CUTTING_REWARD_POINTS
+        settings["success_rates"] = CUTTING_SUCCESS_RATES
+    elif game_key == "trust":
+        settings["decision_seconds"] = TRUST_DECISION_SECONDS
+        settings["match_history_rounds"] = TRUST_MATCH_HISTORY_ROUNDS
+    elif game_key == "sand":
+        settings["play_seconds"] = SAND_PLAY_SECONDS
+        settings["number_choices"] = SAND_NUMBER_CHOICES
+    elif game_key == "unique_number":
+        settings["number_choices"] = UNIQUE_NUMBER_CHOICES
+    elif game_key == "defuse4":
+        settings["colors"] = [color["id"] for color in DEFUSE_COLORS]
+
+    return settings
+
+
 def get_afk_coins(conn: sqlite3.Connection, user_id: str) -> int:
     row = conn.execute("SELECT coins FROM afk_coins WHERE user_id = ?", (user_id,)).fetchone()
     return int(row["coins"]) if row else 0
@@ -710,6 +850,19 @@ def force_close_current_event(
         """,
         (closed_at, event_row["id"]),
     )
+    # 정상 완료와 강제 마감은 event_sessions에서 똑같이 'closed'로만 보인다.
+    # 어느 쪽으로 끝났는지는 이 로그에만 남는다.
+    log_activity(
+        conn,
+        "event",
+        "close",
+        event_session_id=int(event_row["id"]),
+        payload={
+            "reason": "force_closed",
+            "round_count": len(round_rows),
+            "round_ids": [int(row["id"]) for row in round_rows],
+        },
+    )
     return event_row, round_rows
 
 
@@ -795,6 +948,32 @@ def close_completed_event(event_session_id: int) -> tuple[str, discord.Embed] | 
         )
         if cursor.rowcount != 1:
             return None
+
+        participant_count = int(
+            conn.execute(
+                "SELECT COUNT(*) AS count FROM event_participants WHERE event_session_id = ?",
+                (event_session_id,),
+            ).fetchone()["count"]
+        )
+        log_activity(
+            conn,
+            "event",
+            "close",
+            event_session_id=event_session_id,
+            payload={
+                "reason": "completed",
+                "participant_count": participant_count,
+                # 이벤트 구성(메인->미니 / 미니 단독)을 사후에 한 줄로 알 수 있게 남긴다.
+                "rounds": [
+                    {
+                        "round_id": int(row["id"]),
+                        "game_key": round_game_key(row),
+                        "title": str(row["title"]),
+                    }
+                    for row in round_rows
+                ],
+            },
+        )
         event_values = dict(event_row)
         event_values["closed_at"] = closed_at
         return str(event_row["channel_id"]), build_event_summary_embed(
@@ -1246,6 +1425,17 @@ async def handle_event_join(interaction: discord.Interaction, event_session_id: 
                 (event_session_id,),
             ).fetchone()["count"]
         )
+        log_activity(
+            conn,
+            "participation",
+            "join",
+            event_session_id=event_session_id,
+            actor_user_id=str(interaction.user.id),
+            payload={
+                "display_name": user_display_name(interaction.user),
+                "participant_count": participant_count,
+            },
+        )
 
     await interaction.response.edit_message(
         view=event_join_view(event_session_id, participant_count),
@@ -1295,6 +1485,18 @@ async def handle_event_cancel(interaction: discord.Interaction, event_session_id
                 """,
                 (event_session_id,),
             ).fetchone()["count"]
+        )
+        # DELETE로 행이 사라지므로 취소했다는 사실은 여기서만 남는다.
+        log_activity(
+            conn,
+            "participation",
+            "cancel",
+            event_session_id=event_session_id,
+            actor_user_id=str(interaction.user.id),
+            payload={
+                "display_name": user_display_name(interaction.user),
+                "participant_count": participant_count,
+            },
         )
 
     await interaction.response.edit_message(
@@ -1377,6 +1579,22 @@ class AnonymousDiscussionModal(discord.ui.Modal):
             conn.execute(
                 "UPDATE discussion_messages SET message_id = ? WHERE id = ?",
                 (str(posted_message.id), post_id),
+            )
+            # 내용은 discussion_messages(append-only)에 이미 온전히 있다. 여기서는 중복 저장하지
+            # 않고 참조만 남겨, 하나의 타임라인에서 발언 시점을 다른 활동과 함께 볼 수 있게 한다.
+            log_activity(
+                conn,
+                "thread",
+                "anon_post",
+                event_session_id=round_row["event_session_id"],
+                round_id=self.round_id,
+                actor_user_id=user_id,
+                payload={
+                    "discussion_message_id": post_id,
+                    "anon_number": anon_number,
+                    "content_length": len(content),
+                    "thread_id": str(interaction.channel.id),
+                },
             )
 
         # 버튼이 발언에 밀려 위로 올라가지 않도록, 옛 버튼을 지우고 맨 아래에 다시 붙인다.
@@ -1518,6 +1736,30 @@ def start_trust_decision(round_id: int) -> dict[str, Any] | None:
                 """,
                 (round_id, user_a_id, user_b_id, now_text()),
             )
+            log_activity(
+                conn,
+                "match",
+                "pair_matched",
+                event_session_id=round_row["event_session_id"],
+                round_id=round_id,
+                actor_user_id=user_a_id,
+                target_user_id=user_b_id,
+                payload={"game_key": "trust"},
+            )
+        log_activity(
+            conn,
+            "match",
+            "pairing_complete",
+            event_session_id=round_row["event_session_id"],
+            round_id=round_id,
+            payload={
+                "game_key": "trust",
+                "pair_count": len(pairs),
+                "registered_count": len(user_ids),
+                "unmatched_user_id": unmatched_user_id,
+                "avoided_recent_pairs": len(recent_pairs),
+            },
+        )
 
         decision_close_at = time.time() + TRUST_DECISION_SECONDS
         extra.update(
@@ -1866,6 +2108,11 @@ async def handle_trust_decision(
 
         ensure_user(conn, interaction.user)
         ts = now_text()
+        # votes는 choice를 덮어쓰므로 바꾸기 전 값을 여기서 잡아둬야 이력이 남는다.
+        previous = conn.execute(
+            "SELECT choice FROM votes WHERE round_id = ? AND user_id = ?",
+            (round_id, str(interaction.user.id)),
+        ).fetchone()
         conn.execute(
             """
             INSERT INTO votes (round_id, user_id, choice, created_at, updated_at)
@@ -1875,6 +2122,19 @@ async def handle_trust_decision(
                 updated_at = excluded.updated_at
             """,
             (round_id, str(interaction.user.id), choice, ts, ts),
+        )
+        log_activity(
+            conn,
+            "vote",
+            "trust_decision",
+            round_id=round_id,
+            actor_user_id=str(interaction.user.id),
+            payload={
+                "choice": choice,
+                "previous_choice": previous["choice"] if previous else None,
+                "changed": bool(previous and previous["choice"] != choice),
+                "thread_id": str(interaction.channel_id),
+            },
         )
     await interaction.response.send_message(
         "선택을 저장했습니다. 마감 전까지 다시 누르면 선택이 바뀝니다.",
@@ -1928,6 +2188,16 @@ def start_sand_game(round_id: int) -> dict[str, Any] | None:
                 """,
                 (round_id, user_a_id, user_b_id, now_text()),
             )
+            log_activity(
+                conn,
+                "match",
+                "pair_matched",
+                event_session_id=round_row["event_session_id"],
+                round_id=round_id,
+                actor_user_id=user_a_id,
+                target_user_id=user_b_id,
+                payload={"game_key": "sand"},
+            )
             sand_pairs.append(
                 {
                     "user_a_id": user_a_id,
@@ -1939,6 +2209,19 @@ def start_sand_game(round_id: int) -> dict[str, Any] | None:
                     "successful_removals": 0,
                 }
             )
+        log_activity(
+            conn,
+            "match",
+            "pairing_complete",
+            event_session_id=round_row["event_session_id"],
+            round_id=round_id,
+            payload={
+                "game_key": "sand",
+                "pair_count": len(pairs),
+                "registered_count": len(user_ids),
+                "unmatched_user_id": unmatched_user_id,
+            },
+        )
 
         play_close_at = time.time() + SAND_PLAY_SECONDS
         extra.update(
@@ -2262,6 +2545,25 @@ async def handle_emergency_join(interaction: discord.Interaction, round_id: int)
             VALUES (?, ?, ?, ?)
             """,
             (round_id, applied["user_a_id"], applied["user_b_id"], now_text()),
+        )
+        # 긴급 투입은 event_participants에 INSERT OR IGNORE로 끼어들어가 joined_at만 남는다.
+        # '정상 참여'와 구분되지 않으므로 투입 경위를 여기서 남긴다.
+        log_activity(
+            conn,
+            "match",
+            "emergency_join",
+            event_session_id=round_row["event_session_id"],
+            round_id=round_id,
+            actor_user_id=user_id,
+            target_user_id=(
+                str(applied["user_b_id"])
+                if str(applied["user_a_id"]) == user_id
+                else str(applied["user_a_id"])
+            ),
+            payload={
+                "game_key": round_type,
+                "extension_seconds": EMERGENCY_EXTENSION_SECONDS,
+            },
         )
         conn.execute(
             "UPDATE rounds SET extra_json = ? WHERE id = ?",
@@ -2959,6 +3261,15 @@ def submit_roulette_bet(
         f"UPDATE russian_roulette_games SET {column} = ? WHERE id = ?",
         (amount, game_id),
     )
+    # 베팅은 최종값만 컬럼에 남고 무효화(balance_changed) 시 NULL로 지워진다.
+    # 얼마를 언제 걸었는지는 여기서만 복원할 수 있다.
+    log_activity(
+        conn,
+        "roulette",
+        "bet",
+        actor_user_id=user_id,
+        payload={"game_id": game_id, "amount": amount, "balance": balance},
+    )
     row = conn.execute(
         "SELECT * FROM russian_roulette_games WHERE id = ?", (game_id,)
     ).fetchone()
@@ -3014,6 +3325,22 @@ def submit_roulette_bet(
         """,
         (current_player_id, live_chamber, game_id),
     )
+    # live_chamber는 이미 게임 테이블에 평문으로 있다(운영자는 어차피 볼 수 있다).
+    # 여기 남겨두면 나중에 '실탄 위치가 고르게 나왔는지' 분포를 검증할 수 있다.
+    log_activity(
+        conn,
+        "roulette",
+        "start",
+        actor_user_id=player_ids[0],
+        target_user_id=player_ids[1],
+        payload={
+            "game_id": game_id,
+            "bets": bets,
+            "pot": bets[player_ids[0]] + bets[player_ids[1]],
+            "live_chamber": live_chamber,
+            "first_player_id": current_player_id,
+        },
+    )
     fresh = conn.execute(
         "SELECT * FROM russian_roulette_games WHERE id = ?", (game_id,)
     ).fetchone()
@@ -3058,6 +3385,23 @@ def pull_roulette_trigger(
             """,
             (winner_id, loser_id, now_text(), game_id),
         )
+        log_activity(
+            conn,
+            "roulette",
+            "shot",
+            actor_user_id=user_id,
+            # 승자를 target으로 걸어야 승자 쪽 타임라인에서도 이 격발이 보인다.
+            # (actor/target 어느 쪽이든 걸리게 조회하므로, 비워두면 이긴 사람 기록에서 빠진다)
+            target_user_id=winner_id,
+            payload={
+                "game_id": game_id,
+                "shot_index": int(row["shots_fired"]),
+                "result": "fired",
+                "winner_id": winner_id,
+                "loser_id": loser_id,
+                "pot": pot,
+            },
+        )
         state = "fired"
     else:
         next_player_id = target_id if user_id == challenger_id else challenger_id
@@ -3068,6 +3412,19 @@ def pull_roulette_trigger(
             WHERE id = ? AND status = 'playing'
             """,
             (next_player_id, game_id),
+        )
+        # shots_fired는 카운터라 '누가 몇 번째를 쐈는지'가 남지 않는다. 격발마다 한 줄씩 남긴다.
+        log_activity(
+            conn,
+            "roulette",
+            "shot",
+            actor_user_id=user_id,
+            target_user_id=next_player_id,
+            payload={
+                "game_id": game_id,
+                "shot_index": int(row["shots_fired"]),
+                "result": "blank",
+            },
         )
         state = "blank"
 
@@ -3192,6 +3549,14 @@ async def handle_roulette_accept(interaction: discord.Interaction, game_id: int)
             """,
             (now_text(), time.time() + ROULETTE_BETTING_SECONDS, game_id),
         )
+        log_activity(
+            conn,
+            "roulette",
+            "accept",
+            actor_user_id=str(interaction.user.id),
+            target_user_id=str(row["challenger_id"]),
+            payload={"game_id": game_id},
+        )
         game = dict(
             conn.execute(
                 "SELECT * FROM russian_roulette_games WHERE id = ?", (game_id,)
@@ -3222,6 +3587,14 @@ async def handle_roulette_decline(interaction: discord.Interaction, game_id: int
         conn.execute(
             "UPDATE russian_roulette_games SET status = 'declined', finished_at = ? WHERE id = ?",
             (now_text(), game_id),
+        )
+        log_activity(
+            conn,
+            "roulette",
+            "decline",
+            actor_user_id=str(interaction.user.id),
+            target_user_id=str(row["challenger_id"]),
+            payload={"game_id": game_id},
         )
         game = dict(
             conn.execute(
@@ -3757,6 +4130,12 @@ class EventBot(discord.Client):
 
             ensure_user(conn, interaction.user)
             ts = now_text()
+            # 덮어쓰기 전 값. 소수파 밸런스는 1차 선택이 재선택으로 덮이므로
+            # 이 로그가 없으면 '누가 무엇에서 무엇으로 바꿨는지'가 영구히 사라진다.
+            previous = conn.execute(
+                "SELECT choice FROM votes WHERE round_id = ? AND user_id = ?",
+                (round_id, str(interaction.user.id)),
+            ).fetchone()
             conn.execute(
                 """
                 INSERT INTO votes (round_id, user_id, choice, created_at, updated_at)
@@ -3766,6 +4145,24 @@ class EventBot(discord.Client):
                     updated_at = excluded.updated_at
                 """,
                 (round_id, str(interaction.user.id), choice, ts, ts),
+            )
+            log_activity(
+                conn,
+                "vote",
+                "cast",
+                event_session_id=round_row["event_session_id"],
+                round_id=round_id,
+                actor_user_id=str(interaction.user.id),
+                payload={
+                    "game_key": game_key,
+                    "choice": choice,
+                    "previous_choice": previous["choice"] if previous else None,
+                    "changed": bool(previous and previous["choice"] != choice),
+                    # 소수파 밸런스의 1차/재선택 구분. 어느 단계의 표인지 사후에 알아야 한다.
+                    "phase": round_extra(round_row).get("balance_phase"),
+                    "in_thread": str(interaction.channel_id)
+                    != str(round_row["channel_id"]),
+                },
             )
 
         await interaction.response.send_message(
@@ -5112,6 +5509,16 @@ def close_round_record(
                         """,
                         (round_row["id"], user_id, assigned, ts, ts),
                     )
+                    # 본인이 고른 표와 섞이면 안 된다. votes만 보면 구분이 안 되므로 여기서 남긴다.
+                    log_activity(
+                        conn,
+                        "vote",
+                        "auto_assigned",
+                        event_session_id=round_row["event_session_id"],
+                        round_id=round_row["id"],
+                        actor_user_id=user_id,
+                        payload={"choice": assigned, "reason": "마감까지 미선택"},
+                    )
                     vote_choices[user_id] = assigned
                     auto_assigned += 1
 
@@ -5390,6 +5797,41 @@ def close_round_record(
             )
         embed.set_footer(text=f"시작: {round_row['created_at']} · 종료: {now_text()}")
 
+        # 정산 요약. 분기마다 settlement 문구 유무가 달라서 그 변수에 기대지 않고,
+        # 이 라운드에 실제로 적용된 score_logs를 역산한다. 어떤 경로로 닫혔든 결과가 정확하다.
+        awarded = conn.execute(
+            """
+            SELECT user_id, SUM(delta) AS total
+            FROM score_logs WHERE round_id = ?
+            GROUP BY user_id ORDER BY total DESC
+            """,
+            (round_row["id"],),
+        ).fetchall()
+        vote_distribution: dict[str, int] = {}
+        for vote_row in votes:
+            key = str(vote_row["choice"])
+            vote_distribution[key] = vote_distribution.get(key, 0) + 1
+
+        log_activity(
+            conn,
+            "score",
+            "round_settled",
+            event_session_id=round_row["event_session_id"],
+            round_id=round_row["id"],
+            payload={
+                "game_key": round_game_key(round_row),
+                "closed_by": closed_by,
+                "vote_count": len(votes),
+                "vote_distribution": vote_distribution,
+                "awarded": {
+                    str(row["user_id"]): int(row["total"]) for row in awarded
+                },
+                "total_delta": sum(int(row["total"]) for row in awarded),
+                "planned_mini_game": planned_mini_game or None,
+                "settings": game_settings_snapshot(round_game_key(round_row)),
+            },
+        )
+
         return str(round_row["channel_id"]), embed
 
 
@@ -5548,6 +5990,17 @@ async def open_event(interaction: discord.Interaction) -> None:
             (str(interaction.channel.id), now_text()),
         )
         event_session_id = int(cursor.lastrowid)
+        log_activity(
+            conn,
+            "event",
+            "open",
+            event_session_id=event_session_id,
+            actor_user_id=str(interaction.user.id),
+            payload={
+                "channel_id": str(interaction.channel.id),
+                "bot_version": BOT_VERSION,
+            },
+        )
 
     try:
         await interaction.response.send_message(
@@ -5988,9 +6441,55 @@ async def create_round_from_setup(
             "UPDATE rounds SET event_session_id = ? WHERE id = ?",
             (event_session_id, round_id),
         )
+        was_recruiting = bool(
+            conn.execute(
+                "SELECT 1 FROM event_sessions WHERE id = ? AND status = 'recruiting'",
+                (event_session_id,),
+            ).fetchone()
+        )
         conn.execute(
             "UPDATE event_sessions SET status = 'active' WHERE id = ?",
             (event_session_id,),
+        )
+        # event_sessions에는 created_at/closed_at만 있어 recruiting->active 시각이 남지 않는다.
+        # 이벤트 타임라인의 시작점이라 여기서 남겨야 한다. (미니게임 연속 시작 때는 이미 active)
+        if was_recruiting:
+            participant_count = int(
+                conn.execute(
+                    "SELECT COUNT(*) AS count FROM event_participants WHERE event_session_id = ?",
+                    (event_session_id,),
+                ).fetchone()["count"]
+            )
+            log_activity(
+                conn,
+                "event",
+                "start",
+                event_session_id=event_session_id,
+                actor_user_id=str(interaction.user.id),
+                payload={
+                    "first_game": 게임,
+                    "participant_count": participant_count,
+                    "planned_mini_game": extra.get("planned_mini_game"),
+                    "bot_version": BOT_VERSION,
+                },
+            )
+
+        log_activity(
+            conn,
+            "round",
+            "create",
+            event_session_id=event_session_id,
+            round_id=round_id,
+            actor_user_id=str(interaction.user.id),
+            payload={
+                "game_key": 게임,
+                "game_name": GAME_NAMES.get(게임, 게임),
+                "title": 제목,
+                "duration_minutes": int(진행시간분),
+                "is_main_game": 게임 in MAIN_GAME_TYPES,
+                # 규칙이 바뀌어도 이 라운드를 당시 기준으로 해석하기 위한 스냅샷
+                "settings": game_settings_snapshot(게임),
+            },
         )
         if 게임 in MAIN_GAME_TYPES:
             conn.execute(
@@ -6523,6 +7022,18 @@ async def russian_roulette(
             ),
         )
         game_id = int(cursor.lastrowid)
+        log_activity(
+            conn,
+            "roulette",
+            "challenge",
+            actor_user_id=challenger_id,
+            target_user_id=target_id,
+            payload={
+                "game_id": game_id,
+                "challenger_score": scores.get(challenger_id, 0),
+                "target_score": target_score,
+            },
+        )
         game = dict(
             conn.execute(
                 "SELECT * FROM russian_roulette_games WHERE id = ?", (game_id,)
