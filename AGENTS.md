@@ -12,9 +12,8 @@ This file provides guidance to AI coding agents (Claude Code, Cursor, Codex 등)
 ```powershell
 .\run.ps1                                   # 봇 실행 (.venv 없으면 자동 생성 + 의존성 설치)
 
-python -m unittest discover -s tests -v     # 전체 테스트
-python -m unittest tests.test_bot -v        # 파일 단위
-python -m unittest tests.test_bot.BotRegressionTests.test_sand_registration_transitions_to_playing   # 단일 테스트
+python -m unittest discover -s tests -v     # 전체
+python -m unittest tests.test_bot -v        # 파일 단위 (단일 테스트는 뒤에 .클래스.메서드)
 
 python -m compileall -q bot.py deploy/check_idle.py   # CI가 도는 문법 검사
 shellcheck deploy/*.sh                                # CI가 도는 배포 스크립트 검사
@@ -31,8 +30,7 @@ shellcheck deploy/*.sh                                # CI가 도는 배포 스�
 
 ## 아키텍처
 
-전체 로직이 `bot.py` 한 파일(~4200줄)에 있다. 대략적인 구역 순서:
-
+전체 로직이 `bot.py` 한 파일에 있고, 구역 순서는 대략:
 상수/게임 설정 → 스키마·마이그레이션 → DB 헬퍼 → 게임별 상태 전이 함수 → `EventBot` 클래스 →
 embed/view 빌더 → `close_round_record`(정산) → 슬래시 명령어 → systemd 연동/엔트리포인트.
 
@@ -51,85 +49,106 @@ embed/view 빌더 → `close_round_record`(정산) → 슬래시 명령어 → s
 ### 이벤트/라운드 모델
 
 `event_sessions`(`recruiting` → `active` → `closed`)가 상위, `rounds`가 그 아래 게임 하나.
-`/오픈`으로 세션을 열고 `event_participants`에 참가자를 모은다. `can_join_round()`가
-**`참여하기`를 누른 유저만** 투표/토론할 수 있게 막는다. `/start` 시점에 명단이 마감된다.
+`can_join_round()`가 **`참여하기`를 누른 유저만** 투표/토론하게 막고, `/start` 시점에 명단이 마감된다.
+정산은 전부 `close_round_record()`의 타입별 분기에서 이뤄지며 `add_score()`가
+`users.total_score`와 `score_logs`를 함께 갱신한다.
 
-정산은 전부 `close_round_record()`의 타입별 분기에서 이뤄지고 `add_score()`가 `users.total_score`와
-`score_logs`를 함께 갱신한다.
+### 스레드에서 버튼이 죽는 두 가지 경우
 
-### 스레드를 잠그지 말 것 (버튼이 죽는다)
+**① 잠근 스레드.** `archived`/`locked` 상태에서는 `스레드 관리` 권한이 없는 유저의 버튼 클릭을 디스코드가 막는다.
+익명 토론방을 잠갔더니 "관리자만 익명 발언이 된다"는 버그가 났었다. 스레드는 채널 권한을 상속해 개별 덮어쓰기가
+불가능하므로 일반 채팅 차단은 **`on_message`의 메시지 삭제로만** 한다. 잠그는 건 라운드가 끝나 버튼이 필요 없을
+때뿐이다(`publish_trust_pair_results` / `publish_sand_pair_results`). 자동 보관도 같은 문제라 스레드 생성 시
+`auto_archive_duration=1440`을 명시한다.
 
-**`archived` 또는 `locked` 상태의 스레드에서는 `스레드 관리` 권한이 없는 유저의 버튼 클릭을 디스코드가 막는다.**
-익명 토론방을 잠가두었더니 "관리자만 익명 발언이 된다 / 스레드 안 버튼이 안 눌린다"는 버그가 났었다.
-스레드는 채널 권한을 상속해서 개별 권한 덮어쓰기가 불가능하므로, 일반 채팅 차단은 **`on_message`의 메시지 삭제로만** 한다.
-잠그는 건 라운드가 끝나 버튼이 더 필요 없을 때뿐이다 (`publish_trust_pair_results` / `publish_sand_pair_results`).
-
-진행 중에 자동 보관돼도 같은 문제가 나므로 스레드 생성 시 `auto_archive_duration=1440`을 명시한다.
-
-### 스레드 시작 메시지의 버튼은 눌리지 않는다
-
-토론 스레드는 라운드 메시지에서 파생시키므로(`message.create_thread`) 그 메시지가 스레드의 **시작 메시지**가 된다.
-시작 메시지의 실체는 부모 채널에 있어서, 스레드 안에서는 그 버튼이 회색으로 뜨고 눌리지 않는다.
-그래서 밸런스·소수파 밸런스·3선 폭탄 게임은 **같은 `custom_id`의 선택 버튼을 스레드 안에도 따로 보낸다**
-(`thread_discussion_view()` — 선택지 + 익명 발언하기, 발언마다 맨 아래로 재게시).
-`votes`는 `(round_id, user_id)` upsert라 채널에서 누르든 스레드에서 누르든 마지막 선택 하나만 남는다.
-버튼은 한 줄에 5개가 상한이다 — 3선 폭탄 게임은 색 3 + 익명 1을 한 줄에 둔다.
+**② 스레드의 시작 메시지.** 토론 스레드는 라운드 메시지에서 파생되므로(`message.create_thread`) 그 메시지가
+시작 메시지가 되는데, 실체가 부모 채널에 있어 스레드 안에서는 회색으로 뜨고 눌리지 않는다. 그래서 밸런스·소수파
+밸런스·3선 폭탄 게임은 **같은 `custom_id`의 선택 버튼을 스레드 안에도 따로 보낸다**(`thread_discussion_view()`).
+`votes`는 `(round_id, user_id)` upsert라 어디서 누르든 마지막 하나만 남는다. 버튼은 한 줄에 5개가 상한이다.
 
 ### 1:1 비공개 방 (딜레마의 섬 · 모래성)
 
-두 메인게임 모두 짝마다 비공개 스레드를 열고 그 안에 게임 버튼을 둔다. 공용 헬퍼는 `create_pair_thread()`다.
+두 메인게임 모두 짝마다 비공개 스레드를 열고 그 안에 게임 버튼을 둔다 (`create_pair_thread()`).
 
 **방에 초대하는 것은 짝 두 사람뿐이다. 운영자를 참관용으로 넣지 말 것.** 운영자도 게임에 참여할 수 있어서
-모든 방에 넣으면 1:1이 성립하지 않는다. 운영자는 `스레드 관리` 권한으로 스레드 목록에서 필요한 방만 골라 본다
-(디스코드 서버 설정에서 운영자 역할에 그 권한을 준다 — 코드가 아니다).
+모든 방에 넣으면 1:1이 성립하지 않는다. 운영자는 `스레드 관리` 권한으로 필요한 방만 골라 본다
+(서버 설정에서 역할에 주는 것 — 코드가 아니다).
 
-버튼 핸들러는 누른 곳이 본인 짝의 방인지 반드시 검증한다 (`handle_trust_decision`, `sand_pair_thread_matches`).
-방 안에서 누른 버튼의 `interaction.followup`은 그 방으로 들어가므로, **라운드 결과는 메인 채널로 직접 보내야 한다.**
-
-버튼을 누를 때마다 개인 응답(ephemeral)이 방에 쌓여 버튼이 달린 진행판을 위로 밀어낸다. 그래서 모래성은
-상호작용마다 방의 진행판을 지우고 맨 아래에 다시 붙인다(`refresh_sand_pair_board`, 현재 id는
-`sand_pairs[].play_message_id`). 숫자 선택은 두 사람이 동시에 누를 수 있어 `interaction.message`가 이미
-사라진 옛 진행판일 수 있으므로, `EventBot.sand_board_lock(thread_id)`을 잡고 DB에서 id를 다시 읽는다.
-
-참가자가 홀수면 `build_random_trust_pairs()`가 한 명을 `extra_json.unmatched_user_id`로 남긴다.
-그 사람에게는 메인 메시지에 **긴급 투입** 버튼이 붙고, 게임에 참여하지 않은 아무나 눌러 짝이 될 수 있다
-(`apply_emergency_join`). 누른 사람은 `event_participants`에 자동 등록되고, 전체 마감이 1분 밀린다.
-**누가 투입됐는지는 메인 채널에만 공개한다.** 각 방에는 시간 연장 사실만 알린다 — 방마다 상대가 누구인지가
-게임의 일부이므로 다른 방에 이름이 새면 안 된다.
+- 버튼 핸들러는 누른 곳이 본인 짝의 방인지 검증한다 (`handle_trust_decision`, `sand_pair_thread_matches`).
+- 방 안 버튼의 `interaction.followup`은 그 방으로 가므로 **라운드 결과는 메인 채널로 직접 보낸다.**
+- ephemeral 응답이 쌓여 진행판을 위로 밀어내므로 모래성은 상호작용마다 진행판을 지우고 맨 아래에
+  다시 붙인다(`refresh_sand_pair_board`). 두 사람이 동시에 누르면 `interaction.message`가 이미 사라진
+  옛 진행판일 수 있어, `EventBot.sand_board_lock(thread_id)`을 잡고 DB에서 id를 다시 읽는다.
+- 홀수 인원은 `extra_json.unmatched_user_id`로 남고 **긴급 투입** 버튼으로 아무나 짝이 된다
+  (`apply_emergency_join`). **누가 투입됐는지는 메인 채널에만 공개하고, 각 방에는 시간 연장만 알린다** —
+  상대가 누구인지가 게임의 일부라 다른 방에 이름이 새면 안 된다.
 
 ### 게임 타입 이름 주의
 
-`rounds.type` CHECK 제약은 `('balance','bomb','grid','cutting','top3','trust','sand')`인데, 실제 게임 목록과 다르다.
+`rounds.type` CHECK 제약(`balance,bomb,grid,cutting,top3,trust,sand`)은 **실제 게임 목록이 아니다.**
+`BASE_SCHEMA`가 불변이라 제약을 못 고쳐서, 이름이 어긋난 채 `extra_json.mode`로 갈라 쓴다:
 
-- **미니게임 "3선 폭탄 게임"의 레거시 코드상 이름은 `defuse4`이고 DB에는 `bomb`으로 저장된다** (`extra_json.mode = "defuse4"`). 새 라운드는 `extra_json.settlement_rule = "top_vote_penalty"`로 구방식 안전선 라운드와 구분한다.
-- **소수파 밸런스는 DB에 `balance`로 저장하고 `extra_json.mode = "minority_balance"`로 구분한다.** `balance_phase`는 `initial` → `revote` 순서이며, 1차 `votes`를 유지한 채 변경 선택을 upsert하고 두 번째 마감에서만 소수파를 정산한다.
-- **`grid`(관리자 시점 타일)는 제거된 게임이다.** `BASE_SCHEMA`가 불변이라 CHECK 제약에서 뺄 수 없어,
-  새 **유일 숫자 게임**을 DB에 저장할 때만 `type = grid`, `extra_json.mode = unique_number`로 재사용한다.
-  `mode`가 없는 옛 grid 라운드는 `close_round_record`의 마지막 `else`에서 점수 없이 마감한다.
+| 게임 | `type` | `extra_json.mode` | 비고 |
+| --- | --- | --- | --- |
+| 3선 폭탄 게임 | `bomb` | `defuse4` | 새 라운드는 `settlement_rule = "top_vote_penalty"`로 구방식과 구분 |
+| 소수파 밸런스 | `balance` | `minority_balance` | |
+| 유일 숫자 게임 | `grid` | `unique_number` | `grid`는 제거된 게임이라 이름만 재사용. `mode` 없는 옛 라운드는 점수 없이 마감 |
 
 권위 있는 목록은 `MAIN_GAME_TYPES` / `MINI_GAME_TYPES` / `GAME_NAMES` 상수다. CHECK 제약이 아니다.
+
+### 활동 로그 (`activity_logs`)
+
+사후 분석(SQL·에이전트)용 **append-only 이벤트 스트림**. `log_activity()` 하나로만 쓴다.
+**절대 UPDATE/DELETE 하지 않는다.**
+
+존재 이유가 곧 사용 기준이다. 기존 테이블 대부분은 *현재 상태*라 덮어쓰기·삭제가 일어난다:
+
+| 상태 테이블 | 잃어버리는 것 |
+| --- | --- |
+| `votes` (choice upsert) | 선택 **변경 이력**. 소수파 밸런스 1차 선택이 재선택으로 덮인다 |
+| `event_participants` (취소 시 DELETE) | 참여했다 취소한 사실 |
+| `russian_roulette_games` (`shots_fired` 카운터) | 누가 몇 번째에 격발했는지 |
+| `extra_json` (통째로 교체) | 진행 중간 상태 |
+| `event_sessions` | `recruiting→active` 전이 시각, 정상 완료/강제 마감 구분 |
+
+**그래서 상태를 덮어쓰기 직전에 로그를 남긴다.** 새 기능을 추가할 때 그 기능이 위 표처럼
+상태를 덮어쓴다면 `log_activity()` 호출을 함께 넣어야 한다.
+
+이미 append-only인 것(`score_logs`, `discussion_messages`)은 **내용을 중복 저장하지 않는다.**
+익명 발언은 `payload.discussion_message_id`로 참조만 남겨 타임라인 순서만 확보한다.
+점수도 개별 델타는 `score_logs`에 그대로 두고, 라운드당 `score:round_settled` 요약 1건만 남긴다
+(요약은 분기별 `settlement` 문구가 아니라 실제 적용된 `score_logs`를 역산해서 만든다).
+
+`payload_json`에 게임별 세부를 담으므로 **새 게임이 추가돼도 스키마 마이그레이션이 필요 없다.**
+
+**규칙 스냅샷**: 라운드 생성/정산 시 `game_settings_snapshot()`이 튜닝 가능한 상수
+(`CUTTING_REWARD_POINTS` 등)를 값으로 남긴다. 밸런스 몰표 -2점처럼 `close_round_record`에
+하드코딩된 규칙은 값으로 뜰 수 없어서 `bot_version`(배포 커밋 SHA)을 항상 함께 남긴다 —
+그 커밋을 열면 당시 정산 규칙을 그대로 확인할 수 있다. `BOT_VERSION`은 릴리스 디렉터리
+이름(`/opt/yumcbot/releases/<sha>/`)에서 뽑는다.
+
+운영자용 조회 UI는 아직 없다 (`bot.py`의 `TODO(activity-log)`). 서버에서 직접 조회한다.
 
 ### 스키마 변경
 
 **`BASE_SCHEMA`(v1)는 절대 수정하지 않는다.** `tests/test_schema.py`가 SHA256 체크섬으로 고정해두었다.
 수정하면 새로 만든 DB와 운영 DB의 스키마가 조용히 갈라진다.
 
-스키마 추가는 `MIGRATIONS`에 등록한다. `SCHEMA_VERSION`은 자동 계산되고, 부팅 시 `init_db()`가
-`PRAGMA user_version`을 보고 밀린 것만 적용한다. 현재 최신은 **v4**(`russian_roulette_games` 테이블).
+스키마 추가는 `MIGRATIONS`에 다음 번호로 등록한다. `SCHEMA_VERSION`은 자동 계산되고,
+부팅 시 `init_db()`가 `PRAGMA user_version`을 보고 밀린 것만 적용한다.
 
 ```python
 MIGRATIONS: dict[int, list[str]] = {
-    4: ["ALTER TABLE rounds ADD COLUMN memo TEXT"],
+    6: ["ALTER TABLE rounds ADD COLUMN memo TEXT"],   # 현재 최신이 v5이므로 다음은 6
 }
 ```
 
-롤백 가능해야 하므로 **반드시 추가 형태**(`ADD COLUMN`, `CREATE TABLE` 등)로만. 컬럼 삭제/이름 변경/
+롤백 가능해야 하므로 **반드시 추가 형태**(`ADD COLUMN`, `CREATE TABLE`)로만. 컬럼 삭제/이름 변경/
 제약 변경은 구버전 코드로 되돌아갈 수 없게 만든다. 마이그레이션을 빠뜨리면 `verify_schema()`가 부팅을
 막는다 — 이게 없으면 봇이 로그인까지 성공해놓고(배포 헬스체크 통과) 게임 도중 `no such column`으로 터진다.
 
-기존 테이블의 PK를 바꿔야 하는 변경은 불가능하다. `discussion_posts`(PK `(round_id, user_id)`)의
-1인 1회 제약을 풀 때 그 테이블을 고치는 대신 `discussion_messages`를 새로 만든 것이 그 사례다.
-`discussion_posts`는 과거 데이터를 위해 남아 있을 뿐 더 이상 쓰지 않는다.
+**기존 테이블의 PK는 바꿀 수 없다.** `discussion_posts`의 1인 1회 제약을 풀 때 그 테이블을 고치지 않고
+`discussion_messages`를 새로 만든 것이 그래서다 (`discussion_posts`는 과거 데이터용으로 남아 있을 뿐이다).
 
 ### systemd 연동
 
@@ -139,10 +158,10 @@ MIGRATIONS: dict[int, list[str]] = {
 
 ## DB 위치
 
-|      | 경로                                                                                               |
-| ---- | -------------------------------------------------------------------------------------------------- |
-| 로컬 | `data/event_game.sqlite3` (gitignore)                                                              |
-| 운영 | `/var/lib/yumcbot/data/event_game.sqlite3` — 코드 트리(`/opt/yumcbot`) 밖이라 배포로 덮이지 않는다 |
+| | 경로 |
+| --- | --- |
+| 로컬 | `data/event_game.sqlite3` (gitignore) |
+| 운영 | `/var/lib/yumcbot/data/event_game.sqlite3` — 코드 트리(`/opt/yumcbot`) 밖이라 배포로 안 덮인다 |
 
 ## 브랜치 / 배포
 
@@ -159,3 +178,17 @@ main       운영 봇. PR 머지 시 자동 배포
 수정했다면 서버에서 `bootstrap.sh`를 다시 돌려야 한다. 서버 셋업/배포 동작 상세와 **서버 실물 스펙(Rocky Linux 8.10, i5-11600K, 125GiB RAM, KST)**은 `deploy/README.md`.
 
 `.gitattributes`가 `*.sh` / `*.service` / `deploy/*.py`를 LF로 고정한다. CRLF로 체크아웃되면 shebang이 깨진다.
+
+### main에 직접 커밋했다면 그 자리에서 develop으로 되돌린다
+
+머지가 `develop → main` 한 방향뿐이라 **main에서 갈라진 커밋은 develop으로 돌아올 경로가 없다.**
+이후 PR을 아무리 머지해도 방향이 반대라 영영 반영되지 않는다. 증상도 없다 — 테스트는 통과하고
+3-way 머지라 파일이 덮이지도 않아서, 조용히 갈라진 채 쌓이다가 같은 파일을 건드릴 때 터진다
+(`8bb32ae`의 `unixepoch()` 호환 수정이 main에만 3일간 떠 있었다).
+
+```powershell
+git merge origin/main                    # 핫픽스 직후 develop에서 바로
+git log --oneline develop..origin/main   # 상시 점검: 비어 있어야 정상
+```
+
+브랜치를 비교할 때 `main..develop`(develop의 새 작업)만 보지 말고 **반대 방향도 함께 본다.**
