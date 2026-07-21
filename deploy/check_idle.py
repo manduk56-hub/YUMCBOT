@@ -63,7 +63,10 @@ def main() -> int:
                 """
                 SELECT id, status FROM russian_roulette_games
                 WHERE status = 'playing'
-                   OR (status IN ('pending', 'betting') AND expires_at > unixepoch())
+                   OR (
+                        status IN ('pending', 'betting')
+                        AND expires_at > CAST(strftime('%s', 'now') AS INTEGER)
+                   )
                 ORDER BY id
                 """
             ).fetchall()
