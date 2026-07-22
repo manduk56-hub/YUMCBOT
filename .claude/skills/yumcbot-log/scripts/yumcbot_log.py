@@ -48,6 +48,16 @@ ACTION_LABELS = {
     "roulette:bet": "룰렛 베팅",
     "roulette:start": "룰렛 시작",
     "roulette:shot": "룰렛 격발",
+    "roulette:timeout": "룰렛 시간초과",
+    "roulette:stack": "룰렛 연승스택",
+    "roulette:expire": "룰렛 만료",
+}
+
+STACK_REASON_LABELS = {
+    "win": "승리",
+    "payout": "보상 지급 후 초기화",
+    "loss": "패배로 초기화",
+    "escaped": "신용 상태 탈출로 초기화",
 }
 
 GAME_LABELS = {
@@ -266,11 +276,43 @@ def who(names: dict[str, str], user_id: str | None) -> str:
     return f"{names.get(user_id, '?')}({user_id})"
 
 
+def counterpart(row: sqlite3.Row, uid: str) -> str | None:
+    """조회 대상 기준의 '상대'.
+
+    조회가 actor/target 양쪽을 잡으므로, 남이 나를 지목한 행에서는 actor 쪽이 상대다.
+    target을 그대로 쓰면 자기 자신이 자기 상대로 찍힌다 (룰렛 격발 로그는 승자를
+    target으로 걸기 때문에 이긴 사람 화면에서 특히 눈에 띈다).
+    """
+    actor, target = row["actor_user_id"], row["target_user_id"]
+    if target == uid:
+        return actor
+    if actor == uid:
+        return target
+    return target or actor
+
+
 def payload_of(row: sqlite3.Row) -> dict:
     try:
         return json.loads(row["payload_json"]) or {}
     except (json.JSONDecodeError, TypeError):
         return {}
+
+
+def roulette_result_note(p: dict) -> str:
+    """승자가 신용 유저면 판돈이 실제로 오가지 않는다. 그 사실과 스택 진행을 덧붙인다.
+
+    구버전 로그에는 이 키들이 없어서 아무것도 붙지 않는다.
+    """
+    if not p.get("winner_is_credit"):
+        return ""
+    stack = p.get("stack_after")
+    if stack is None:
+        note = "스택 미적립"  # 시간 초과 승리는 세지 않는다
+    elif stack == 0:
+        note = "연승 보상 지급"
+    else:
+        note = f"스택 {stack}"
+    return f" · 승자 실수령 {p.get('payout')}점 ({note})"
 
 
 def describe(row: sqlite3.Row, names: dict[str, str]) -> str:
@@ -294,13 +336,47 @@ def describe(row: sqlite3.Row, names: dict[str, str]) -> str:
             return (
                 f"{p.get('shot_index')}번째 발사 · 승 {who(names, p.get('winner_id'))}"
                 f" / 패 {who(names, p.get('loser_id'))} · {p.get('pot')}점"
+                + roulette_result_note(p)
             )
         return f"{p.get('shot_index')}번째 빈 탄"
+    if key == "roulette:timeout":
+        return (
+            f"{p.get('shot_index')}번째 차례 미격발 → 자동 패배 · "
+            f"승 {who(names, p.get('winner_id'))} / 패 {who(names, p.get('loser_id'))}"
+            f" · {p.get('pot')}점" + roulette_result_note(p)
+        )
     if key == "roulette:bet":
-        return f"{p.get('amount')}점 베팅 (보유 {p.get('balance')}점)"
+        amount, submitted = p.get("amount"), p.get("submitted")
+        if submitted is not None and submitted != amount:
+            # 신용 유저는 입력값과 관계없이 최소액으로 눌린다.
+            return f"{submitted}점 입력 → {amount}점 확정 (보유 {p.get('balance')}점 · 신용)"
+        return f"{amount}점 베팅 (보유 {p.get('balance')}점)"
     if key == "roulette:start":
-        bets = p.get("bets") or {}
-        return f"판돈 {p.get('pot')}점 · 베팅 {'/'.join(str(v) for v in bets.values())}"
+        stake = p.get("stake")
+        if stake is None:
+            # 각자 다른 금액을 걸 수 있던 시절의 구버전 로그.
+            bets = p.get("bets") or {}
+            return f"판돈 {p.get('pot')}점 · 베팅 {'/'.join(str(v) for v in bets.values())}"
+        text = f"판돈 {p.get('pot')}점 · 각 {stake}점"
+        submitted = list((p.get("submitted_bets") or {}).values())
+        if any(value != stake for value in submitted):
+            text += f" (입력 {'/'.join(str(v) for v in submitted)} → 낮은 쪽으로 통일)"
+        credit = [uid for uid, flag in (p.get("credit") or {}).items() if flag]
+        if credit:
+            text += f" · 신용 {'/'.join(who(names, uid) for uid in credit)}"
+        return text
+    if key == "roulette:stack":
+        reason = STACK_REASON_LABELS.get(str(p.get("reason")), p.get("reason"))
+        return f"연승 스택 {p.get('before')} → {p.get('after')} ({reason})"
+    if key == "roulette:expire":
+        if p.get("phase") != "betting":
+            return "수락 대기 만료 (횟수 미차감)"
+        missing = [
+            label
+            for label, value in (("신청자", p.get("challenger_bet")), ("상대", p.get("target_bet")))
+            if value is None
+        ]
+        return f"베팅 대기 만료 · 미입력 {'/'.join(missing) or '-'} (미입력자만 횟수 차감)"
     if key == "roulette:challenge":
         return f"신청 (내 {p.get('challenger_score')}점 vs 상대 {p.get('target_score')}점)"
     if key == "round:create":
@@ -360,15 +436,33 @@ def cmd_summary(conn, args) -> None:
     events = sorted({row["event_session_id"] for row in logs if row["event_session_id"]})
     rounds = sorted({row["round_id"] for row in logs if row["round_id"]})
 
-    # 룰렛 전적
-    wins = losses = 0
+    # 룰렛 전적. 시간 초과 자동 패배도 승부가 갈린 판이라 함께 센다.
+    wins = losses = timeout_losses = 0
+    stack = None
     for row in logs:
+        if row["category"] != "roulette":
+            continue
         p = payload_of(row)
-        if row["category"] == "roulette" and row["action"] == "shot" and p.get("result") == "fired":
-            if p.get("winner_id") == uid:
-                wins += 1
-            elif p.get("loser_id") == uid:
-                losses += 1
+        if row["action"] == "stack":
+            stack = p.get("after")
+            continue
+        decided = row["action"] == "timeout" or (
+            row["action"] == "shot" and p.get("result") == "fired"
+        )
+        if not decided:
+            continue
+        if p.get("winner_id") == uid:
+            wins += 1
+        elif p.get("loser_id") == uid:
+            losses += 1
+            if row["action"] == "timeout":
+                timeout_losses += 1
+
+    record = "없음"
+    if wins or losses:
+        record = f"{wins}승 {losses}패"
+        if timeout_losses:
+            record += f" (시간 초과 패 {timeout_losses})"
 
     changed = sum(1 for row in logs if payload_of(row).get("changed"))
     gained = sum(row["delta"] for row in scores if row["delta"] > 0)
@@ -378,11 +472,14 @@ def cmd_summary(conn, args) -> None:
         ["활동 기간", f"{days[0]} ~ {days[-1]}  ({len(days)}일)" if days else "-"],
         ["참여 이벤트", f"{len(events)}회  {'· '.join('E' + str(e) for e in events[-5:])}"],
         ["플레이 라운드", f"{len(rounds)}개"],
-        ["룰렛 전적", f"{wins}승 {losses}패" if (wins or losses) else "없음"],
+        ["룰렛 전적", record],
         ["선택 변경", f"{changed}회"],
         ["점수", f"획득 +{gained} / 손실 {lost} / 합계 {gained + lost:+d}"],
         ["활동 로그", f"{len(logs)}건"],
     ]
+    if stack is not None:
+        # users 테이블을 안 읽고 로그에서 뽑는다. 스키마 v6 미만 DB에도 그대로 돈다.
+        info.insert(4, ["룰렛 연승 스택", f"{stack} (마지막 기록 기준)"])
     print()
     print(table(["항목", "값"], info))
 
@@ -471,7 +568,7 @@ def cmd_detail(conn, args) -> None:
                 row["created_at"][11:19],
                 label_for(row["category"], row["action"]),
                 scope_of(row),
-                who(names, row["target_user_id"]) if row["target_user_id"] else "-",
+                who(names, counterpart(row, uid)),
                 describe(row, names),
             ]
             for row in entries
