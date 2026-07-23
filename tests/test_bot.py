@@ -95,72 +95,387 @@ class BotRegressionTests(unittest.TestCase):
         with bot.db() as conn, self.assertRaisesRegex(ValueError, "플레이어만"):
             bot.roulette_player_score_message(conn, game, "3")
 
-    def test_roulette_escrows_bets_and_awards_the_whole_pot(self) -> None:
+    def new_betting_game(self, conn, created_at: str | None = None) -> int:
+        cursor = conn.execute(
+            """
+            INSERT INTO russian_roulette_games (
+                guild_id, channel_id, challenger_id, target_id,
+                challenger_name, target_name, status, created_at, expires_at
+            )
+            VALUES ('10', '20', '1', '2', '도전자', '상대', 'betting', ?, ?)
+            """,
+            (created_at or bot.now_text(), 9_999_999_999),
+        )
+        return int(cursor.lastrowid)
+
+    def scores_of(self, conn, *user_ids: str) -> dict[str, int]:
+        placeholders = ", ".join("?" for _ in user_ids)
+        return {
+            row["user_id"]: row["total_score"]
+            for row in conn.execute(
+                f"SELECT user_id, total_score FROM users WHERE user_id IN ({placeholders})",
+                user_ids,
+            )
+        }
+
+    def test_roulette_unifies_bets_to_the_lower_stake_and_awards_the_pot(self) -> None:
+        """서로 다른 금액을 걸면 낮은 쪽으로 맞춰진다.
+
+        금액이 다른 채로 두면 적게 건 쪽이 항상 이득이라 '무조건 최소액'이 유일한 정답이 된다.
+        """
         self.add_user("1", "도전자", 10)
         self.add_user("2", "상대", 8)
         with bot.db() as conn:
-            cursor = conn.execute(
-                """
-                INSERT INTO russian_roulette_games (
-                    guild_id, channel_id, challenger_id, target_id,
-                    challenger_name, target_name, status, created_at, expires_at
-                )
-                VALUES ('10', '20', '1', '2', '도전자', '상대', 'betting', ?, ?)
-                """,
-                (bot.now_text(), 9_999_999_999),
-            )
-            game_id = int(cursor.lastrowid)
+            game_id = self.new_betting_game(conn)
 
-            state, _ = bot.submit_roulette_bet(conn, game_id, "1", 4)
+            state, _ = bot.submit_roulette_bet(conn, game_id, "1", 3)
             self.assertEqual(state, "waiting")
             with patch.object(bot.secrets, "randbelow", side_effect=[0, 2]):
-                state, game = bot.submit_roulette_bet(conn, game_id, "2", 3)
+                state, game = bot.submit_roulette_bet(conn, game_id, "2", 2)
 
             self.assertEqual(state, "started")
+            self.assertEqual(game["challenger_bet"], 2)
+            self.assertEqual(game["target_bet"], 2)
             self.assertEqual(game["current_player_id"], "1")
             self.assertEqual(game["live_chamber"], 2)
-            scores = {
-                row["user_id"]: row["total_score"]
-                for row in conn.execute(
-                    "SELECT user_id, total_score FROM users WHERE user_id IN ('1', '2')"
-                )
-            }
-            self.assertEqual(scores, {"1": 6, "2": 5})
+            self.assertIsNotNone(game["expires_at"])
+            self.assertEqual(self.scores_of(conn, "1", "2"), {"1": 8, "2": 6})
 
             self.assertEqual(bot.pull_roulette_trigger(conn, game_id, "1")[0], "blank")
             self.assertEqual(bot.pull_roulette_trigger(conn, game_id, "2")[0], "blank")
             result, finished = bot.pull_roulette_trigger(conn, game_id, "1")
+
             self.assertEqual(result, "fired")
             self.assertEqual(finished["winner_id"], "2")
-            self.assertEqual(finished["loser_id"], "1")
+            self.assertEqual(finished["finish_cause"], "fired")
             rendered = json.dumps(bot.build_roulette_embed(finished).to_dict(), ensure_ascii=False)
-            self.assertIn("<@2>님이 <@1>님의 **4점**을 빼앗았습니다", rendered)
+            self.assertIn("<@2>님이 <@1>님의 **2점**을 빼앗았습니다", rendered)
 
-            final_scores = {
-                row["user_id"]: row["total_score"]
-                for row in conn.execute(
-                    "SELECT user_id, total_score FROM users WHERE user_id IN ('1', '2')"
-                )
-            }
-            self.assertEqual(final_scores, {"1": 6, "2": 12})
-            self.assertEqual(sum(final_scores.values()), 18)
+            final = self.scores_of(conn, "1", "2")
+            self.assertEqual(final, {"1": 8, "2": 10})
+            self.assertEqual(sum(final.values()), 18)
 
     def test_roulette_rejects_a_bet_over_the_current_balance(self) -> None:
         self.add_user("1", "도전자", 2)
         self.add_user("2", "상대", 3)
         with bot.db() as conn:
-            cursor = conn.execute(
+            game_id = self.new_betting_game(conn)
+            with self.assertRaisesRegex(ValueError, "가진 점수보다 많이"):
+                bot.submit_roulette_bet(conn, game_id, "1", 3)
+
+    def test_roulette_rejects_a_bet_over_the_maximum(self) -> None:
+        self.add_user("1", "도전자", 100)
+        self.add_user("2", "상대", 100)
+        with bot.db() as conn:
+            game_id = self.new_betting_game(conn)
+            with self.assertRaisesRegex(ValueError, "사이여야"):
+                bot.submit_roulette_bet(conn, game_id, "1", bot.ROULETTE_MAX_BET + 1)
+
+    def test_roulette_credit_user_bet_is_clamped_and_winning_pays_nothing(self) -> None:
+        """신용 유저는 강제로 최소액을 걸고, 이겨도 예치금만 돌려받는다.
+
+        진행판에는 최소액을 건 다른 플레이어와 똑같이 보여야 하므로 금액도 같아야 한다.
+        """
+        self.add_user("1", "도전자", 5)
+        self.add_user("2", "빚쟁이", -1)
+        with bot.db() as conn:
+            game_id = self.new_betting_game(conn)
+
+            bot.submit_roulette_bet(conn, game_id, "1", bot.ROULETTE_MAX_BET)
+            # 3을 넣어도 신용 유저라 최소액으로 눌린다.
+            with patch.object(bot.secrets, "randbelow", side_effect=[0, 0]):
+                state, game = bot.submit_roulette_bet(conn, game_id, "2", bot.ROULETTE_MAX_BET)
+
+            self.assertEqual(state, "started")
+            self.assertEqual(game["target_bet"], bot.ROULETTE_MIN_BET)
+            self.assertEqual(game["challenger_bet"], bot.ROULETTE_MIN_BET)
+            self.assertEqual(game["target_negative"], 1)
+            self.assertEqual(game["challenger_negative"], 0)
+            self.assertEqual(self.scores_of(conn, "1", "2"), {"1": 4, "2": -2})
+
+            result, finished = bot.pull_roulette_trigger(conn, game_id, "1")
+
+            self.assertEqual(result, "fired")
+            self.assertEqual(finished["winner_id"], "2")
+            # 이긴 신용 유저는 순변동 0, 진 쪽만 1점을 잃는다.
+            self.assertEqual(self.scores_of(conn, "1", "2"), {"1": 4, "2": -1})
+            self.assertEqual(finished["winner_stack_after"], 1)
+            self.assertEqual(bot.get_roulette_stack(conn, "2"), 1)
+
+            # 공개 결과는 일반 유저가 이겼을 때와 글자 하나 다르지 않아야 한다.
+            rendered = json.dumps(bot.build_roulette_embed(finished).to_dict(), ensure_ascii=False)
+            self.assertIn("<@2>님이 <@1>님의 **1점**을 빼앗았습니다", rendered)
+            self.assertNotIn("신용", rendered)
+            self.assertNotIn("스택", rendered)
+
+    def test_roulette_credit_user_stack_pays_out_on_the_second_win(self) -> None:
+        self.add_user("1", "도전자", 10)
+        self.add_user("2", "빚쟁이", -1)
+        for expected_stack in (1, 0):
+            with bot.db() as conn:
+                game_id = self.new_betting_game(conn)
+                bot.submit_roulette_bet(conn, game_id, "1", 1)
+                with patch.object(bot.secrets, "randbelow", side_effect=[0, 0]):
+                    bot.submit_roulette_bet(conn, game_id, "2", 1)
+                _, finished = bot.pull_roulette_trigger(conn, game_id, "1")
+                self.assertEqual(finished["winner_id"], "2")
+                self.assertEqual(finished["winner_stack_after"], expected_stack)
+
+        with bot.db() as conn:
+            # 2연승 보상 +2점을 받아 신용 상태를 벗어났고, 스택은 0으로 초기화됐다.
+            self.assertEqual(self.scores_of(conn, "2")["2"], 1)
+            self.assertEqual(bot.get_roulette_stack(conn, "2"), 0)
+
+    def test_roulette_stack_resets_when_leaving_credit_status(self) -> None:
+        """메인게임 정산으로 신용 상태를 벗어나도 스택은 무효가 된다."""
+        self.add_user("2", "빚쟁이", -3)
+        with bot.db() as conn:
+            bot.set_roulette_stack(conn, "2", 1, "win")
+            bot.add_score(conn, "2", "빚쟁이", 5, "라운드 보상")
+
+            self.assertEqual(bot.get_roulette_stack(conn, "2"), 0)
+            reasons = [
+                json.loads(row["payload_json"])["reason"]
+                for row in conn.execute(
+                    "SELECT payload_json FROM activity_logs "
+                    "WHERE category = 'roulette' AND action = 'stack' ORDER BY id"
+                )
+            ]
+            self.assertEqual(reasons, ["win", "escaped"])
+
+    def _display_name(self, conn, user_id: str) -> str:
+        row = conn.execute(
+            "SELECT display_name FROM users WHERE user_id = ?", (user_id,)
+        ).fetchone()
+        return row["display_name"]
+
+    def test_add_score_preserves_existing_name_when_none(self) -> None:
+        """멤버 캐시 미스로 display_name=None이 와도 기존 이름을 덮지 않는다 (issue #19)."""
+        self.add_user("42", "진짜이름", 0)
+        with bot.db() as conn:
+            bot.add_score(conn, "42", None, 5, "라운드 보상")
+
+            self.assertEqual(self._display_name(conn, "42"), "진짜이름")
+            self.assertEqual(self.scores_of(conn, "42")["42"], 5)
+
+    def test_add_score_new_user_with_none_gets_placeholder(self) -> None:
+        """행이 없던 유저 + None이면 NOT NULL 위반 없이 플레이스홀더로 채운다 (issue #19)."""
+        with bot.db() as conn:
+            bot.add_score(conn, "99", None, 3, "라운드 보상")
+
+            self.assertEqual(self._display_name(conn, "99"), "User 99")
+            self.assertEqual(self.scores_of(conn, "99")["99"], 3)
+
+    def test_add_score_updates_name_when_present(self) -> None:
+        """이름이 읽히면(None 아님) 정상적으로 갱신한다."""
+        self.add_user("7", "옛이름", 0)
+        with bot.db() as conn:
+            bot.add_score(conn, "7", "새이름", 1, "라운드 보상")
+
+            self.assertEqual(self._display_name(conn, "7"), "새이름")
+
+    def test_member_name_returns_none_on_cache_miss(self) -> None:
+        """캐시 미스(멤버 없음/길드 없음)면 플레이스홀더가 아니라 None을 반환한다 (issue #19)."""
+        self.assertIsNone(bot.member_name(None, "123"))
+        guild = SimpleNamespace(get_member=lambda _uid: None)
+        self.assertIsNone(bot.member_name(guild, "123"))
+        member = SimpleNamespace(display_name="캐시된이름")
+        guild_hit = SimpleNamespace(get_member=lambda _uid: member)
+        self.assertEqual(bot.member_name(guild_hit, "123"), "캐시된이름")
+
+    def test_roulette_timeout_makes_the_idle_player_lose(self) -> None:
+        """자기 차례에 안 누르면 자동 패배. 무승부 환불이면 잠수가 지배 전략이 된다."""
+        self.add_user("1", "도전자", 5)
+        self.add_user("2", "상대", 5)
+        with bot.db() as conn:
+            game_id = self.new_betting_game(conn)
+            bot.submit_roulette_bet(conn, game_id, "1", 2)
+            with patch.object(bot.secrets, "randbelow", side_effect=[0, 5]):
+                _, game = bot.submit_roulette_bet(conn, game_id, "2", 2)
+
+            self.assertIsNotNone(game["expires_at"])
+            finished = bot.timeout_roulette_turn(conn, game_id, 0)
+
+            self.assertIsNotNone(finished)
+            self.assertEqual(finished["loser_id"], "1")
+            self.assertEqual(finished["winner_id"], "2")
+            self.assertEqual(finished["finish_cause"], "timeout")
+            self.assertEqual(finished["shots_fired"], 0)
+            self.assertEqual(self.scores_of(conn, "1", "2"), {"1": 3, "2": 7})
+
+    def test_roulette_timeout_is_ignored_when_the_turn_already_moved_on(self) -> None:
+        """격발로 차례가 넘어간 뒤 도착한 낡은 타이머는 아무것도 하지 않아야 한다."""
+        self.add_user("1", "도전자", 5)
+        self.add_user("2", "상대", 5)
+        with bot.db() as conn:
+            game_id = self.new_betting_game(conn)
+            bot.submit_roulette_bet(conn, game_id, "1", 1)
+            with patch.object(bot.secrets, "randbelow", side_effect=[0, 5]):
+                _, game = bot.submit_roulette_bet(conn, game_id, "2", 1)
+
+            self.assertEqual(game["shots_fired"], 0)
+            bot.pull_roulette_trigger(conn, game_id, "1")
+
+            # 0번 차례를 감시하던 타이머. 이미 1번 차례로 넘어갔으므로 무시돼야 한다.
+            self.assertIsNone(bot.timeout_roulette_turn(conn, game_id, 0))
+            still_playing = conn.execute(
+                "SELECT status FROM russian_roulette_games WHERE id = ?", (game_id,)
+            ).fetchone()
+            self.assertEqual(still_playing["status"], "playing")
+
+    def test_roulette_timeout_win_does_not_advance_the_stack(self) -> None:
+        """짜고 잠수해주면 확률 없이 스택을 채울 수 있으므로 시간 초과 승리는 세지 않는다."""
+        self.add_user("1", "도전자", 5)
+        self.add_user("2", "빚쟁이", -1)
+        with bot.db() as conn:
+            game_id = self.new_betting_game(conn)
+            bot.submit_roulette_bet(conn, game_id, "1", 1)
+            with patch.object(bot.secrets, "randbelow", side_effect=[0, 5]):
+                bot.submit_roulette_bet(conn, game_id, "2", 1)
+
+            finished = bot.timeout_roulette_turn(conn, game_id, 0)
+
+            self.assertEqual(finished["winner_id"], "2")
+            self.assertIsNone(finished["winner_stack_after"])
+            self.assertEqual(bot.get_roulette_stack(conn, "2"), 0)
+
+    def test_roulette_daily_count_charges_only_the_player_who_skipped_betting(self) -> None:
+        """베팅을 넣은 쪽은 상대가 방치해도 횟수를 잃지 않는다."""
+        self.add_user("1", "도전자", 5)
+        self.add_user("2", "상대", 5)
+        today = bot.roulette_day_key()
+        with bot.db() as conn:
+            conn.execute(
+                """
+                INSERT INTO russian_roulette_games (
+                    guild_id, channel_id, challenger_id, target_id,
+                    challenger_name, target_name, status, created_at,
+                    accepted_at, challenger_bet, target_bet
+                )
+                VALUES ('10', '20', '1', '2', '도전자', '상대', 'expired', ?, ?, NULL, 2)
+                """,
+                (f"{today} 12:00:00", f"{today} 12:01:00"),
+            )
+
+            self.assertEqual(bot.count_roulette_games_today(conn, "1"), 1)
+            self.assertEqual(bot.count_roulette_games_today(conn, "2"), 0)
+            # 성립하지 않은 판이라 '같은 상대 하루 1회'는 태우지 않는다.
+            self.assertEqual(
+                bot.count_roulette_games_with_opponent_today(conn, "1", "2"), 0
+            )
+
+    def test_roulette_daily_count_ignores_declines_and_pending_expiry(self) -> None:
+        self.add_user("1", "도전자", 5)
+        self.add_user("2", "상대", 5)
+        today = bot.roulette_day_key()
+        with bot.db() as conn:
+            for status, accepted in (("declined", None), ("expired", None)):
+                conn.execute(
+                    """
+                    INSERT INTO russian_roulette_games (
+                        guild_id, channel_id, challenger_id, target_id,
+                        challenger_name, target_name, status, created_at, accepted_at
+                    )
+                    VALUES ('10', '20', '1', '2', '도전자', '상대', ?, ?, ?)
+                    """,
+                    (status, f"{today} 12:00:00", accepted),
+                )
+
+            self.assertEqual(bot.count_roulette_games_today(conn, "1"), 0)
+            self.assertEqual(bot.count_roulette_games_today(conn, "2"), 0)
+
+    def test_roulette_daily_count_is_scoped_to_the_day(self) -> None:
+        self.add_user("1", "도전자", 5)
+        self.add_user("2", "상대", 5)
+        with bot.db() as conn:
+            for day in ("2026-07-21", "2026-07-22"):
+                conn.execute(
+                    """
+                    INSERT INTO russian_roulette_games (
+                        guild_id, channel_id, challenger_id, target_id,
+                        challenger_name, target_name, status, created_at
+                    )
+                    VALUES ('10', '20', '1', '2', '도전자', '상대', 'finished', ?)
+                    """,
+                    (f"{day} 12:00:00",),
+                )
+
+            self.assertEqual(
+                bot.count_roulette_games_today(conn, "1", day="2026-07-22"), 1
+            )
+            self.assertEqual(
+                bot.count_roulette_games_with_opponent_today(
+                    conn, "1", "2", day="2026-07-22"
+                ),
+                1,
+            )
+
+    def test_roulette_pending_locks_only_the_challenger(self) -> None:
+        """받는 쪽까지 묶으면 신청만 걸어두는 것으로 상대를 공짜로 배제할 수 있다."""
+        self.add_user("1", "도전자", 5)
+        self.add_user("2", "상대", 5)
+        with bot.db() as conn:
+            conn.execute(
                 """
                 INSERT INTO russian_roulette_games (
                     guild_id, channel_id, challenger_id, target_id,
                     challenger_name, target_name, status, created_at, expires_at
                 )
-                VALUES ('10', '20', '1', '2', '도전자', '상대', 'betting', ?, ?)
+                VALUES ('10', '20', '1', '2', '도전자', '상대', 'pending', ?, ?)
                 """,
                 (bot.now_text(), 9_999_999_999),
             )
-            with self.assertRaisesRegex(ValueError, "가진 점수보다 많이"):
-                bot.submit_roulette_bet(conn, int(cursor.lastrowid), "1", 3)
+
+            self.assertIsNotNone(bot.active_roulette_game_for_user(conn, "1"))
+            self.assertIsNone(bot.active_roulette_game_for_user(conn, "2"))
+
+    def test_roulette_betting_embed_hides_amounts_until_both_are_in(self) -> None:
+        """먼저 넣은 금액이 보이면 나중에 넣는 쪽이 그걸 보고 정할 수 있다."""
+        game = {
+            "id": 7,
+            "challenger_id": "1",
+            "target_id": "2",
+            "status": "betting",
+            "challenger_bet": 3,
+            "target_bet": None,
+            "expires_at": 9_999_999_999,
+            "finish_cause": None,
+        }
+
+        rendered = json.dumps(bot.build_roulette_embed(game).to_dict(), ensure_ascii=False)
+
+        self.assertIn("입력 완료", rendered)
+        self.assertIn("입력 대기 중", rendered)
+        self.assertNotIn("**3점**", rendered)
+
+    def test_roulette_finished_view_keeps_a_personal_settlement_button(self) -> None:
+        view = bot.roulette_view({"id": 7, "status": "finished"})
+
+        self.assertEqual(
+            [item.custom_id for item in view.children], ["eventbot:roulettesettle:7"]
+        )
+
+    def test_roulette_settlement_message_is_private_about_credit_results(self) -> None:
+        self.add_user("2", "빚쟁이", -1)
+        game = {
+            "id": 7,
+            "challenger_id": "1",
+            "target_id": "2",
+            "challenger_bet": 1,
+            "target_bet": 1,
+            "challenger_negative": 0,
+            "target_negative": 1,
+            "winner_id": "2",
+            "loser_id": "1",
+            "finish_cause": "fired",
+            "winner_stack_after": 1,
+        }
+
+        with bot.db() as conn:
+            message = bot.roulette_settlement_message(conn, game, "2")
+
+        self.assertIn("점수 변동 **없음**", message)
+        self.assertIn(f"연승 스택 **1/{bot.ROULETTE_STACK_GOAL}**", message)
 
     def test_close_time_text_shows_exact_discord_time_without_relative_time(self) -> None:
         rendered = bot.close_time_text(1_800_000_000.9)
@@ -1710,6 +2025,60 @@ class BotRegressionTests(unittest.TestCase):
         self.assertIsNotNone(unmatched_user_id)
         paired = {user_id for pair in pairs for user_id in pair}
         self.assertNotIn(unmatched_user_id, paired)
+
+    def _insert_round(self, round_id: int, round_type: str) -> None:
+        with bot.db() as conn:
+            conn.execute(
+                """
+                INSERT INTO rounds (id, type, title, question, created_at)
+                VALUES (?, ?, '제목', '질문', '2026-01-01 00:00:00')
+                """,
+                (round_id, round_type),
+            )
+
+    def _insert_pairing(self, round_id: int, user_a_id: str, user_b_id: str) -> None:
+        with bot.db() as conn:
+            conn.execute(
+                """
+                INSERT INTO trust_pairings (round_id, user_a_id, user_b_id, created_at)
+                VALUES (?, ?, ?, '2026-01-01 00:00:00')
+                """,
+                (round_id, user_a_id, user_b_id),
+            )
+
+    def test_recent_match_pairs_isolates_by_round_type_and_normalizes(self) -> None:
+        # trust 라운드 1·3, sand 라운드 2·4 를 섞어 심는다.
+        self._insert_round(1, "trust")
+        self._insert_round(2, "sand")
+        self._insert_round(3, "trust")
+        self._insert_round(4, "sand")
+        self._insert_pairing(1, "A", "B")  # trust
+        self._insert_pairing(2, "C", "A")  # sand, 저장 순서가 뒤집힘
+        self._insert_pairing(3, "A", "C")  # trust
+        self._insert_pairing(4, "B", "A")  # sand
+
+        with bot.db() as conn:
+            sand_recent = bot.recent_match_pairs(conn, 5, "sand")
+            trust_recent = bot.recent_match_pairs(conn, 5, "trust")
+
+        # sand 라운드는 sand 짝만 보고, trust 라운드와 섞이지 않는다. 짝은 정렬되어 정규화된다.
+        self.assertEqual(sand_recent, {("A", "C"), ("A", "B")})
+        self.assertEqual(trust_recent, {("A", "B"), ("A", "C")})
+
+    def test_recent_match_pairs_respects_history_window(self) -> None:
+        for round_id in range(1, 6):  # sand 라운드 1~5
+            self._insert_round(round_id, "sand")
+            self._insert_pairing(round_id, f"a{round_id}", f"b{round_id}")
+
+        with bot.db() as conn:
+            recent = bot.recent_match_pairs(conn, 6, "sand", history_rounds=2)
+
+        # 직전 2개 라운드(4·5)의 짝만 회피 대상이 된다.
+        self.assertEqual(recent, {("a4", "b4"), ("a5", "b5")})
+
+    def test_recent_match_pairs_empty_when_no_history(self) -> None:
+        with bot.db() as conn:
+            self.assertEqual(bot.recent_match_pairs(conn, 1, "sand"), set())
 
     def test_emergency_join_pairs_waiting_user_and_extends_deadline(self) -> None:
         extra = {
