@@ -243,6 +243,46 @@ class BotRegressionTests(unittest.TestCase):
             ]
             self.assertEqual(reasons, ["win", "escaped"])
 
+    def _display_name(self, conn, user_id: str) -> str:
+        row = conn.execute(
+            "SELECT display_name FROM users WHERE user_id = ?", (user_id,)
+        ).fetchone()
+        return row["display_name"]
+
+    def test_add_score_preserves_existing_name_when_none(self) -> None:
+        """멤버 캐시 미스로 display_name=None이 와도 기존 이름을 덮지 않는다 (issue #19)."""
+        self.add_user("42", "진짜이름", 0)
+        with bot.db() as conn:
+            bot.add_score(conn, "42", None, 5, "라운드 보상")
+
+            self.assertEqual(self._display_name(conn, "42"), "진짜이름")
+            self.assertEqual(self.scores_of(conn, "42")["42"], 5)
+
+    def test_add_score_new_user_with_none_gets_placeholder(self) -> None:
+        """행이 없던 유저 + None이면 NOT NULL 위반 없이 플레이스홀더로 채운다 (issue #19)."""
+        with bot.db() as conn:
+            bot.add_score(conn, "99", None, 3, "라운드 보상")
+
+            self.assertEqual(self._display_name(conn, "99"), "User 99")
+            self.assertEqual(self.scores_of(conn, "99")["99"], 3)
+
+    def test_add_score_updates_name_when_present(self) -> None:
+        """이름이 읽히면(None 아님) 정상적으로 갱신한다."""
+        self.add_user("7", "옛이름", 0)
+        with bot.db() as conn:
+            bot.add_score(conn, "7", "새이름", 1, "라운드 보상")
+
+            self.assertEqual(self._display_name(conn, "7"), "새이름")
+
+    def test_member_name_returns_none_on_cache_miss(self) -> None:
+        """캐시 미스(멤버 없음/길드 없음)면 플레이스홀더가 아니라 None을 반환한다 (issue #19)."""
+        self.assertIsNone(bot.member_name(None, "123"))
+        guild = SimpleNamespace(get_member=lambda _uid: None)
+        self.assertIsNone(bot.member_name(guild, "123"))
+        member = SimpleNamespace(display_name="캐시된이름")
+        guild_hit = SimpleNamespace(get_member=lambda _uid: member)
+        self.assertEqual(bot.member_name(guild_hit, "123"), "캐시된이름")
+
     def test_roulette_timeout_makes_the_idle_player_lose(self) -> None:
         """자기 차례에 안 누르면 자동 패배. 무승부 환불이면 잠수가 지배 전략이 된다."""
         self.add_user("1", "도전자", 5)

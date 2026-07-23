@@ -28,6 +28,8 @@ shellcheck deploy/*.sh                                # CI가 도는 배포 스�
 
 `.env`: `DISCORD_TOKEN`(본인 dev 봇), `GUILD_ID`(있으면 슬래시 명령어 즉시 동기화), `OPERATOR_ROLE_IDS`, `YUMCBOT_DATA_DIR`(선택).
 
+봇이 `members` 특권 인텐트를 쓴다(정산 시 이름 캐시 미스로 `display_name`이 오염되던 issue #19). **Developer Portal → 앱 → Bot → SERVER MEMBERS INTENT를 각자 ON** 해야 한다. 안 켜면 로그인 단계에서 `PrivilegedIntentsRequired`로 죽는다(운영은 헬스체크에 걸려 자동 롤백). 코드보다 포털이 먼저다.
+
 ## 아키텍처
 
 전체 로직이 `bot.py` 한 파일에 있고, 구역 순서는 대략:
