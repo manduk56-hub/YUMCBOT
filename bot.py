@@ -84,7 +84,7 @@ TOP3_NONE_CHOICE = "__none__"
 UNIQUE_NUMBER_CHOICES = [str(index) for index in range(1, 16)]
 TRUST_REGISTRATION_DEFAULT_MINUTES = 2
 TRUST_DECISION_SECONDS = 180
-TRUST_MATCH_HISTORY_ROUNDS = 3
+MATCH_HISTORY_ROUNDS = 3  # 메인게임 1:1 매칭에서 이 라운드 수만큼 직전 짝을 회피 (trust·sand 공유)
 TRUST_OUTCOME_LABELS = {
     "mutual": "신뢰",
     "single": "단독 배신",
@@ -792,10 +792,11 @@ def game_settings_snapshot(game_key: str) -> dict[str, Any]:
         settings["success_rates"] = CUTTING_SUCCESS_RATES
     elif game_key == "trust":
         settings["decision_seconds"] = TRUST_DECISION_SECONDS
-        settings["match_history_rounds"] = TRUST_MATCH_HISTORY_ROUNDS
+        settings["match_history_rounds"] = MATCH_HISTORY_ROUNDS
     elif game_key == "sand":
         settings["play_seconds"] = SAND_PLAY_SECONDS
         settings["number_choices"] = SAND_NUMBER_CHOICES
+        settings["match_history_rounds"] = MATCH_HISTORY_ROUNDS
     elif game_key == "unique_number":
         settings["number_choices"] = UNIQUE_NUMBER_CHOICES
     elif game_key == "defuse4":
@@ -1694,6 +1695,39 @@ class AnonymousDiscussionModal(discord.ui.Modal):
             pass
 
 
+def recent_match_pairs(
+    conn: sqlite3.Connection,
+    round_id: int,
+    round_type: str,
+    history_rounds: int = MATCH_HISTORY_ROUNDS,
+) -> set[tuple[str, str]]:
+    """직전 `history_rounds`개 같은 타입 라운드에서 성사된 1:1 짝을 정규화해 모은다.
+
+    trust·sand 모두 `trust_pairings`에 짝을 남기므로 `round_type`으로 갈라 조회한다.
+    """
+    history_rows = conn.execute(
+        """
+        SELECT id FROM rounds
+        WHERE type = ? AND id < ?
+        ORDER BY id DESC
+        LIMIT ?
+        """,
+        (round_type, round_id, history_rounds),
+    ).fetchall()
+    history_ids = [int(row["id"]) for row in history_rows]
+    if not history_ids:
+        return set()
+    placeholders = ", ".join("?" for _ in history_ids)
+    history_pairs = conn.execute(
+        f"SELECT user_a_id, user_b_id FROM trust_pairings WHERE round_id IN ({placeholders})",
+        tuple(history_ids),
+    ).fetchall()
+    return {
+        tuple(sorted((str(row["user_a_id"]), str(row["user_b_id"]))))
+        for row in history_pairs
+    }
+
+
 def build_random_trust_pairs(
     user_ids: list[str],
     recent_pairs: set[tuple[str, str]],
@@ -1754,28 +1788,7 @@ def start_trust_decision(round_id: int) -> dict[str, Any] | None:
                 "embed": embed,
             }
 
-        history_rounds = conn.execute(
-            """
-            SELECT id FROM rounds
-            WHERE type = 'trust' AND id < ?
-            ORDER BY id DESC
-            LIMIT ?
-            """,
-            (round_id, TRUST_MATCH_HISTORY_ROUNDS),
-        ).fetchall()
-        history_ids = [int(row["id"]) for row in history_rounds]
-        recent_pairs: set[tuple[str, str]] = set()
-        if history_ids:
-            placeholders = ", ".join("?" for _ in history_ids)
-            history_pairs = conn.execute(
-                f"SELECT user_a_id, user_b_id FROM trust_pairings WHERE round_id IN ({placeholders})",
-                tuple(history_ids),
-            ).fetchall()
-            recent_pairs = {
-                tuple(sorted((str(row["user_a_id"]), str(row["user_b_id"]))))
-                for row in history_pairs
-            }
-
+        recent_pairs = recent_match_pairs(conn, round_id, "trust")
         pairs, unmatched_user_id = build_random_trust_pairs(user_ids, recent_pairs)
         for user_a_id, user_b_id in pairs:
             conn.execute(
@@ -2227,7 +2240,8 @@ def start_sand_game(round_id: int) -> dict[str, Any] | None:
                 "embed": embed,
             }
 
-        pairs, unmatched_user_id = build_random_trust_pairs(user_ids, set())
+        recent_pairs = recent_match_pairs(conn, round_id, "sand")
+        pairs, unmatched_user_id = build_random_trust_pairs(user_ids, recent_pairs)
         sand_pairs: list[dict[str, Any]] = []
         for user_a_id, user_b_id in pairs:
             conn.execute(
