@@ -670,21 +670,24 @@ def ensure_user(conn: sqlite3.Connection, user: discord.abc.User) -> None:
 def add_score(
     conn: sqlite3.Connection,
     user_id: str,
-    display_name: str,
+    display_name: str | None,
     delta: int,
     reason: str,
     round_id: int | None = None,
 ) -> None:
     ts = now_text()
+    # display_name이 None(멤버 캐시 미스)이면 신규 행은 플레이스홀더로,
+    # 기존 행은 이름을 보존한다. excluded는 VALUES에서 파생돼 이 분기를 못 하므로
+    # 원본 :name 파라미터를 UPDATE에서 직접 참조한다 (issue #19).
     conn.execute(
         """
         INSERT INTO users (user_id, display_name, total_score, created_at, updated_at)
-        VALUES (?, ?, 0, ?, ?)
+        VALUES (:uid, COALESCE(:name, 'User ' || :uid), 0, :ts, :ts)
         ON CONFLICT(user_id) DO UPDATE SET
-            display_name = excluded.display_name,
-            updated_at = excluded.updated_at
+            display_name = COALESCE(:name, users.display_name),
+            updated_at = :ts
         """,
-        (user_id, display_name, ts, ts),
+        {"uid": user_id, "name": display_name, "ts": ts},
     )
     conn.execute(
         "UPDATE users SET total_score = total_score + ?, updated_at = ? WHERE user_id = ?",
@@ -1178,12 +1181,18 @@ def field_text(lines: list[str], empty: str = "없음", limit: int = 1024) -> st
     return text if len(text) <= limit else text[: limit - 3] + "..."
 
 
-def member_name(guild: discord.Guild | None, user_id: str) -> str:
+def member_name(guild: discord.Guild | None, user_id: str) -> str | None:
+    """멤버 캐시에서 표시 이름을 읽는다. 미스면 None.
+
+    반환값은 add_score()의 display_name 인자로만 흘러가며, None이면 upsert가
+    기존 이름을 보존한다. 예전엔 미스 시 'User <id>' 플레이스홀더를 반환해 그게
+    DB에 그대로 덮여쓰였다 (issue #19). 결과는 embed 멘션으로 표시되므로 표시용
+    플레이스홀더는 따로 필요 없다."""
     if guild:
         member = guild.get_member(int(user_id))
         if member:
             return member.display_name
-    return f"User {user_id}"
+    return None
 
 
 def choice_display(choice: str, game_key: str | None = None) -> str:
@@ -4281,6 +4290,9 @@ async def handle_roulette_trigger(interaction: discord.Interaction, game_id: int
 class EventBot(discord.Client):
     def __init__(self) -> None:
         intents = discord.Intents.default()
+        # 멤버 캐시를 채워 member_name() 미스를 없앤다. Developer Portal의
+        # SERVER MEMBERS INTENT 토글이 함께 ON이어야 로그인이 된다 (issue #19).
+        intents.members = True
         super().__init__(intents=intents)
         self.tree = app_commands.CommandTree(self)
         self.auto_close_tasks: dict[int, asyncio.Task[None]] = {}
