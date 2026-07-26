@@ -91,7 +91,10 @@ TRUST_OUTCOME_LABELS = {
     "double": "동시 배신",
     "incomplete": "미선택",
 }
-MAIN_GAME_TYPES = {"trust", "sand"}
+# 게임 키 집합이다 (rounds.type 값 집합이 아니다). 'bail'은 type='sand'로 저장되므로
+# `round_row["type"] in MAIN_GAME_TYPES` 검사도 그대로 통과한다. 게임을 갈라야 할 때는
+# round_game_key()를 쓴다.
+MAIN_GAME_TYPES = {"trust", "sand", "bail"}
 # 'grid'(관리자 시점 타일)는 제거된 미니게임이다. 불변인 rounds.type CHECK 제약의 grid 값은
 # extra_json.mode='unique_number'인 새 유일 숫자 게임의 저장 타입으로만 재사용한다.
 MINI_GAME_TYPES = {
@@ -113,6 +116,8 @@ GAME_NAMES = {
     "unique_number": "홍피겔만의 황금금고",
     "trust": "딜레마의 섬",
     "sand": "모래성 게임",
+    # DB type은 sand를 재사용하고 extra_json.mode='bail'로 갈라 쓴다.
+    "bail": "가라앉는 배",
 }
 BALANCE_VOTE_CHOICES = [("A 선택", "A"), ("B 선택", "B")]
 ANONYMOUS_EMBED_COLORS = (
@@ -161,6 +166,21 @@ SAND_OUTCOME_LABELS = {
     "quit_success": "포기 후 상대 덜기 성공",
     "quit_collapse": "포기 후 상대 모래성 붕괴",
     "plain_collapse": "일반 모래성 붕괴",
+}
+# 가라앉는 배: 협상 → 실행 2단계 메인게임. rounds.type CHECK 제약을 못 고쳐서
+# type='sand' + extra_json.mode='bail'로 저장한다 (grid→unique_number와 같은 방식).
+BAIL_REQUIRED_SCOOPS = 6  # 배가 뜨는 데 필요한 두 사람 합계 퍼내기 횟수
+BAIL_SCOOP_CHOICES = [str(index) for index in range(BAIL_REQUIRED_SCOOPS + 1)]  # 0~6
+BAIL_SCOOP_COST = 1  # 퍼내기 1회당 차감
+BAIL_SURVIVE_REWARD = 4  # 배가 뜨면 각자 지급
+BAIL_SINK_PENALTY = 3  # 침몰 시 양쪽 차감
+BAIL_NEGOTIATION_MAX_OFFERS = 3  # 교대 제안 최대 횟수
+BAIL_DEFAULT_NEGOTIATION_MINUTES = 5
+BAIL_DEFAULT_EXECUTION_MINUTES = 3
+BAIL_FALLBACK_SCOOPS = BAIL_REQUIRED_SCOOPS // 2  # 합의도 제출도 없을 때의 자동 제출값
+BAIL_OUTCOME_LABELS = {
+    "survived": "생존",
+    "sunk": "침몰",
 }
 EVENT_STATUS_LABELS = {
     "recruiting": "참가 모집 중",
@@ -800,6 +820,14 @@ def game_settings_snapshot(game_key: str) -> dict[str, Any]:
         settings["play_seconds"] = SAND_PLAY_SECONDS
         settings["number_choices"] = SAND_NUMBER_CHOICES
         settings["match_history_rounds"] = MATCH_HISTORY_ROUNDS
+    elif game_key == "bail":
+        settings["required_scoops"] = BAIL_REQUIRED_SCOOPS
+        settings["scoop_cost"] = BAIL_SCOOP_COST
+        settings["survive_reward"] = BAIL_SURVIVE_REWARD
+        settings["sink_penalty"] = BAIL_SINK_PENALTY
+        settings["max_offers"] = BAIL_NEGOTIATION_MAX_OFFERS
+        settings["fallback_scoops"] = BAIL_FALLBACK_SCOOPS
+        settings["match_history_rounds"] = MATCH_HISTORY_ROUNDS
     elif game_key == "unique_number":
         settings["number_choices"] = UNIQUE_NUMBER_CHOICES
     elif game_key == "defuse4":
@@ -1256,6 +1284,20 @@ def round_game_key(round_row: sqlite3.Row) -> str:
     return str(round_extra(round_row).get("mode") or round_row["type"])
 
 
+def main_game_phase(round_row: sqlite3.Row | dict[str, Any]) -> str | None:
+    """메인게임의 진행 단계. 게임마다 extra_json 키가 달라서 한 곳에 모아둔다.
+
+    세 게임 모두 마지막 단계 이름은 'scored', 취소는 'cancelled'로 맞춘다.
+    """
+    extra = round_extra(round_row)  # type: ignore[arg-type]
+    game_key = round_game_key(round_row)  # type: ignore[arg-type]
+    if game_key == "trust":
+        return extra.get("trust_phase")
+    if game_key == "bail":
+        return extra.get("bail_phase")
+    return extra.get("sand_phase")
+
+
 def thread_discussion_view(round_id: int, game_key: str) -> discord.ui.View:
     """토론방 맨 아래에 붙는 버튼 묶음: 선택지 + 익명 발언하기.
 
@@ -1369,7 +1411,7 @@ def planned_mini_game_view(main_round_id: int) -> discord.ui.View | None:
         return None
 
     extra = round_extra(round_row)
-    phase = extra.get("trust_phase") if round_row["type"] == "trust" else extra.get("sand_phase")
+    phase = main_game_phase(round_row)
     mini_game = str(extra.get("planned_mini_game") or "")
     if phase != "scored" or mini_game not in MINI_GAME_TYPES:
         return None
@@ -1410,7 +1452,7 @@ async def handle_planned_mini_game(interaction: discord.Interaction, main_round_
             return
 
         extra = round_extra(main_round)
-        phase = extra.get("trust_phase") if main_round["type"] == "trust" else extra.get("sand_phase")
+        phase = main_game_phase(main_round)
         mini_game = str(extra.get("planned_mini_game") or "")
         if phase != "scored" or mini_game not in MINI_GAME_TYPES:
             await interaction.response.send_message("시작할 미니게임이 지정되어 있지 않습니다.", ephemeral=True)
@@ -2446,10 +2488,13 @@ async def publish_sand_pair_results(round_id: int) -> None:
 
 def apply_emergency_join(
     extra: dict[str, Any],
-    round_type: str,
+    game_key: str,
     new_user_id: str,
 ) -> dict[str, Any] | None:
     """긴급 투입을 extra에 반영한다. 짝 없는 대기자가 없으면 None.
+
+    `game_key`는 rounds.type이 아니라 round_game_key() 값이다 — 가라앉는 배는
+    type='sand'로 저장되므로 타입으로는 모래성과 구분되지 않는다.
 
     DB도 디스코드도 건드리지 않는 순수 함수라 테스트에서 그대로 쓴다.
     호출 전에 라운드 상태·중복 참여 검증이 끝나 있어야 한다.
@@ -2458,17 +2503,25 @@ def apply_emergency_join(
     if not unmatched_user_id or unmatched_user_id == new_user_id:
         return None
 
-    pair = {
-        "user_a_id": unmatched_user_id,
-        "user_b_id": new_user_id,
-        "number_a": None,
-        "number_b": None,
-        "phase": "number_selection",
-        "current_user_id": random.choice([unmatched_user_id, new_user_id]),
-        "successful_removals": 0,
-    }
-    if round_type == "sand":
-        extra.setdefault("sand_pairs", []).append(pair)
+    if game_key == "bail":
+        # 가라앉는 배는 짝 구조가 다르다. 늦게 붙은 짝도 협상부터 시작하되,
+        # 이미 실행 단계로 넘어간 뒤라면 협상 기회가 없으므로 합의 없이 제출만 한다.
+        pair = bail_new_pair(unmatched_user_id, new_user_id)
+        if extra.get("bail_phase") == "execution":
+            pair.update({"phase": "submitting", "offer": None})
+        extra.setdefault("bail_pairs", []).append(pair)
+    else:
+        pair = {
+            "user_a_id": unmatched_user_id,
+            "user_b_id": new_user_id,
+            "number_a": None,
+            "number_b": None,
+            "phase": "number_selection",
+            "current_user_id": random.choice([unmatched_user_id, new_user_id]),
+            "successful_removals": 0,
+        }
+        if game_key == "sand":
+            extra.setdefault("sand_pairs", []).append(pair)
 
     extra["unmatched_user_id"] = None
     extra["emergency_user_id"] = new_user_id
@@ -2476,7 +2529,17 @@ def apply_emergency_join(
     # 늦게 합류한 짝도 게임을 끝낼 시간이 필요하다. 전체 마감을 1분 미룬다.
     close_at = float(extra.get("auto_close_at") or time.time()) + EMERGENCY_EXTENSION_SECONDS
     extra["auto_close_at"] = close_at
-    extra["decision_close_at" if round_type == "trust" else "play_close_at"] = close_at
+    if game_key == "trust":
+        extra["decision_close_at"] = close_at
+    elif game_key == "bail":
+        phase_key = (
+            "execution_close_at"
+            if extra.get("bail_phase") == "execution"
+            else "negotiation_close_at"
+        )
+        extra[phase_key] = close_at
+    else:
+        extra["play_close_at"] = close_at
 
     return {
         "user_a_id": unmatched_user_id,
@@ -2574,9 +2637,11 @@ async def handle_emergency_join(interaction: discord.Interaction, round_id: int)
             return
 
         round_type = str(round_row["type"])
+        game_key = round_game_key(round_row)
         extra = round_extra(round_row)
-        phase = extra.get("trust_phase") if round_type == "trust" else extra.get("sand_phase")
-        if phase not in {"decision", "playing"}:
+        phase = main_game_phase(round_row)
+        # 가라앉는 배는 협상·실행 두 단계 모두에서 투입을 받는다.
+        if phase not in {"decision", "playing", "negotiation", "execution"}:
             await interaction.followup.send("지금은 긴급 투입할 수 없습니다.", ephemeral=True)
             return
 
@@ -2592,7 +2657,7 @@ async def handle_emergency_join(interaction: discord.Interaction, round_id: int)
             return
 
         # 동시 클릭 방어: 대기자를 읽고 비우는 것까지 한 트랜잭션 안에서 끝낸다.
-        applied = apply_emergency_join(extra, round_type, user_id)
+        applied = apply_emergency_join(extra, game_key, user_id)
         if not applied:
             await interaction.followup.send("긴급 투입 자리가 이미 채워졌습니다.", ephemeral=True)
             return
@@ -2633,7 +2698,7 @@ async def handle_emergency_join(interaction: discord.Interaction, round_id: int)
                 else str(applied["user_a_id"])
             ),
             payload={
-                "game_key": round_type,
+                "game_key": game_key,
                 "extension_seconds": EMERGENCY_EXTENSION_SECONDS,
             },
         )
@@ -2666,6 +2731,16 @@ async def handle_emergency_join(interaction: discord.Interaction, round_id: int)
             trust_decision_view(round_id),
             content=trust_pair_intro(user_a_id, user_b_id, close_at),
         )
+    elif game_key == "bail":
+        created = await create_pair_thread(
+            channel,
+            f"{title} · 긴급 투입 구조선",
+            [user_a_id, user_b_id],
+            f"가라앉는 배 #{round_id} 긴급 투입 방",
+            bail_pair_view(round_id, applied["pair"], extra),
+            content=bail_pair_intro(user_a_id, user_b_id),
+            embed=build_bail_pair_embed(title, applied["pair"], extra),
+        )
     else:
         created = await create_pair_thread(
             channel,
@@ -2685,7 +2760,11 @@ async def handle_emergency_join(interaction: discord.Interaction, round_id: int)
     else:
         thread, message = created
         save_pair_thread_id(round_id, user_a_id, user_b_id, str(thread.id))
-        if round_type == "sand":
+        if game_key == "bail":
+            store_bail_thread_ids(
+                round_id, {(user_a_id, user_b_id): (str(thread.id), str(message.id))}
+            )
+        elif round_type == "sand":
             store_sand_thread_ids(
                 round_id, {(user_a_id, user_b_id): (str(thread.id), str(message.id))}
             )
@@ -2694,7 +2773,9 @@ async def handle_emergency_join(interaction: discord.Interaction, round_id: int)
             ephemeral=True,
         )
 
-    if round_type == "sand":
+    if game_key == "bail":
+        await refresh_main_bail_board(round_id)
+    elif round_type == "sand":
         await refresh_main_sand_board(round_id)
     else:
         await refresh_main_trust_board(round_id)
@@ -3120,6 +3201,889 @@ async def handle_sand_action(
         public_message = private_message
         private_message = None
     await refresh_or_finish_sand_round(interaction, round_id, private_message, public_message)
+
+
+# ---------------------------------------------------------------------------
+# 가라앉는 배 (bail) — 협상 → 실행 2단계 메인게임
+#
+# 모래성과 같은 1:1 비공개 방 구조를 쓰지만 단계가 하나 더 있다.
+#   registration → negotiation(교대 제안) → execution(동시 비공개 제출) → scored
+# 협상에서 맺은 합의는 기록만 되고 점수에 영향이 없다. 그게 이 게임의 핵심 규칙이라
+# 정산은 오직 execution 단계의 제출값만 본다.
+# ---------------------------------------------------------------------------
+
+
+def bail_rules_text() -> str:
+    """규칙 안내문. 점수 상수를 조정하면 안내문도 따라 바뀌도록 런타임에 만든다."""
+    return (
+        f"**1** ─ 배가 가라앉기 전에 **두 사람이 합쳐 {BAIL_REQUIRED_SCOOPS}번** 물을 퍼내야 합니다.\n"
+        "**2** ─ 먼저 비공개 방에서 누가 몇 번 퍼낼지 **협상**합니다. "
+        f"제안과 수락/거절을 번갈아 최대 {BAIL_NEGOTIATION_MAX_OFFERS}번 주고받습니다.\n"
+        "**3** ─ 협상이 끝나면 각자 실제로 퍼낼 횟수를 **비공개로** 제출합니다. "
+        "**합의는 기록만 되고 점수와 무관합니다** — 약속을 지킬지는 각자의 선택입니다.\n"
+        "**4** ─ 제출하지 않으면 마감 때 합의한 몫(합의가 없으면 "
+        f"{BAIL_FALLBACK_SCOOPS}번)으로 자동 제출됩니다.\n\n"
+        f"> 🪣 퍼내기 1회당 **-{BAIL_SCOOP_COST}점**\n"
+        f"> ⛵ 두 사람 합이 **{BAIL_REQUIRED_SCOOPS}번 이상**이면 배가 뜨고 각자 "
+        f"**+{BAIL_SURVIVE_REWARD}점**\n"
+        f"> 🌊 못 미치면 침몰 — **양쪽 모두 -{BAIL_SINK_PENALTY}점**"
+    )
+
+
+def find_bail_pair(extra: dict[str, Any], user_id: str) -> dict[str, Any] | None:
+    for pair in extra.get("bail_pairs", []):
+        if user_id in {str(pair.get("user_a_id")), str(pair.get("user_b_id"))}:
+            return pair
+    return None
+
+
+def bail_pair_thread_matches(pair: dict[str, Any], channel_id: int | None) -> bool:
+    """누른 곳이 본인 짝의 비공개 방인지 확인한다."""
+    thread_id = str(pair.get("thread_id") or "")
+    if not thread_id:
+        return True
+    return thread_id == str(channel_id)
+
+
+def bail_side_key(pair: dict[str, Any], user_id: str) -> str:
+    return "user_a" if user_id == str(pair["user_a_id"]) else "user_b"
+
+
+def bail_agreed_scoops(pair: dict[str, Any], user_id: str) -> int | None:
+    """합의된 내 몫. 합의가 없으면 None."""
+    agreement = pair.get("agreement")
+    if not agreement:
+        return None
+    return int(agreement[bail_side_key(pair, user_id)])
+
+
+def bail_new_pair(user_a_id: str, user_b_id: str) -> dict[str, Any]:
+    return {
+        "user_a_id": user_a_id,
+        "user_b_id": user_b_id,
+        "phase": "negotiating",
+        "proposer_id": random.choice([user_a_id, user_b_id]),
+        "offer": None,
+        "offer_count": 0,
+        "agreement": None,
+        "scoop_a": None,
+        "scoop_b": None,
+    }
+
+
+def apply_bail_offer(pair: dict[str, Any], user_id: str, scoops: int) -> str:
+    """제안권자가 분담안을 제시한다. 호출 전에 단계·차례 검증이 끝나 있어야 한다."""
+    other_scoops = BAIL_REQUIRED_SCOOPS - scoops
+    pair.update(
+        {
+            "offer": {"proposer_id": user_id, "scoops": scoops},
+            "offer_count": int(pair.get("offer_count", 0)) + 1,
+        }
+    )
+    return (
+        f"제안했습니다 — 내가 **{scoops}번**, 상대가 **{other_scoops}번**.\n"
+        "상대의 수락/거절을 기다립니다."
+    )
+
+
+def apply_bail_response(pair: dict[str, Any], user_id: str, accepted: bool) -> str:
+    """대기 중인 제안에 응답한다. 수락이면 합의 확정, 거절이면 제안권이 넘어간다."""
+    offer = pair["offer"]
+    proposer_id = str(offer["proposer_id"])
+    proposer_scoops = int(offer["scoops"])
+    responder_scoops = BAIL_REQUIRED_SCOOPS - proposer_scoops
+
+    if accepted:
+        pair.update(
+            {
+                "agreement": {
+                    bail_side_key(pair, proposer_id): proposer_scoops,
+                    bail_side_key(pair, user_id): responder_scoops,
+                },
+                "offer": None,
+                "phase": "submitting",
+            }
+        )
+        return (
+            f"합의했습니다 — 내가 **{responder_scoops}번**, 상대가 **{proposer_scoops}번**.\n"
+            "실행 단계에서 실제로 퍼낼 횟수를 따로 제출합니다. **합의는 점수와 무관합니다.**"
+        )
+
+    exhausted = int(pair.get("offer_count", 0)) >= BAIL_NEGOTIATION_MAX_OFFERS
+    pair.update(
+        {
+            "offer": None,
+            "proposer_id": proposer_id if exhausted else user_id,
+            "phase": "submitting" if exhausted else "negotiating",
+        }
+    )
+    if exhausted:
+        return "거절했습니다. 제안 횟수를 모두 소진해 **합의 없이** 실행 단계로 넘어갑니다."
+    return "거절했습니다. 이제 내가 제안할 차례입니다."
+
+
+def bail_negotiations_complete(extra: dict[str, Any]) -> bool:
+    pairs = extra.get("bail_pairs", [])
+    return bool(pairs) and all(
+        str(pair.get("phase")) in {"submitting", "resolved"} for pair in pairs
+    )
+
+
+def bail_games_complete(extra: dict[str, Any]) -> bool:
+    pairs = extra.get("bail_pairs", [])
+    return bool(pairs) and all(str(pair.get("phase")) == "resolved" for pair in pairs)
+
+
+def resolve_bail_pair(pair: dict[str, Any]) -> None:
+    """제출된 두 횟수로 생존/침몰과 점수를 확정한다.
+
+    합의는 보지 않는다. 약속을 지켰는지는 결과 공개용 기록일 뿐이다.
+    """
+    scoop_a = int(pair["scoop_a"])
+    scoop_b = int(pair["scoop_b"])
+    total = scoop_a + scoop_b
+    survived = total >= BAIL_REQUIRED_SCOOPS
+    if survived:
+        score_a = BAIL_SURVIVE_REWARD - scoop_a * BAIL_SCOOP_COST
+        score_b = BAIL_SURVIVE_REWARD - scoop_b * BAIL_SCOOP_COST
+    else:
+        score_a = score_b = -BAIL_SINK_PENALTY
+    pair.update(
+        {
+            "phase": "resolved",
+            "outcome": "survived" if survived else "sunk",
+            "result": {
+                "total_scoops": total,
+                "score_a": score_a,
+                "score_b": score_b,
+            },
+        }
+    )
+
+
+def autocomplete_bail_pair(pair: dict[str, Any]) -> None:
+    """마감 시점에 안 끝난 짝을 자동으로 확정한다.
+
+    미제출은 합의한 몫으로, 합의도 없으면 절반(BAIL_FALLBACK_SCOOPS)으로 채운다.
+    0으로 박으면 잠수 한 명이 상대까지 침몰시키고, 랜덤은 침몰 확률이 지나치게 높다.
+    """
+    if str(pair.get("phase")) == "resolved":
+        return
+
+    pair["offer"] = None
+    for key, user_key in (("scoop_a", "user_a_id"), ("scoop_b", "user_b_id")):
+        if pair.get(key) is None:
+            agreed = bail_agreed_scoops(pair, str(pair[user_key]))
+            pair[key] = BAIL_FALLBACK_SCOOPS if agreed is None else agreed
+    pair["auto_completed"] = True
+    resolve_bail_pair(pair)
+
+
+def bail_score_text(delta: int) -> str:
+    if delta > 0:
+        return f"+{delta}점"
+    if delta < 0:
+        return f"{delta}점"
+    return "±0점"
+
+
+def bail_pair_settlement_text(pair: dict[str, Any]) -> str:
+    """짝 하나의 정산 문구. 라운드 요약과 방별 결과 공개가 같은 문구를 쓴다."""
+    result = pair.get("result")
+    if not result:
+        return "점수 변동 없음"
+    return (
+        f"<@{pair['user_a_id']}> {bail_score_text(int(result['score_a']))} · "
+        f"<@{pair['user_b_id']}> {bail_score_text(int(result['score_b']))}"
+    )
+
+
+def bail_promise_text(pair: dict[str, Any]) -> str:
+    """합의와 실제 제출을 나란히 보여준다. 약속을 어긴 사람이 드러나는 것이 게임 장치다."""
+    agreement = pair.get("agreement")
+    scoop_a = pair.get("scoop_a")
+    scoop_b = pair.get("scoop_b")
+    lines = []
+    if agreement:
+        lines.append(
+            f"합의: <@{pair['user_a_id']}> {int(agreement['user_a'])}번 · "
+            f"<@{pair['user_b_id']}> {int(agreement['user_b'])}번"
+        )
+    else:
+        lines.append("합의: **없음** (협상 결렬)")
+    if scoop_a is not None and scoop_b is not None:
+        marks = []
+        for side, scoop, user_key in (
+            ("user_a", int(scoop_a), "user_a_id"),
+            ("user_b", int(scoop_b), "user_b_id"),
+        ):
+            mark = ""
+            if agreement:
+                mark = " ✅" if scoop >= int(agreement[side]) else " ⚠️"
+            marks.append(f"<@{pair[user_key]}> {scoop}번{mark}")
+        lines.append(f"실제: {' · '.join(marks)}")
+    return "\n".join(lines)
+
+
+def start_bail_negotiation(round_id: int) -> dict[str, Any] | None:
+    """참가 모집을 마감하고 짝을 지어 협상 단계를 시작한다."""
+    with db() as conn:
+        round_row = conn.execute(
+            "SELECT * FROM rounds WHERE id = ? AND type = 'sand' AND status = 'open'",
+            (round_id,),
+        ).fetchone()
+        if not round_row or round_game_key(round_row) != "bail":
+            return None
+
+        extra = round_extra(round_row)
+        if extra.get("bail_phase") != "registration":
+            return None
+
+        registrations = conn.execute(
+            "SELECT user_id FROM trust_registrations WHERE round_id = ? ORDER BY registered_at ASC",
+            (round_id,),
+        ).fetchall()
+        user_ids = [str(row["user_id"]) for row in registrations]
+        if len(user_ids) < 2:
+            extra.update({"bail_phase": "cancelled", "cancelled_reason": "not_enough_participants"})
+            conn.execute(
+                "UPDATE rounds SET status = 'closed', closed_at = ?, extra_json = ? WHERE id = ?",
+                (now_text(), json.dumps(extra, ensure_ascii=False), round_id),
+            )
+            embed = discord.Embed(
+                title=f"{round_row['title']} · 취소",
+                description="참여자가 2명 미만이라 가라앉는 배를 시작하지 못했습니다.",
+                color=discord.Color.light_grey(),
+            )
+            return {
+                "state": "cancelled",
+                "channel_id": str(round_row["channel_id"]),
+                "message_id": str(round_row["message_id"] or ""),
+                "embed": embed,
+            }
+
+        # 짝 이력은 모래성과 공유한다(같은 type이라 recent_match_pairs가 함께 조회한다).
+        recent_pairs = recent_match_pairs(conn, round_id, "sand")
+        pairs, unmatched_user_id = build_random_trust_pairs(user_ids, recent_pairs)
+        bail_pairs: list[dict[str, Any]] = []
+        for user_a_id, user_b_id in pairs:
+            conn.execute(
+                """
+                INSERT INTO trust_pairings (round_id, user_a_id, user_b_id, created_at)
+                VALUES (?, ?, ?, ?)
+                """,
+                (round_id, user_a_id, user_b_id, now_text()),
+            )
+            log_activity(
+                conn,
+                "match",
+                "pair_matched",
+                event_session_id=round_row["event_session_id"],
+                round_id=round_id,
+                actor_user_id=user_a_id,
+                target_user_id=user_b_id,
+                payload={"game_key": "bail"},
+            )
+            bail_pairs.append(bail_new_pair(user_a_id, user_b_id))
+        log_activity(
+            conn,
+            "match",
+            "pairing_complete",
+            event_session_id=round_row["event_session_id"],
+            round_id=round_id,
+            payload={
+                "game_key": "bail",
+                "pair_count": len(pairs),
+                "registered_count": len(user_ids),
+                "unmatched_user_id": unmatched_user_id,
+            },
+        )
+
+        negotiation_seconds = int(
+            extra.get("negotiation_seconds") or BAIL_DEFAULT_NEGOTIATION_MINUTES * 60
+        )
+        close_at = time.time() + negotiation_seconds
+        extra.update(
+            {
+                "bail_phase": "negotiation",
+                "bail_pairs": bail_pairs,
+                "unmatched_user_id": unmatched_user_id,
+                "negotiation_close_at": close_at,
+                "auto_close_at": close_at,
+            }
+        )
+        conn.execute(
+            "UPDATE rounds SET extra_json = ? WHERE id = ?",
+            (json.dumps(extra, ensure_ascii=False), round_id),
+        )
+        updated_row = conn.execute("SELECT * FROM rounds WHERE id = ?", (round_id,)).fetchone()
+        return {
+            "state": "negotiation",
+            "channel_id": str(round_row["channel_id"]),
+            "message_id": str(round_row["message_id"] or ""),
+            "round_id": round_id,
+            "title": str(round_row["title"]),
+            "pairs": pairs,
+            "embed": build_bail_play_embed(updated_row, extra),
+            # 게임 버튼은 짝별 비공개 방 안에만 둔다. 메인 메시지는 진행판 역할만 한다.
+            "view": emergency_join_view(round_id) if unmatched_user_id else None,
+            "close_at": close_at,
+        }
+
+
+def start_bail_execution(round_id: int) -> dict[str, Any] | None:
+    """협상을 마감하고 실행(비공개 제출) 단계로 넘긴다.
+
+    협상 중이던 짝은 합의 없이 넘어간다. 모든 짝이 일찍 협상을 마쳐도 이 함수로 전이한다.
+    """
+    with db() as conn:
+        round_row = conn.execute(
+            "SELECT * FROM rounds WHERE id = ? AND type = 'sand' AND status = 'open'",
+            (round_id,),
+        ).fetchone()
+        if not round_row or round_game_key(round_row) != "bail":
+            return None
+
+        extra = round_extra(round_row)
+        if extra.get("bail_phase") != "negotiation":
+            return None
+
+        for pair in extra.get("bail_pairs", []):
+            if str(pair.get("phase")) == "negotiating":
+                # 대기 중인 제안은 응답 없이 사라진다. 합의가 없는 채로 실행 단계로 간다.
+                pair.update({"offer": None, "phase": "submitting"})
+
+        execution_seconds = int(
+            extra.get("execution_seconds") or BAIL_DEFAULT_EXECUTION_MINUTES * 60
+        )
+        close_at = time.time() + execution_seconds
+        extra.update(
+            {
+                "bail_phase": "execution",
+                "execution_close_at": close_at,
+                "auto_close_at": close_at,
+            }
+        )
+        conn.execute(
+            "UPDATE rounds SET extra_json = ? WHERE id = ?",
+            (json.dumps(extra, ensure_ascii=False), round_id),
+        )
+        updated_row = conn.execute("SELECT * FROM rounds WHERE id = ?", (round_id,)).fetchone()
+        return {
+            "state": "execution",
+            "channel_id": str(round_row["channel_id"]),
+            "message_id": str(round_row["message_id"] or ""),
+            "round_id": round_id,
+            "title": str(round_row["title"]),
+            "embed": build_bail_play_embed(updated_row, extra),
+            "view": emergency_join_view(round_id) if extra.get("unmatched_user_id") else None,
+            "close_at": close_at,
+        }
+
+
+def bail_pair_intro(user_a_id: str, user_b_id: str) -> str:
+    return (
+        f"<@{user_a_id}>님과 <@{user_b_id}>님의 **1:1 구조 협상방**입니다.\n"
+        f"> **1** ─ 둘이 합쳐 {BAIL_REQUIRED_SCOOPS}번 퍼내야 배가 뜹니다. "
+        "먼저 누가 몇 번 퍼낼지 협상하세요.\n"
+        "> **2** ─ 협상이 끝나면 각자 **실제로 퍼낼 횟수**를 비공개로 제출합니다. "
+        "합의는 점수와 무관합니다."
+    )
+
+
+async def create_bail_pair_threads(transition: dict[str, Any]) -> None:
+    """짝마다 비공개 방을 열고 그 안에 협상 버튼을 둔다."""
+    if transition.get("state") != "negotiation":
+        return
+
+    channel = await resolve_text_channel(str(transition["channel_id"]))
+    if channel is None:
+        return
+
+    round_id = int(transition["round_id"])
+    title = str(transition["title"])
+
+    with db() as conn:
+        round_row = conn.execute("SELECT * FROM rounds WHERE id = ?", (round_id,)).fetchone()
+    if not round_row:
+        return
+    extra = round_extra(round_row)
+
+    created_threads: dict[tuple[str, str], tuple[str, str]] = {}
+    failed_pairs = 0
+    for pair_number, pair in enumerate(extra.get("bail_pairs", []), start=1):
+        user_a_id = str(pair["user_a_id"])
+        user_b_id = str(pair["user_b_id"])
+        created = await create_pair_thread(
+            channel,
+            f"{title} · {pair_number}번 구조선",
+            [user_a_id, user_b_id],
+            f"가라앉는 배 #{round_id} 1:1 비공개 방",
+            bail_pair_view(round_id, pair, extra),
+            content=bail_pair_intro(user_a_id, user_b_id),
+            embed=build_bail_pair_embed(title, pair, extra),
+        )
+        if created is None:
+            failed_pairs += 1
+            continue
+        thread, message = created
+        save_pair_thread_id(round_id, user_a_id, user_b_id, str(thread.id))
+        created_threads[(user_a_id, user_b_id)] = (str(thread.id), str(message.id))
+
+    if created_threads:
+        store_bail_thread_ids(round_id, created_threads)
+    await warn_failed_pair_threads(channel, round_id, failed_pairs)
+
+
+def store_bail_thread_ids(
+    round_id: int,
+    created_threads: dict[tuple[str, str], tuple[str, str]],
+) -> None:
+    """스레드/메시지 id를 bail_pairs에 심는다. 재시작 후에도 방별 진행판을 갱신할 수 있어야 한다."""
+    with db() as conn:
+        round_row = conn.execute("SELECT * FROM rounds WHERE id = ?", (round_id,)).fetchone()
+        if not round_row:
+            return
+        extra = round_extra(round_row)
+        for pair in extra.get("bail_pairs", []):
+            key = (str(pair["user_a_id"]), str(pair["user_b_id"]))
+            if key in created_threads:
+                pair["thread_id"], pair["play_message_id"] = created_threads[key]
+        conn.execute(
+            "UPDATE rounds SET extra_json = ? WHERE id = ?",
+            (json.dumps(extra, ensure_ascii=False), round_id),
+        )
+
+
+def save_bail_pair_message_id(round_id: int, pair: dict[str, Any], message_id: str) -> None:
+    with db() as conn:
+        round_row = conn.execute("SELECT * FROM rounds WHERE id = ?", (round_id,)).fetchone()
+        if not round_row:
+            return
+        extra = round_extra(round_row)
+        target = find_bail_pair(extra, str(pair["user_a_id"]))
+        if not target:
+            return
+        target["play_message_id"] = message_id
+        conn.execute(
+            "UPDATE rounds SET extra_json = ? WHERE id = ?",
+            (json.dumps(extra, ensure_ascii=False), round_id),
+        )
+
+
+async def redraw_bail_pair_board(
+    round_id: int,
+    thread: discord.Thread,
+    pair_user_id: str,
+) -> None:
+    """방 하나의 진행판을 지우고 맨 아래에 다시 붙인다.
+
+    ephemeral 응답이 쌓여 버튼이 위로 밀리므로 모래성과 같은 방식으로 재부착한다.
+    두 사람이 동시에 누르면 옛 진행판을 가리킬 수 있어, 락을 잡고 DB에서 id를 다시 읽는다.
+    (락 dict는 모래성과 공유한다 — 키가 thread_id라 서로 충돌하지 않는다.)
+    """
+    async with bot.sand_board_lock(thread.id):
+        with db() as conn:
+            round_row = conn.execute("SELECT * FROM rounds WHERE id = ?", (round_id,)).fetchone()
+        if not round_row:
+            return
+        extra = round_extra(round_row)
+        pair = find_bail_pair(extra, pair_user_id)
+        if not pair:
+            return
+
+        resolved = str(pair.get("phase")) == "resolved"
+        embed = build_bail_pair_embed(str(round_row["title"]), pair, extra)
+        view = bail_pair_view(round_id, pair, extra)
+
+        board_message_id = str(pair.get("play_message_id") or "")
+        if resolved:
+            # 더 누를 버튼이 없으므로 제자리에서 비활성화만 한다.
+            if board_message_id:
+                try:
+                    message = await thread.fetch_message(int(board_message_id))
+                    await message.edit(embed=embed, view=view)
+                except (discord.NotFound, discord.HTTPException, ValueError):
+                    pass
+            return
+
+        if board_message_id:
+            try:
+                old_board = await thread.fetch_message(int(board_message_id))
+                await old_board.delete()
+            except (discord.NotFound, discord.HTTPException, ValueError):
+                pass
+        try:
+            new_board = await thread.send(embed=embed, view=view)
+        except discord.HTTPException:
+            return
+        save_bail_pair_message_id(round_id, pair, str(new_board.id))
+
+
+async def refresh_bail_pair_board(interaction: discord.Interaction, round_id: int) -> None:
+    """누른 사람의 방 진행판만 갱신한다. 다른 짝의 상황은 새어 나가지 않는다."""
+    channel = interaction.channel
+    if not isinstance(channel, discord.Thread):
+        return
+    await redraw_bail_pair_board(round_id, channel, str(interaction.user.id))
+
+
+async def refresh_all_bail_pair_boards(round_id: int) -> None:
+    """모든 방의 진행판을 다시 그린다. 협상 → 실행 전이처럼 버튼 구성이 바뀔 때 쓴다."""
+    with db() as conn:
+        round_row = conn.execute("SELECT * FROM rounds WHERE id = ?", (round_id,)).fetchone()
+    if not round_row:
+        return
+    for pair in round_extra(round_row).get("bail_pairs", []):
+        thread_id = str(pair.get("thread_id") or "")
+        if not thread_id:
+            continue
+        try:
+            thread = bot.get_channel(int(thread_id)) or await bot.fetch_channel(int(thread_id))
+        except (discord.HTTPException, ValueError):
+            continue
+        if not isinstance(thread, discord.Thread):
+            continue
+        await redraw_bail_pair_board(round_id, thread, str(pair["user_a_id"]))
+
+
+async def refresh_main_bail_board(round_id: int) -> None:
+    """메인 채널의 실시간 진행판을 다시 그린다. 게임 버튼은 각 비공개 방에만 있다."""
+    with db() as conn:
+        round_row = conn.execute("SELECT * FROM rounds WHERE id = ?", (round_id,)).fetchone()
+    if not round_row or not round_row["message_id"]:
+        return
+
+    extra = round_extra(round_row)
+    channel = await resolve_text_channel(str(round_row["channel_id"]))
+    if channel is None:
+        return
+    try:
+        message = await channel.fetch_message(int(round_row["message_id"]))
+        await message.edit(
+            embed=build_bail_play_embed(round_row, extra),
+            view=emergency_join_view(round_id) if extra.get("unmatched_user_id") else None,
+        )
+    except (discord.HTTPException, ValueError):
+        pass
+
+
+async def publish_bail_pair_results(round_id: int) -> None:
+    with db() as conn:
+        round_row = conn.execute(
+            "SELECT * FROM rounds WHERE id = ? AND type = 'sand'",
+            (round_id,),
+        ).fetchone()
+    if not round_row or round_game_key(round_row) != "bail":
+        return
+
+    title = str(round_row["title"])
+    extra = round_extra(round_row)
+    for pair in extra.get("bail_pairs", []):
+        thread_id = str(pair.get("thread_id") or "")
+        if not thread_id:
+            continue
+        try:
+            bot.sand_board_locks.pop(int(thread_id), None)
+            thread = bot.get_channel(int(thread_id)) or await bot.fetch_channel(int(thread_id))
+            if not isinstance(thread, discord.Thread):
+                continue
+            if thread.archived:
+                await thread.edit(archived=False, reason="가라앉는 배 결과 공개")
+            await thread.send(embed=build_bail_pair_result_embed(title, pair))
+            # 라운드가 끝나 버튼이 필요 없어진 뒤에만 잠근다.
+            await thread.edit(archived=True, locked=True, reason="가라앉는 배 결과 공개 완료")
+        except (discord.Forbidden, discord.HTTPException, ValueError):
+            continue
+
+
+async def advance_or_finish_bail_round(
+    interaction: discord.Interaction,
+    round_id: int,
+    private_message: str | None = None,
+    public_message: str | None = None,
+) -> None:
+    """버튼 처리 후 응답을 보내고, 단계 전이/정산이 필요하면 이어서 처리한다."""
+    with db() as conn:
+        round_row = conn.execute("SELECT * FROM rounds WHERE id = ?", (round_id,)).fetchone()
+        if not round_row:
+            await interaction.response.send_message("존재하지 않는 라운드입니다.", ephemeral=True)
+            return
+        channel_id = str(round_row["channel_id"])
+        extra = round_extra(round_row)
+        phase = str(extra.get("bail_phase") or "")
+        negotiations_done = bail_negotiations_complete(extra)
+        games_done = bail_games_complete(extra)
+
+    # 방 전체에 보여야 하는 안내는 공개로, 개인 선택 내용은 본인만 보게 보낸다.
+    if public_message:
+        await interaction.response.send_message(public_message)
+        if private_message:
+            await interaction.followup.send(private_message, ephemeral=True)
+    elif private_message:
+        await interaction.response.send_message(private_message, ephemeral=True)
+    else:
+        await interaction.response.defer()
+
+    # 모든 짝이 협상을 마쳤으면 남은 시간을 기다리지 않고 실행 단계로 넘긴다.
+    if phase == "negotiation" and negotiations_done:
+        transition = start_bail_execution(round_id)
+        if transition:
+            bot.schedule_auto_close(round_id, float(transition["close_at"]))
+            await refresh_all_bail_pair_boards(round_id)
+            await refresh_main_bail_board(round_id)
+            channel = await resolve_text_channel(channel_id)
+            if channel is not None:
+                try:
+                    await channel.send(
+                        "🪣 모든 방의 협상이 끝났습니다. **실행 단계**를 시작합니다 — "
+                        f"각자 실제로 퍼낼 횟수를 비공개로 제출하세요. (마감 {close_time_text(transition['close_at'])})"
+                    )
+                except discord.HTTPException:
+                    pass
+            return
+
+    await refresh_bail_pair_board(interaction, round_id)
+    await refresh_main_bail_board(round_id)
+
+    if not games_done:
+        return
+    result = close_round_record(round_id, interaction.guild, closed_by="모든 1:1 게임 종료")
+    if not result:
+        return
+    task = bot.auto_close_tasks.pop(round_id, None)
+    if task:
+        task.cancel()
+    await publish_bail_pair_results(round_id)
+
+    # followup은 버튼을 누른 비공개 방으로 들어간다. 라운드 결과는 메인 채널에 알려야 한다.
+    _, result_embed = result
+    channel = await resolve_text_channel(channel_id)
+    if channel is not None:
+        try:
+            await channel.send(embed=result_embed, view=planned_mini_game_view(round_id))
+        except discord.HTTPException:
+            pass
+    await publish_event_summary_if_complete(round_row["event_session_id"])
+
+
+def load_open_bail_pair(
+    conn: sqlite3.Connection,
+    round_id: int,
+    user_id: str,
+    channel_id: int | None,
+) -> tuple[sqlite3.Row, dict[str, Any], dict[str, Any]] | str:
+    """열린 bail 라운드에서 이 유저의 짝을 찾는다. 문제가 있으면 안내 문구를 돌려준다."""
+    round_row = conn.execute(
+        "SELECT * FROM rounds WHERE id = ? AND type = 'sand' AND status = 'open'",
+        (round_id,),
+    ).fetchone()
+    if not round_row or round_game_key(round_row) != "bail":
+        return "이미 끝난 게임입니다."
+    extra = round_extra(round_row)
+    pair = find_bail_pair(extra, user_id)
+    if not pair:
+        return "이 라운드에 매칭된 참가자가 아닙니다."
+    if not bail_pair_thread_matches(pair, channel_id):
+        return "자신에게 배정된 1:1 방에서만 진행할 수 있습니다."
+    return round_row, extra, pair
+
+
+async def handle_bail_offer(
+    interaction: discord.Interaction,
+    round_id: int,
+    scoops: int,
+) -> None:
+    user_id = str(interaction.user.id)
+    with db() as conn:
+        loaded = load_open_bail_pair(conn, round_id, user_id, interaction.channel_id)
+        if isinstance(loaded, str):
+            await interaction.response.send_message(loaded, ephemeral=True)
+            return
+        round_row, extra, pair = loaded
+
+        if extra.get("bail_phase") != "negotiation":
+            await interaction.response.send_message("지금은 협상 단계가 아닙니다.", ephemeral=True)
+            return
+        if str(pair.get("phase")) != "negotiating":
+            await interaction.response.send_message("이 방의 협상은 이미 끝났습니다.", ephemeral=True)
+            return
+        if pair.get("offer"):
+            await interaction.response.send_message(
+                "상대가 아직 내 제안에 답하지 않았습니다.", ephemeral=True
+            )
+            return
+        if user_id != str(pair.get("proposer_id")):
+            await interaction.response.send_message("지금은 상대가 제안할 차례입니다.", ephemeral=True)
+            return
+
+        private_message = apply_bail_offer(pair, user_id, scoops)
+        log_activity(
+            conn,
+            "bail",
+            "offer",
+            event_session_id=round_row["event_session_id"],
+            round_id=round_id,
+            actor_user_id=user_id,
+            payload={
+                "game_key": "bail",
+                "proposer_scoops": scoops,
+                "responder_scoops": BAIL_REQUIRED_SCOOPS - scoops,
+                "offer_count": int(pair.get("offer_count", 0)),
+            },
+        )
+        conn.execute(
+            "UPDATE rounds SET extra_json = ? WHERE id = ?",
+            (json.dumps(extra, ensure_ascii=False), round_id),
+        )
+
+    # 제안 내용은 상대가 봐야 하므로 방에 공개한다.
+    await advance_or_finish_bail_round(
+        interaction,
+        round_id,
+        public_message=(
+            f"<@{user_id}>님의 제안 — 본인 **{scoops}번** / 상대 "
+            f"**{BAIL_REQUIRED_SCOOPS - scoops}번**"
+        ),
+        private_message=private_message,
+    )
+
+
+async def handle_bail_response(
+    interaction: discord.Interaction,
+    round_id: int,
+    accepted: bool,
+) -> None:
+    user_id = str(interaction.user.id)
+    with db() as conn:
+        loaded = load_open_bail_pair(conn, round_id, user_id, interaction.channel_id)
+        if isinstance(loaded, str):
+            await interaction.response.send_message(loaded, ephemeral=True)
+            return
+        round_row, extra, pair = loaded
+
+        if extra.get("bail_phase") != "negotiation":
+            await interaction.response.send_message("지금은 협상 단계가 아닙니다.", ephemeral=True)
+            return
+        offer = pair.get("offer")
+        if not offer:
+            await interaction.response.send_message("응답할 제안이 없습니다.", ephemeral=True)
+            return
+        if user_id == str(offer["proposer_id"]):
+            await interaction.response.send_message(
+                "자신의 제안에는 응답할 수 없습니다. 상대의 응답을 기다려주세요.",
+                ephemeral=True,
+            )
+            return
+
+        proposer_id = str(offer["proposer_id"])
+        proposer_scoops = int(offer["scoops"])
+        private_message = apply_bail_response(pair, user_id, accepted)
+        log_activity(
+            conn,
+            "bail",
+            "offer_accepted" if accepted else "offer_rejected",
+            event_session_id=round_row["event_session_id"],
+            round_id=round_id,
+            actor_user_id=user_id,
+            target_user_id=proposer_id,
+            payload={
+                "game_key": "bail",
+                "proposer_scoops": proposer_scoops,
+                "responder_scoops": BAIL_REQUIRED_SCOOPS - proposer_scoops,
+                "offer_count": int(pair.get("offer_count", 0)),
+                "negotiation_closed": str(pair.get("phase")) == "submitting",
+            },
+        )
+        conn.execute(
+            "UPDATE rounds SET extra_json = ? WHERE id = ?",
+            (json.dumps(extra, ensure_ascii=False), round_id),
+        )
+
+    if accepted:
+        public_message = (
+            f"🤝 합의 — <@{proposer_id}> **{proposer_scoops}번** / "
+            f"<@{user_id}> **{BAIL_REQUIRED_SCOOPS - proposer_scoops}번**\n"
+            "> 실제로 퍼낼 횟수는 실행 단계에서 각자 따로 제출합니다."
+        )
+    elif str(pair.get("phase")) == "submitting":
+        public_message = (
+            f"❌ <@{user_id}>님이 거절했습니다. 제안 횟수를 모두 소진해 **합의 없이** "
+            "실행 단계로 넘어갑니다."
+        )
+    else:
+        public_message = f"❌ <@{user_id}>님이 거절했습니다. 이제 <@{user_id}>님의 제안 차례입니다."
+    await advance_or_finish_bail_round(
+        interaction,
+        round_id,
+        public_message=public_message,
+        private_message=private_message,
+    )
+
+
+async def handle_bail_scoop(
+    interaction: discord.Interaction,
+    round_id: int,
+    scoops: int,
+) -> None:
+    user_id = str(interaction.user.id)
+    with db() as conn:
+        loaded = load_open_bail_pair(conn, round_id, user_id, interaction.channel_id)
+        if isinstance(loaded, str):
+            await interaction.response.send_message(loaded, ephemeral=True)
+            return
+        round_row, extra, pair = loaded
+
+        if extra.get("bail_phase") != "execution":
+            await interaction.response.send_message(
+                "아직 실행 단계가 아닙니다. 협상이 모두 끝나면 제출할 수 있습니다.",
+                ephemeral=True,
+            )
+            return
+        if str(pair.get("phase")) == "resolved":
+            await interaction.response.send_message("이 1:1 게임은 이미 끝났습니다.", ephemeral=True)
+            return
+
+        key = "scoop_a" if user_id == str(pair["user_a_id"]) else "scoop_b"
+        if pair.get(key) is not None:
+            await interaction.response.send_message(
+                "이미 제출했습니다. 변경할 수 없습니다.", ephemeral=True
+            )
+            return
+        pair[key] = scoops
+        agreed = bail_agreed_scoops(pair, user_id)
+        both_submitted = pair.get("scoop_a") is not None and pair.get("scoop_b") is not None
+        if both_submitted:
+            resolve_bail_pair(pair)
+        log_activity(
+            conn,
+            "bail",
+            "scoop_submitted",
+            event_session_id=round_row["event_session_id"],
+            round_id=round_id,
+            actor_user_id=user_id,
+            payload={
+                "game_key": "bail",
+                "scoops": scoops,
+                "agreed_scoops": agreed,
+                "kept_promise": None if agreed is None else scoops >= agreed,
+            },
+        )
+        conn.execute(
+            "UPDATE rounds SET extra_json = ? WHERE id = ?",
+            (json.dumps(extra, ensure_ascii=False), round_id),
+        )
+
+    suffix = (
+        " 두 사람의 제출이 끝났습니다. 결과를 확인하세요!"
+        if both_submitted
+        else " 상대의 제출을 기다립니다."
+    )
+    await advance_or_finish_bail_round(
+        interaction,
+        round_id,
+        private_message=f"**{scoops}번** 퍼내기로 제출했습니다.{suffix}",
+    )
 
 
 def expire_stale_roulette_games(conn: sqlite3.Connection, now: float | None = None) -> None:
@@ -4537,6 +5501,36 @@ class EventBot(discord.Client):
                     self.schedule_auto_close(round_id, float(transition["close_at"]))
                 return
 
+            # 가라앉는 배는 단계가 하나 더 있다: 모집 → 협상 → 실행 → 정산.
+            if round_game_key(row) == "bail":
+                bail_phase = round_extra(row).get("bail_phase")
+                if bail_phase == "registration":
+                    transition = start_bail_negotiation(round_id)
+                    if not transition:
+                        return
+                    await create_bail_pair_threads(transition)
+                    await update_trust_main_message(transition)
+                    if transition["state"] == "negotiation":
+                        self.schedule_auto_close(round_id, float(transition["close_at"]))
+                    return
+                if bail_phase == "negotiation":
+                    transition = start_bail_execution(round_id)
+                    if not transition:
+                        return
+                    await refresh_all_bail_pair_boards(round_id)
+                    await refresh_main_bail_board(round_id)
+                    self.schedule_auto_close(round_id, float(transition["close_at"]))
+                    if hasattr(channel, "send"):
+                        try:
+                            await channel.send(
+                                "🪣 협상 시간이 끝났습니다. **실행 단계**를 시작합니다 — "
+                                "각자 실제로 퍼낼 횟수를 비공개로 제출하세요. "
+                                f"(마감 {close_time_text(transition['close_at'])})"
+                            )
+                        except discord.HTTPException:
+                            pass
+                    return
+
             row_extra = round_extra(row)
             if (
                 row["type"] == "balance"
@@ -4557,7 +5551,9 @@ class EventBot(discord.Client):
             _, embed = result
             if row["type"] == "trust":
                 await publish_trust_pair_results(round_id)
-            if row["type"] == "sand":
+            elif round_game_key(row) == "bail":
+                await publish_bail_pair_results(round_id)
+            elif row["type"] == "sand":
                 await publish_sand_pair_results(round_id)
             await archive_round_discussion_thread(row, reason="라운드 종료 후 영구 보관")
             if hasattr(channel, "send"):
@@ -4676,6 +5672,33 @@ class EventBot(discord.Client):
                 await interaction.response.send_message("잘못된 라운드 번호입니다.", ephemeral=True)
                 return
             await handle_sand_action(interaction, round_id, parts[3])
+            return
+
+        if action in {"bailoffer", "bailscoop"}:
+            if len(parts) != 4 or parts[3] not in BAIL_SCOOP_CHOICES:
+                await interaction.response.send_message("잘못된 퍼내기 횟수입니다.", ephemeral=True)
+                return
+            try:
+                round_id = int(parts[2])
+            except ValueError:
+                await interaction.response.send_message("잘못된 라운드 번호입니다.", ephemeral=True)
+                return
+            if action == "bailoffer":
+                await handle_bail_offer(interaction, round_id, int(parts[3]))
+            else:
+                await handle_bail_scoop(interaction, round_id, int(parts[3]))
+            return
+
+        if action == "bailrespond":
+            if len(parts) != 4 or parts[3] not in {"accept", "reject"}:
+                await interaction.response.send_message("잘못된 협상 응답입니다.", ephemeral=True)
+                return
+            try:
+                round_id = int(parts[2])
+            except ValueError:
+                await interaction.response.send_message("잘못된 라운드 번호입니다.", ephemeral=True)
+                return
+            await handle_bail_response(interaction, round_id, parts[3] == "accept")
             return
 
         if action == "trustjoin":
@@ -5511,6 +6534,265 @@ def sand_play_view(round_id: int, disabled: bool = False) -> discord.ui.View:
     return view
 
 
+BAIL_EMBED_COLOR = discord.Color.from_rgb(60, 120, 180)
+
+
+def build_bail_registration_embed(round_id: int, title: str, registration_minutes: int) -> discord.Embed:
+    embed = discord.Embed(title=title, description=title, color=BAIL_EMBED_COLOR)
+    embed.add_field(name="🎮 진행 게임", value="가라앉는 배", inline=False)
+    embed.add_field(name="📜 메인 규칙", value=bail_rules_text(), inline=False)
+    return embed
+
+
+def bail_pair_status_text(pair: dict[str, Any], extra: dict[str, Any]) -> str:
+    """짝 하나의 진행 상황. 상대의 제출 내용은 절대 드러내지 않는다."""
+    phase = str(pair.get("phase"))
+    if phase == "resolved":
+        outcome = BAIL_OUTCOME_LABELS.get(str(pair.get("outcome")), "종료")
+        total = (pair.get("result") or {}).get("total_scoops")
+        return f"{outcome} (합계 {total}번)" if total is not None else outcome
+
+    if phase == "negotiating":
+        offer = pair.get("offer")
+        remaining = BAIL_NEGOTIATION_MAX_OFFERS - int(pair.get("offer_count", 0))
+        if offer:
+            responder_scoops = BAIL_REQUIRED_SCOOPS - int(offer["scoops"])
+            return (
+                f"<@{offer['proposer_id']}>님의 제안 대기 중 — "
+                f"제안자 {int(offer['scoops'])}번 / 상대 {responder_scoops}번\n"
+                f"　└ 상대가 수락/거절을 고릅니다 (남은 제안 {remaining}회)"
+            )
+        return f"<@{pair['proposer_id']}> 제안 차례 (남은 제안 {remaining}회)"
+
+    # submitting
+    if str(extra.get("bail_phase")) != "execution":
+        agreement = pair.get("agreement")
+        if agreement:
+            return "협상 완료 · 다른 방의 협상을 기다립니다"
+        return "협상 결렬 · 다른 방의 협상을 기다립니다"
+    submitted = int(pair.get("scoop_a") is not None) + int(pair.get("scoop_b") is not None)
+    return f"퍼낼 횟수 제출 중 : {submitted}/2"
+
+
+def build_bail_pair_embed(title: str, pair: dict[str, Any], extra: dict[str, Any]) -> discord.Embed:
+    """짝 하나의 비공개 방에 걸리는 진행판. 다른 짝의 정보는 담지 않는다."""
+    embed = discord.Embed(
+        title=f"{title} · 1:1 구조선",
+        description=f"<@{pair['user_a_id']}> ↔ <@{pair['user_b_id']}>",
+        color=BAIL_EMBED_COLOR,
+    )
+    embed.add_field(name="⚓ 진행 상황", value=bail_pair_status_text(pair, extra), inline=False)
+
+    round_phase = str(extra.get("bail_phase") or "")
+    pair_phase = str(pair.get("phase") or "")
+    agreement = pair.get("agreement")
+    if agreement:
+        embed.add_field(
+            name="🤝 합의 (점수와 무관)",
+            value=(
+                f"<@{pair['user_a_id']}> {int(agreement['user_a'])}번 · "
+                f"<@{pair['user_b_id']}> {int(agreement['user_b'])}번"
+            ),
+            inline=False,
+        )
+    elif pair_phase == "submitting":
+        embed.add_field(name="🤝 합의", value="**없음** (협상 결렬)", inline=False)
+
+    if round_phase == "negotiation" and pair_phase == "negotiating":
+        embed.add_field(
+            name="🗣️ 협상",
+            value=(
+                f"버튼의 숫자는 **내가 퍼낼 횟수**입니다. 상대는 {BAIL_REQUIRED_SCOOPS}에서 그만큼 뺀 횟수를 맡습니다.\n"
+                "> 대화는 자유롭게 하세요. 합의는 기록만 되고 **점수에는 영향이 없습니다.**"
+            ),
+            inline=False,
+        )
+    elif round_phase == "execution" and pair_phase != "resolved":
+        embed.add_field(
+            name="🪣 실행",
+            value=(
+                "실제로 퍼낼 횟수를 고르세요. **번복 불가**이며 상대에게 공개되지 않습니다.\n"
+                f"> 두 사람 합이 {BAIL_REQUIRED_SCOOPS}번 이상이면 배가 뜹니다."
+            ),
+            inline=False,
+        )
+
+    embed.add_field(name="📜 규칙", value=bail_rules_text(), inline=False)
+    if pair_phase != "resolved":
+        close_at = (
+            extra.get("execution_close_at")
+            if round_phase == "execution"
+            else extra.get("negotiation_close_at")
+        )
+        label = "실행 마감" if round_phase == "execution" else "협상 마감"
+        embed.add_field(
+            name="⏳ 제한 시간",
+            value=(
+                f"{label}: **{close_time_text(close_at)}**\n"
+                "> 시간 안에 제출하지 않으면 합의한 몫(합의가 없으면 "
+                f"{BAIL_FALLBACK_SCOOPS}번)으로 자동 제출됩니다."
+            ),
+            inline=False,
+        )
+    return embed
+
+
+def build_bail_pair_result_embed(title: str, pair: dict[str, Any]) -> discord.Embed:
+    embed = discord.Embed(
+        title=f"1:1 결과 · {title}",
+        description=f"<@{pair['user_a_id']}> ↔ <@{pair['user_b_id']}>",
+        color=BAIL_EMBED_COLOR,
+    )
+    result = pair.get("result") or {}
+    total = result.get("total_scoops")
+    embed.add_field(
+        name="🪣 합의와 실제",
+        value=bail_promise_text(pair),
+        inline=False,
+    )
+    embed.add_field(
+        name="🏁 결과",
+        value=(
+            f"**{BAIL_OUTCOME_LABELS.get(str(pair.get('outcome')), '미완료')}** · "
+            f"합계 **{total}번** / 필요 {BAIL_REQUIRED_SCOOPS}번"
+            if total is not None
+            else "**미완료**"
+        ),
+        inline=False,
+    )
+    embed.add_field(name="💰 정산", value=bail_pair_settlement_text(pair), inline=False)
+    if pair.get("auto_completed"):
+        embed.add_field(
+            name="⏱️ 자동 제출",
+            value="제한 시간이 끝나 미제출분이 합의한 몫(또는 절반)으로 자동 제출되었습니다.",
+            inline=False,
+        )
+    return embed
+
+
+def build_bail_play_embed(round_row: sqlite3.Row, extra: dict[str, Any]) -> discord.Embed:
+    round_phase = str(extra.get("bail_phase") or "")
+    embed = discord.Embed(
+        title=str(round_row["title"]),
+        description=(
+            "각자 초대된 1:1 비공개 방에서 진행하세요. 협상 내용과 제출 횟수는 그 방 밖으로 나가지 않습니다."
+        ),
+        color=BAIL_EMBED_COLOR,
+    )
+    embed.add_field(
+        name="🧭 현재 단계",
+        value=(
+            "**2단계 · 실행** — 각자 실제로 퍼낼 횟수를 비공개 제출"
+            if round_phase == "execution"
+            else "**1단계 · 협상** — 누가 몇 번 퍼낼지 교대로 제안"
+        ),
+        inline=False,
+    )
+    lines = [
+        f"**{index}.** <@{pair['user_a_id']}> ↔ <@{pair['user_b_id']}>\n"
+        f"　└ {bail_pair_status_text(pair, extra)}"
+        for index, pair in enumerate(extra.get("bail_pairs", []), start=1)
+    ]
+    embed.add_field(name="⚓ 1:1 진행 현황", value=field_text(lines), inline=False)
+
+    unmatched_user_id = str(extra.get("unmatched_user_id") or "")
+    if unmatched_user_id:
+        embed.add_field(
+            name="🚨 긴급 투입 대기",
+            value=(
+                f"<@{unmatched_user_id}>님, 참여자가 홀수라 짝이 없습니다. 잠시만 기다려주세요!\n"
+                "> 아직 게임에 참여하지 않은 분이 아래 `긴급 투입하기` 버튼을 누르면 둘만의 방이 새로 열리고, "
+                "전체 진행 시간이 **1분 연장**됩니다."
+            ),
+            inline=False,
+        )
+    emergency_user_id = str(extra.get("emergency_user_id") or "")
+    if emergency_user_id:
+        embed.add_field(name="🚨 긴급 투입", value=emergency_join_notice(emergency_user_id), inline=False)
+
+    close_at = (
+        extra.get("execution_close_at")
+        if round_phase == "execution"
+        else extra.get("negotiation_close_at")
+    )
+    embed.add_field(
+        name="⏳ 제한 시간",
+        value=(
+            f"{'실행' if round_phase == 'execution' else '협상'} 마감: "
+            f"**{close_time_text(close_at)}**\n"
+            "> 모든 방이 먼저 끝나면 남은 시간을 기다리지 않고 다음 단계로 넘어갑니다."
+        ),
+        inline=False,
+    )
+    return embed
+
+
+def bail_pair_view(
+    round_id: int,
+    pair: dict[str, Any],
+    extra: dict[str, Any],
+) -> discord.ui.View:
+    """방 안 진행판에 붙는 버튼. 단계마다 버튼 구성이 완전히 달라서 phase로 갈라 만든다.
+
+    버튼은 한 줄에 5개가 상한이라 0~6 일곱 개를 4+3으로 나눠 배치한다.
+    """
+    view = discord.ui.View(timeout=None)
+    round_phase = str(extra.get("bail_phase") or "")
+    pair_phase = str(pair.get("phase") or "")
+
+    if pair_phase == "resolved":
+        return view
+
+    if round_phase == "negotiation" and pair_phase == "negotiating":
+        awaiting_response = bool(pair.get("offer"))
+        for index, value in enumerate(BAIL_SCOOP_CHOICES):
+            view.add_item(
+                discord.ui.Button(
+                    label=f"내가 {value}번",
+                    style=discord.ButtonStyle.secondary,
+                    custom_id=f"eventbot:bailoffer:{round_id}:{value}",
+                    disabled=awaiting_response,
+                    row=index // 4,
+                )
+            )
+        view.add_item(
+            discord.ui.Button(
+                label="수락",
+                emoji="🤝",
+                style=discord.ButtonStyle.success,
+                custom_id=f"eventbot:bailrespond:{round_id}:accept",
+                disabled=not awaiting_response,
+                row=2,
+            )
+        )
+        view.add_item(
+            discord.ui.Button(
+                label="거절",
+                emoji="✋",
+                style=discord.ButtonStyle.danger,
+                custom_id=f"eventbot:bailrespond:{round_id}:reject",
+                disabled=not awaiting_response,
+                row=2,
+            )
+        )
+        return view
+
+    if round_phase == "execution":
+        for index, value in enumerate(BAIL_SCOOP_CHOICES):
+            view.add_item(
+                discord.ui.Button(
+                    label=f"{value}번 퍼내기",
+                    style=discord.ButtonStyle.primary,
+                    custom_id=f"eventbot:bailscoop:{round_id}:{value}",
+                    row=index // 4,
+                )
+            )
+        return view
+
+    # 협상은 끝났지만 아직 실행 단계가 아닌 대기 상태. 누를 버튼이 없다.
+    return view
+
+
 def defuse_vote_view(round_id: int) -> discord.ui.View:
     view = discord.ui.View(timeout=None)
     for color in DEFUSE_COLORS:
@@ -5608,6 +6890,11 @@ def auto_close_action_label(round_row: sqlite3.Row | dict[str, Any]) -> str:
         return "참가 모집 종료 및 랜덤 매칭"
     if round_row["type"] == "sand" and extra.get("sand_phase") == "registration":
         return "참가 모집 종료 및 모래성 게임 시작"
+    if extra.get("mode") == "bail":
+        if extra.get("bail_phase") == "registration":
+            return "참가 모집 종료 및 협상 시작"
+        if extra.get("bail_phase") == "negotiation":
+            return "협상 종료 및 실행 단계 시작"
     if extra.get("mode") == "minority_balance" and extra.get("balance_phase") == "revote":
         return "재선택 종료"
     game_key = round_game_key(round_row)  # type: ignore[arg-type]
@@ -6297,6 +7584,75 @@ def close_round_record(
                 value="상호 신뢰는 각 +2점, 단독 배신은 배신자 +5점·상대 0점, 동시 배신은 각 -3점입니다.",
                 inline=False,
             )
+        elif round_game_key(round_row) == "bail":
+            # 정산은 실행 단계의 제출값만 본다. 합의는 결과 공개용 기록일 뿐이다.
+            bail_lines: list[str] = []
+            bail_auto_count = 0
+            for pair in extra.get("bail_pairs", []):
+                if str(pair.get("phase")) != "resolved":
+                    autocomplete_bail_pair(pair)
+                    bail_auto_count += 1
+
+            for pair in extra.get("bail_pairs", []):
+                user_a_id = str(pair["user_a_id"])
+                user_b_id = str(pair["user_b_id"])
+                pair_result = pair.get("result") or {}
+                outcome = str(pair.get("outcome") or "")
+                survived = outcome == "survived"
+                reason_label = "생존" if survived else "침몰"
+                for user_id, score_key, scoop_key in (
+                    (user_a_id, "score_a", "scoop_a"),
+                    (user_b_id, "score_b", "scoop_b"),
+                ):
+                    add_score(
+                        conn,
+                        user_id,
+                        member_name(guild, user_id),
+                        int(pair_result[score_key]),
+                        (
+                            f"라운드 #{round_row['id']} 가라앉는 배 {reason_label}"
+                            f"({int(pair[scoop_key])}번 퍼내기)"
+                        ),
+                        round_row["id"],
+                    )
+                auto_mark = " · 자동 제출" if pair.get("auto_completed") else ""
+                bail_lines.append(
+                    f"**{len(bail_lines) + 1}.** <@{user_a_id}> ↔ <@{user_b_id}>\n"
+                    f"　└ **{BAIL_OUTCOME_LABELS.get(outcome, '미완료')}** "
+                    f"(합계 {int(pair_result['total_scoops'])}/{BAIL_REQUIRED_SCOOPS}번) · "
+                    f"{bail_pair_settlement_text(pair)}{auto_mark}\n"
+                    f"　└ {bail_promise_text(pair)}"
+                )
+
+            extra.update({"bail_phase": "scored", "bail_scored_at": now_text()})
+            conn.execute(
+                "UPDATE rounds SET extra_json = ? WHERE id = ?",
+                (json.dumps(extra, ensure_ascii=False), round_row["id"]),
+            )
+            embed = discord.Embed(
+                title=f"결과 · {round_row['title']}",
+                description=round_row["title"],
+                color=BAIL_EMBED_COLOR,
+            )
+            embed.add_field(name="⚓ 짝별 결과", value=field_text(bail_lines), inline=False)
+            unmatched_user_id = str(extra.get("unmatched_user_id") or "")
+            if unmatched_user_id:
+                embed.add_field(name="⏳ 매칭 대기", value=f"<@{unmatched_user_id}> (0점)", inline=False)
+            if bail_auto_count:
+                embed.add_field(
+                    name="⏱️ 자동 제출",
+                    value=f"제한 시간이 끝나 **{bail_auto_count}개 방**의 미제출분이 자동 제출되었습니다.",
+                    inline=False,
+                )
+            embed.add_field(
+                name="💰 정산",
+                value=(
+                    f"퍼내기 1회당 -{BAIL_SCOOP_COST}점 · 합이 {BAIL_REQUIRED_SCOOPS}번 이상이면 각자 "
+                    f"+{BAIL_SURVIVE_REWARD}점 · 못 미치면 양쪽 -{BAIL_SINK_PENALTY}점입니다.\n"
+                    "> ✅ 합의를 지킨 사람 / ⚠️ 합의보다 적게 퍼낸 사람"
+                ),
+                inline=False,
+            )
         elif round_row["type"] == "sand":
             result_lines: list[str] = []
             completed_count = 0
@@ -6608,6 +7964,24 @@ class StartSetupModal(discord.ui.Modal):
         self.add_item(self.game_title)
         self.add_item(self.duration)
 
+        # 가라앉는 배는 협상·실행 두 단계라 각 시간을 운영자가 따로 정한다.
+        # (딜레마의 섬·모래성은 플레이 시간이 상수로 고정돼 있다.)
+        if game == "bail":
+            self.negotiation_minutes = discord.ui.TextInput(
+                label="협상 시간(분)",
+                placeholder=f"예: {BAIL_DEFAULT_NEGOTIATION_MINUTES}",
+                default=str(BAIL_DEFAULT_NEGOTIATION_MINUTES),
+                max_length=4,
+            )
+            self.execution_minutes = discord.ui.TextInput(
+                label="실행(퍼내기 제출) 시간(분)",
+                placeholder=f"예: {BAIL_DEFAULT_EXECUTION_MINUTES}",
+                default=str(BAIL_DEFAULT_EXECUTION_MINUTES),
+                max_length=4,
+            )
+            self.add_item(self.negotiation_minutes)
+            self.add_item(self.execution_minutes)
+
         if game in {"balance", "minority_balance"}:
             self.option_a = discord.ui.TextInput(label="A 선택지", max_length=80)
             self.option_b = discord.ui.TextInput(label="B 선택지", max_length=80)
@@ -6621,7 +7995,18 @@ class StartSetupModal(discord.ui.Modal):
             if not title:
                 raise ValueError("제목을 입력해주세요.")
 
-            if self.game in {"balance", "minority_balance"}:
+            if self.game == "bail":
+                await create_round_from_setup(
+                    interaction,
+                    self.game,
+                    duration,
+                    title,
+                    협상시간분=parse_duration_minutes(str(self.negotiation_minutes.value)),
+                    실행시간분=parse_duration_minutes(str(self.execution_minutes.value)),
+                    예정_미니게임=self.planned_mini_game,
+                    단독_미니게임=self.standalone_mini_game,
+                )
+            elif self.game in {"balance", "minority_balance"}:
                 await create_round_from_setup(
                     interaction,
                     self.game,
@@ -6720,6 +8105,7 @@ async def open_event(interaction: discord.Interaction) -> None:
     메인게임=[
         app_commands.Choice(name="딜레마의 섬", value="trust"),
         app_commands.Choice(name="모래성 게임", value="sand"),
+        app_commands.Choice(name="가라앉는 배", value="bail"),
     ],
     미니게임=[
         app_commands.Choice(name="밸런스 게임", value="balance"),
@@ -6796,6 +8182,8 @@ async def create_round_from_setup(
     안전선개수: int = 2,
     안전색: str | None = None,
     힌트: str | None = None,
+    협상시간분: int | None = None,
+    실행시간분: int | None = None,
     예정_미니게임: str | None = None,
     단독_미니게임: bool = False,
 ) -> None:
@@ -7041,6 +8429,37 @@ async def create_round_from_setup(
             round_id = int(cursor.lastrowid)
             embed = build_sand_registration_embed(round_id, 제목, int(진행시간분))
             view = discord.utils.MISSING
+        elif 게임 == "bail":
+            # rounds.type CHECK 제약을 못 고쳐서 type은 sand를 재사용하고 mode로 갈라 쓴다.
+            extra.update(
+                {
+                    "mode": "bail",
+                    "bail_phase": "registration",
+                    "registration_minutes": int(진행시간분),
+                    "registration_close_at": close_at,
+                    "negotiation_seconds": int(
+                        협상시간분 or BAIL_DEFAULT_NEGOTIATION_MINUTES
+                    ) * 60,
+                    "execution_seconds": int(실행시간분 or BAIL_DEFAULT_EXECUTION_MINUTES) * 60,
+                }
+            )
+            cursor = conn.execute(
+                """
+                INSERT INTO rounds
+                    (type, title, question, status, channel_id, extra_json, created_at)
+                VALUES ('sand', ?, ?, 'open', ?, ?, ?)
+                """,
+                (
+                    제목,
+                    제목,
+                    main_channel_id,
+                    json.dumps(extra, ensure_ascii=False),
+                    now_text(),
+                ),
+            )
+            round_id = int(cursor.lastrowid)
+            embed = build_bail_registration_embed(round_id, 제목, int(진행시간분))
+            view = discord.utils.MISSING
         elif 게임 == "top3":
             rows = conn.execute(
                 """
@@ -7195,7 +8614,18 @@ async def create_round_from_setup(
     # 메인게임 등록 단계에서는 시작 시각만 알린다. 규칙은 임베드 본문에 이미 있고,
     # 다음 미니게임이 뭔지는 참가자가 미리 알 필요가 없다.
     if 게임 in MAIN_GAME_TYPES:
-        if 게임 == "sand":
+        if 게임 == "bail":
+            embed.add_field(
+                name="게임 시작",
+                value=(
+                    f"{진행시간분}분 후 1:1 매칭과 함께 협상이 시작됩니다.\n"
+                    f"시작 예정: {close_time_text(close_at)}\n"
+                    f"협상 {협상시간분 or BAIL_DEFAULT_NEGOTIATION_MINUTES}분 → "
+                    f"실행 {실행시간분 or BAIL_DEFAULT_EXECUTION_MINUTES}분"
+                ),
+                inline=False,
+            )
+        elif 게임 == "sand":
             embed.add_field(
                 name="게임 시작",
                 value=(
@@ -7331,6 +8761,40 @@ async def close_round(interaction: discord.Interaction) -> None:
             await interaction.followup.send("참여자가 부족해 모래성 게임을 취소했습니다.", ephemeral=True)
         return
 
+    if round_game_key(round_row) == "bail" and main_game_phase(round_row) in {
+        "registration",
+        "negotiation",
+    }:
+        # 짝마다 비공개 방을 여느라 API 호출이 여러 번이다. 3초 응답 제한을 넘기므로 먼저 defer한다.
+        await interaction.response.defer(ephemeral=True)
+        round_id = int(round_row["id"])
+        registration = main_game_phase(round_row) == "registration"
+        transition = (
+            start_bail_negotiation(round_id) if registration else start_bail_execution(round_id)
+        )
+        if not transition:
+            await interaction.followup.send("현재 단계를 마감하지 못했습니다.", ephemeral=True)
+            return
+        task = bot.auto_close_tasks.pop(round_id, None)
+        if task:
+            task.cancel()
+        if transition["state"] == "cancelled":
+            await update_trust_main_message(transition)
+            await interaction.followup.send("참여자가 부족해 가라앉는 배를 취소했습니다.", ephemeral=True)
+            return
+        if registration:
+            await create_bail_pair_threads(transition)
+            await update_trust_main_message(transition)
+            await interaction.followup.send(
+                "참여자 모집을 마감하고 1:1 협상 단계를 시작했습니다.", ephemeral=True
+            )
+        else:
+            await refresh_all_bail_pair_boards(round_id)
+            await refresh_main_bail_board(round_id)
+            await interaction.followup.send("협상을 마감하고 실행 단계를 시작했습니다.", ephemeral=True)
+        bot.schedule_auto_close(round_id, float(transition["close_at"]))
+        return
+
     round_extra_row = round_extra(round_row)
     if (
         round_row["type"] == "balance"
@@ -7363,8 +8827,15 @@ async def close_round(interaction: discord.Interaction) -> None:
     is_trust_decision = (
         round_row["type"] == "trust" and round_extra_row.get("trust_phase") == "decision"
     )
-    is_sand_playing = round_row["type"] == "sand" and round_extra_row.get("sand_phase") == "playing"
-    publishes_pair_results = is_trust_decision or is_sand_playing
+    is_sand_playing = (
+        round_row["type"] == "sand"
+        and round_extra_row.get("mode") != "bail"
+        and round_extra_row.get("sand_phase") == "playing"
+    )
+    is_bail_execution = (
+        round_game_key(round_row) == "bail" and round_extra_row.get("bail_phase") == "execution"
+    )
+    publishes_pair_results = is_trust_decision or is_sand_playing or is_bail_execution
     await interaction.response.defer(ephemeral=True)
 
     result = close_round_record(int(round_row["id"]), interaction.guild)
@@ -7380,6 +8851,8 @@ async def close_round(interaction: discord.Interaction) -> None:
     if publishes_pair_results:
         if is_trust_decision:
             await publish_trust_pair_results(int(round_row["id"]))
+        elif is_bail_execution:
+            await publish_bail_pair_results(int(round_row["id"]))
         else:
             await publish_sand_pair_results(int(round_row["id"]))
     await archive_round_discussion_thread(round_row, reason="라운드 종료 후 영구 보관")
@@ -7609,7 +9082,7 @@ async def list_events(interaction: discord.Interaction) -> None:
     for round_row in round_rows:
         extra = round_extra(round_row)
         game_key = round_game_key(round_row)
-        phase = extra.get("trust_phase") or extra.get("sand_phase")
+        phase = main_game_phase(round_row)
         round_status = "진행 중" if round_row["status"] == "open" else "마감"
         lines.append(
             f"#{round_row['id']} {GAME_NAMES.get(game_key, game_key)} · {round_status}"

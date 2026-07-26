@@ -68,9 +68,9 @@ embed/view 빌더 → `close_round_record`(정산) → 슬래시 명령어 → s
 밸런스·3선 폭탄 게임은 **같은 `custom_id`의 선택 버튼을 스레드 안에도 따로 보낸다**(`thread_discussion_view()`).
 `votes`는 `(round_id, user_id)` upsert라 어디서 누르든 마지막 하나만 남는다. 버튼은 한 줄에 5개가 상한이다.
 
-### 1:1 비공개 방 (딜레마의 섬 · 모래성)
+### 1:1 비공개 방 (딜레마의 섬 · 모래성 · 가라앉는 배)
 
-두 메인게임 모두 짝마다 비공개 스레드를 열고 그 안에 게임 버튼을 둔다 (`create_pair_thread()`).
+메인게임 셋 모두 짝마다 비공개 스레드를 열고 그 안에 게임 버튼을 둔다 (`create_pair_thread()`).
 
 **방에 초대하는 것은 짝 두 사람뿐이다. 운영자를 참관용으로 넣지 말 것.** 운영자도 게임에 참여할 수 있어서
 모든 방에 넣으면 1:1이 성립하지 않는다. 운영자는 `스레드 관리` 권한으로 필요한 방만 골라 본다
@@ -85,6 +85,16 @@ embed/view 빌더 → `close_round_record`(정산) → 슬래시 명령어 → s
   (`apply_emergency_join`). **누가 투입됐는지는 메인 채널에만 공개하고, 각 방에는 시간 연장만 알린다** —
   상대가 누구인지가 게임의 일부라 다른 방에 이름이 새면 안 된다.
 
+**가라앉는 배만 단계가 하나 더 있다**: `registration → negotiation → execution → scored`.
+그래서 자동 마감 타이머가 한 번 더 돈다 — `on_ready` 복구 콜백과 `/라운드마감` 양쪽에 전이 분기가 있어야
+한다(`start_bail_negotiation` / `start_bail_execution`). 그리고 협상 → 실행 전이에서 버튼 구성이 바뀌므로
+**모든 방의 진행판을 다시 그려야 한다**(`refresh_all_bail_pair_boards`) — 누른 사람 방만 갱신하는
+모래성과 다른 점이다. 모든 짝이 협상을 먼저 마치면 남은 시간을 기다리지 않고 조기 전이한다.
+
+이 게임의 핵심 규칙은 **협상에서 맺은 합의에 구속력이 없다**는 것이다. 정산은 실행 단계의 제출값만 보고
+(`resolve_bail_pair`), 합의는 결과 공개용 기록으로만 남는다(`bail_promise_text`가 합의와 실제를 나란히
+보여준다). 합의를 점수에 반영하면 게임이 성립하지 않으므로 정산 분기에서 `agreement`를 읽지 말 것.
+
 ### 게임 타입 이름 주의
 
 `rounds.type` CHECK 제약(`balance,bomb,grid,cutting,top3,trust,sand`)은 **실제 게임 목록이 아니다.**
@@ -95,8 +105,20 @@ embed/view 빌더 → `close_round_record`(정산) → 슬래시 명령어 → s
 | 3선 폭탄 게임 | `bomb` | `defuse4` | 새 라운드는 `settlement_rule = "top_vote_penalty"`로 구방식과 구분 |
 | 소수파 밸런스 | `balance` | `minority_balance` | |
 | 유일 숫자 게임 | `grid` | `unique_number` | `grid`는 제거된 게임이라 이름만 재사용. `mode` 없는 옛 라운드는 점수 없이 마감 |
+| 가라앉는 배 | `sand` | `bail` | **모래성과 같은 타입을 쓴다.** 아래 주의 참고 |
 
 권위 있는 목록은 `MAIN_GAME_TYPES` / `MINI_GAME_TYPES` / `GAME_NAMES` 상수다. CHECK 제약이 아니다.
+이 상수들은 **게임 키 집합**이지 `rounds.type` 값 집합이 아니다 (`MAIN_GAME_TYPES`에 `bail`이 있지만
+그런 `type` 값은 DB에 없다). 게임을 갈라야 할 때는 `round_game_key(round_row)`를 쓴다.
+
+**`bail`은 `sand`와 타입이 겹치는 첫 사례다.** `type == "sand"`로 분기하는 코드는 모래성과 가라앉는 배를
+구분하지 못한다. 새 코드를 넣을 때 다음을 확인한다:
+
+- 정산(`close_round_record`)은 `round_game_key(...) == "bail"` 분기를 **sand 분기보다 먼저** 둔다.
+- 단계 조회는 `main_game_phase(round_row)`를 쓴다 (`trust_phase`/`sand_phase`/`bail_phase`를 한 곳에 모아둠).
+- 짝 이력(`recent_match_pairs`)은 타입으로 조회하므로 **두 게임이 이력을 공유한다.** 의도된 동작이다 —
+  같은 사람과 연속으로 만나는 것을 두 게임에 걸쳐 회피한다.
+- 긴급 투입은 `round_game_key`를 넘긴다(`apply_emergency_join(extra, game_key, ...)`).
 
 ### 러시안룰렛 (상시 1:1)
 

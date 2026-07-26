@@ -1144,6 +1144,19 @@ class BotRegressionTests(unittest.TestCase):
                 ).fetchone()["total_score"]
             )
 
+    @staticmethod
+    def insert_bail_round(extra: dict) -> int:
+        """가라앉는 배 라운드를 넣는다. CHECK 제약 때문에 type은 sand고 mode로 갈린다."""
+        with bot.db() as conn:
+            cursor = conn.execute(
+                """
+                INSERT INTO rounds (type, title, question, status, channel_id, extra_json, created_at)
+                VALUES ('sand', '가라앉는 배', '가라앉는 배', 'open', '10', ?, '2026-01-01 00:00:00')
+                """,
+                (json.dumps({"mode": "bail", **extra}),),
+            )
+            return int(cursor.lastrowid)
+
     def test_balance_one_sided_vote_penalizes_every_voter(self) -> None:
         for user_id in ("1", "2", "3"):
             self.add_user(user_id, f"참가자{user_id}", 0)
@@ -1809,6 +1822,354 @@ class BotRegressionTests(unittest.TestCase):
         self.assertEqual(
             {user_id: self.score_of(user_id) for user_id in ("1", "2", "3", "4", "5", "6", "7", "8")},
             {"1": -3, "2": -3, "3": 5, "4": -3, "5": 2, "6": -3, "7": -3, "8": 0},
+        )
+
+    # --- 가라앉는 배 --------------------------------------------------------
+
+    @staticmethod
+    def bail_pair(**overrides) -> dict:
+        pair = bot.bail_new_pair("1", "2")
+        pair["proposer_id"] = "1"  # 랜덤이라 테스트에서는 고정한다
+        pair.update(overrides)
+        return pair
+
+    @staticmethod
+    def bail_submitted_pair(scoop_a: int, scoop_b: int, agreement: dict | None = None) -> dict:
+        pair = bot.bail_new_pair("1", "2")
+        pair.update(
+            {
+                "phase": "submitting",
+                "agreement": agreement,
+                "scoop_a": scoop_a,
+                "scoop_b": scoop_b,
+            }
+        )
+        bot.resolve_bail_pair(pair)
+        return pair
+
+    def test_bail_accepted_offer_records_agreement(self) -> None:
+        pair = self.bail_pair()
+
+        bot.apply_bail_offer(pair, "1", 2)
+        self.assertEqual(pair["offer"], {"proposer_id": "1", "scoops": 2})
+        self.assertEqual(pair["offer_count"], 1)
+
+        bot.apply_bail_response(pair, "2", True)
+
+        # 제안자가 2번이면 상대는 나머지를 맡는다.
+        self.assertEqual(pair["agreement"], {"user_a": 2, "user_b": bot.BAIL_REQUIRED_SCOOPS - 2})
+        self.assertEqual(pair["phase"], "submitting")
+        self.assertIsNone(pair["offer"])
+
+    def test_bail_rejection_hands_proposal_turn_to_responder(self) -> None:
+        pair = self.bail_pair()
+
+        bot.apply_bail_offer(pair, "1", 1)
+        bot.apply_bail_response(pair, "2", False)
+
+        self.assertEqual(pair["phase"], "negotiating")
+        self.assertEqual(pair["proposer_id"], "2")
+        self.assertIsNone(pair["offer"])
+        self.assertIsNone(pair["agreement"])
+
+    def test_bail_exhausted_offers_end_negotiation_without_agreement(self) -> None:
+        """제안 횟수를 모두 소진하면 합의 없이 실행 단계로 넘어간다."""
+        pair = self.bail_pair()
+
+        proposer, responder = "1", "2"
+        for _ in range(bot.BAIL_NEGOTIATION_MAX_OFFERS):
+            bot.apply_bail_offer(pair, proposer, 0)
+            bot.apply_bail_response(pair, responder, False)
+            proposer, responder = responder, proposer
+
+        self.assertEqual(pair["offer_count"], bot.BAIL_NEGOTIATION_MAX_OFFERS)
+        self.assertEqual(pair["phase"], "submitting")
+        self.assertIsNone(pair["agreement"])
+
+    def test_bail_survives_when_submissions_reach_requirement(self) -> None:
+        pair = self.bail_submitted_pair(3, 3)
+
+        self.assertEqual(pair["outcome"], "survived")
+        self.assertEqual(pair["result"]["total_scoops"], bot.BAIL_REQUIRED_SCOOPS)
+        # 협력은 낮은 이득: 보상에서 퍼낸 만큼을 뺀다.
+        self.assertEqual(pair["result"]["score_a"], bot.BAIL_SURVIVE_REWARD - 3)
+        self.assertEqual(pair["result"]["score_b"], bot.BAIL_SURVIVE_REWARD - 3)
+
+    def test_bail_sinks_when_submissions_fall_short(self) -> None:
+        pair = self.bail_submitted_pair(3, 2)
+
+        self.assertEqual(pair["outcome"], "sunk")
+        self.assertEqual(pair["result"]["score_a"], -bot.BAIL_SINK_PENALTY)
+        self.assertEqual(pair["result"]["score_b"], -bot.BAIL_SINK_PENALTY)
+
+    def test_bail_free_rider_takes_full_reward(self) -> None:
+        """한 명이 전부 떠안으면 무임승차한 쪽이 최고점, 떠안은 쪽은 마이너스다."""
+        pair = self.bail_submitted_pair(0, bot.BAIL_REQUIRED_SCOOPS)
+
+        self.assertEqual(pair["outcome"], "survived")
+        self.assertEqual(pair["result"]["score_a"], bot.BAIL_SURVIVE_REWARD)
+        self.assertEqual(
+            pair["result"]["score_b"],
+            bot.BAIL_SURVIVE_REWARD - bot.BAIL_REQUIRED_SCOOPS,
+        )
+        # 침몰(-3)보다는 나아야 떠안는 선택이 성립한다.
+        self.assertGreater(pair["result"]["score_b"], -bot.BAIL_SINK_PENALTY)
+
+    def test_bail_agreement_never_changes_score(self) -> None:
+        """합의는 기록만 된다. 같은 제출값이면 합의 내용이 무엇이든 점수가 같다."""
+        kept = self.bail_submitted_pair(2, 4, agreement={"user_a": 2, "user_b": 4})
+        broken = self.bail_submitted_pair(2, 4, agreement={"user_a": 4, "user_b": 2})
+
+        self.assertEqual(kept["result"], broken["result"])
+
+    def test_bail_autocomplete_uses_agreed_share(self) -> None:
+        pair = self.bail_pair(
+            phase="submitting",
+            agreement={"user_a": 4, "user_b": 2},
+            scoop_a=None,
+            scoop_b=1,
+        )
+
+        bot.autocomplete_bail_pair(pair)
+
+        # 미제출자는 합의한 몫으로, 이미 낸 사람은 낸 값 그대로.
+        self.assertEqual(pair["scoop_a"], 4)
+        self.assertEqual(pair["scoop_b"], 1)
+        self.assertEqual(pair["phase"], "resolved")
+        self.assertTrue(pair["auto_completed"])
+
+    def test_bail_autocomplete_without_agreement_splits_evenly(self) -> None:
+        pair = self.bail_pair(phase="negotiating", offer={"proposer_id": "1", "scoops": 0})
+
+        bot.autocomplete_bail_pair(pair)
+
+        self.assertEqual(pair["scoop_a"], bot.BAIL_FALLBACK_SCOOPS)
+        self.assertEqual(pair["scoop_b"], bot.BAIL_FALLBACK_SCOOPS)
+        self.assertIsNone(pair["offer"])
+        # 절반씩이면 배가 뜬다 — 잠수 한 명이 상대까지 침몰시키지 않는다.
+        self.assertEqual(pair["outcome"], "survived")
+
+    def test_bail_negotiations_and_games_complete_flags(self) -> None:
+        negotiating = {"bail_pairs": [self.bail_pair()]}
+        submitting = {"bail_pairs": [self.bail_pair(phase="submitting")]}
+        resolved = {"bail_pairs": [self.bail_submitted_pair(3, 3)]}
+
+        self.assertFalse(bot.bail_negotiations_complete(negotiating))
+        self.assertTrue(bot.bail_negotiations_complete(submitting))
+        self.assertFalse(bot.bail_games_complete(submitting))
+        self.assertTrue(bot.bail_games_complete(resolved))
+        # 짝이 없으면 완료가 아니다 (라운드가 조기 전이되지 않게).
+        self.assertFalse(bot.bail_negotiations_complete({"bail_pairs": []}))
+
+    def test_bail_registration_transitions_to_negotiation(self) -> None:
+        self.add_user("1", "참가자1", 0)
+        self.add_user("2", "참가자2", 0)
+        round_id = self.insert_bail_round({"bail_phase": "registration"})
+        with bot.db() as conn:
+            conn.executemany(
+                "INSERT INTO trust_registrations (round_id, user_id, registered_at) VALUES (?, ?, ?)",
+                [(round_id, "1", "2026-01-01 00:00:00"), (round_id, "2", "2026-01-01 00:00:01")],
+            )
+
+        transition = bot.start_bail_negotiation(round_id)
+
+        self.assertIsNotNone(transition)
+        self.assertEqual(transition["state"], "negotiation")
+        self.assertEqual({tuple(sorted(pair)) for pair in transition["pairs"]}, {("1", "2")})
+        with bot.db() as conn:
+            extra = json.loads(
+                conn.execute(
+                    "SELECT extra_json FROM rounds WHERE id = ?", (round_id,)
+                ).fetchone()["extra_json"]
+            )
+        self.assertEqual(extra["bail_phase"], "negotiation")
+        self.assertEqual(extra["bail_pairs"][0]["phase"], "negotiating")
+
+    def test_bail_execution_transition_drops_pending_offers(self) -> None:
+        """협상 시간이 끝나면 대기 중인 제안은 합의 없이 사라진다."""
+        pending = self.bail_pair(offer={"proposer_id": "1", "scoops": 0}, offer_count=1)
+        agreed = self.bail_pair(phase="submitting", agreement={"user_a": 3, "user_b": 3})
+        round_id = self.insert_bail_round(
+            {"bail_phase": "negotiation", "bail_pairs": [pending, agreed]}
+        )
+
+        transition = bot.start_bail_execution(round_id)
+
+        self.assertEqual(transition["state"], "execution")
+        with bot.db() as conn:
+            extra = json.loads(
+                conn.execute(
+                    "SELECT extra_json FROM rounds WHERE id = ?", (round_id,)
+                ).fetchone()["extra_json"]
+            )
+        self.assertEqual(extra["bail_phase"], "execution")
+        self.assertEqual(extra["bail_pairs"][0]["phase"], "submitting")
+        self.assertIsNone(extra["bail_pairs"][0]["offer"])
+        self.assertIsNone(extra["bail_pairs"][0]["agreement"])
+        # 이미 합의한 짝은 그대로 유지된다.
+        self.assertEqual(extra["bail_pairs"][1]["agreement"], {"user_a": 3, "user_b": 3})
+
+    def test_bail_execution_transition_requires_negotiation_phase(self) -> None:
+        round_id = self.insert_bail_round({"bail_phase": "execution", "bail_pairs": []})
+
+        self.assertIsNone(bot.start_bail_execution(round_id))
+
+    def test_bail_close_autocompletes_and_scores_pairs(self) -> None:
+        for user_id in ("1", "2", "3", "4", "5", "6"):
+            self.add_user(user_id, f"참가자{user_id}", 0)
+        survived = self.bail_submitted_pair(2, 4)
+        sunk = {**self.bail_submitted_pair(3, 2), "user_a_id": "3", "user_b_id": "4"}
+        unfinished = self.bail_pair(
+            user_a_id="5",
+            user_b_id="6",
+            phase="submitting",
+            agreement={"user_a": 3, "user_b": 3},
+            scoop_a=3,
+        )
+        round_id = self.insert_bail_round(
+            {"bail_phase": "execution", "bail_pairs": [survived, sunk, unfinished]}
+        )
+
+        result = bot.close_round_record(round_id, None)
+
+        self.assertEqual(
+            {user_id: self.score_of(user_id) for user_id in ("1", "2", "3", "4", "5", "6")},
+            {
+                "1": bot.BAIL_SURVIVE_REWARD - 2,
+                "2": bot.BAIL_SURVIVE_REWARD - 4,
+                "3": -bot.BAIL_SINK_PENALTY,
+                "4": -bot.BAIL_SINK_PENALTY,
+                # 미제출자는 합의한 3번으로 자동 제출되어 배가 뜬다.
+                "5": bot.BAIL_SURVIVE_REWARD - 3,
+                "6": bot.BAIL_SURVIVE_REWARD - 3,
+            },
+        )
+        with bot.db() as conn:
+            extra = json.loads(
+                conn.execute(
+                    "SELECT extra_json FROM rounds WHERE id = ?", (round_id,)
+                ).fetchone()["extra_json"]
+            )
+        self.assertEqual(extra["bail_phase"], "scored")
+        self.assertTrue(extra["bail_pairs"][2]["auto_completed"])
+        rendered = json.dumps(result[1].to_dict(), ensure_ascii=False)
+        self.assertIn("자동 제출", rendered)
+        self.assertIn("침몰", rendered)
+
+    def test_bail_result_shows_agreement_next_to_actual(self) -> None:
+        """약속을 어긴 사람이 결과에 드러나야 한다 — 이게 평판 장치다."""
+        pair = self.bail_submitted_pair(4, 2, agreement={"user_a": 3, "user_b": 3})
+
+        rendered = bot.bail_promise_text(pair)
+
+        self.assertIn("4번 ✅", rendered)  # 합의(3) 이상을 냈다
+        self.assertIn("2번 ⚠️", rendered)  # 합의보다 적게 냈다
+
+    def test_bail_promise_text_marks_failed_negotiation(self) -> None:
+        pair = self.bail_submitted_pair(3, 3)
+
+        rendered = bot.bail_promise_text(pair)
+
+        self.assertIn("협상 결렬", rendered)
+        self.assertNotIn("✅", rendered)
+
+    def test_bail_emergency_join_starts_a_new_negotiation(self) -> None:
+        extra = {"bail_phase": "negotiation", "unmatched_user_id": "3", "auto_close_at": 100.0}
+
+        applied = bot.apply_emergency_join(extra, "bail", "4")
+
+        self.assertIsNotNone(applied)
+        self.assertEqual(extra["bail_pairs"][0]["phase"], "negotiating")
+        self.assertEqual(
+            {extra["bail_pairs"][0]["user_a_id"], extra["bail_pairs"][0]["user_b_id"]},
+            {"3", "4"},
+        )
+        self.assertIsNone(extra["unmatched_user_id"])
+        # 협상 단계에서는 협상 마감이 연장된다.
+        self.assertEqual(extra["negotiation_close_at"], extra["auto_close_at"])
+        self.assertNotIn("play_close_at", extra)
+
+    def test_bail_emergency_join_during_execution_skips_negotiation(self) -> None:
+        """실행 단계에 투입되면 협상 기회가 없으므로 제출 단계에서 시작한다."""
+        extra = {"bail_phase": "execution", "unmatched_user_id": "3", "auto_close_at": 100.0}
+
+        bot.apply_emergency_join(extra, "bail", "4")
+
+        self.assertEqual(extra["bail_pairs"][0]["phase"], "submitting")
+        self.assertIsNone(extra["bail_pairs"][0]["agreement"])
+        self.assertEqual(extra["execution_close_at"], extra["auto_close_at"])
+
+    def test_bail_rules_text_is_generated_from_constants(self) -> None:
+        with patch.object(bot, "BAIL_SURVIVE_REWARD", 9):
+            self.assertIn("+9점", bot.build_bail_registration_embed(1, "배", 2).fields[1].value)
+
+    def test_bail_pair_view_fits_discord_button_limits(self) -> None:
+        """버튼은 한 줄에 5개가 상한이다. 넘기면 View 생성 자체가 터진다."""
+        cases = [
+            ({"bail_phase": "negotiation"}, self.bail_pair()),
+            (
+                {"bail_phase": "negotiation"},
+                self.bail_pair(offer={"proposer_id": "1", "scoops": 3}, offer_count=1),
+            ),
+            ({"bail_phase": "execution"}, self.bail_pair(phase="submitting")),
+        ]
+        for extra, pair in cases:
+            view = bot.bail_pair_view(1, pair, extra)
+            per_row: dict[int, int] = {}
+            for item in view.children:
+                per_row[item.row] = per_row.get(item.row, 0) + 1
+            self.assertLessEqual(max(per_row.values()), 5, extra)
+            self.assertLessEqual(len(view.children), 25, extra)
+            self.assertTrue(
+                all(item.custom_id.startswith("eventbot:bail") for item in view.children),
+                extra,
+            )
+
+    def test_bail_pair_view_locks_proposals_while_offer_pending(self) -> None:
+        extra = {"bail_phase": "negotiation"}
+        pending = bot.bail_pair_view(
+            1, self.bail_pair(offer={"proposer_id": "1", "scoops": 3}), extra
+        )
+
+        disabled = {
+            item.custom_id.rsplit(":", 1)[0]: item.disabled for item in pending.children
+        }
+        self.assertTrue(disabled["eventbot:bailoffer:1"])
+        self.assertFalse(disabled["eventbot:bailrespond:1"])
+
+    def test_bail_resolved_pair_has_no_buttons(self) -> None:
+        view = bot.bail_pair_view(1, self.bail_submitted_pair(3, 3), {"bail_phase": "execution"})
+
+        self.assertEqual(view.children, [])
+
+    def test_bail_embeds_render_in_every_phase(self) -> None:
+        """embed 필드는 1024자 제한이 있어 단계별로 한 번씩 만들어봐야 한다."""
+        for phase, pair in (
+            ("negotiation", self.bail_pair()),
+            ("execution", self.bail_pair(phase="submitting", scoop_a=2)),
+            ("scored", self.bail_submitted_pair(2, 4, agreement={"user_a": 3, "user_b": 3})),
+        ):
+            extra = {
+                "bail_phase": phase,
+                "bail_pairs": [pair],
+                "unmatched_user_id": "9",
+                "negotiation_close_at": 100.0,
+                "execution_close_at": 200.0,
+            }
+            round_row = {"title": "가라앉는 배", "type": "sand"}
+            for embed in (
+                bot.build_bail_pair_embed("가라앉는 배", pair, extra),
+                bot.build_bail_play_embed(round_row, extra),
+                bot.build_bail_pair_result_embed("가라앉는 배", pair),
+            ):
+                for field in embed.fields:
+                    self.assertLessEqual(len(field.value), 1024, (phase, field.name))
+
+    def test_bail_scoop_choices_cover_every_share(self) -> None:
+        # 0번부터 전부 떠안는 경우까지 고를 수 있어야 협상 폭이 나온다.
+        self.assertEqual(
+            bot.BAIL_SCOOP_CHOICES,
+            [str(index) for index in range(bot.BAIL_REQUIRED_SCOOPS + 1)],
         )
 
     # --- 돌 세공 ------------------------------------------------------------
