@@ -95,6 +95,7 @@ embed/view 빌더 → `close_round_record`(정산) → 슬래시 명령어 → s
 | 3선 폭탄 게임 | `bomb` | `defuse4` | 새 라운드는 `settlement_rule = "top_vote_penalty"`로 구방식과 구분 |
 | 소수파 밸런스 | `balance` | `minority_balance` | |
 | 유일 숫자 게임 | `grid` | `unique_number` | `grid`는 제거된 게임이라 이름만 재사용. `mode` 없는 옛 라운드는 점수 없이 마감 |
+| 야구 | `grid` | `baseball` | `/준비` 후 비활성 3×3 판을 띄우고 3초 뒤 자동 활성화. 클릭 기록은 `baseball_swings`, 활성화 시각·조작판 메시지 ID·무작위 버튼 위치는 `extra_json`에 저장해 재시작 시 타이머 복구. 미입력은 7초로 계산하고 3구 평균 최종 순위로 한 번만 점수 지급 |
 
 권위 있는 목록은 `MAIN_GAME_TYPES` / `MINI_GAME_TYPES` / `GAME_NAMES` 상수다. CHECK 제약이 아니다.
 
