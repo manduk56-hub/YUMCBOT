@@ -169,15 +169,24 @@ SAND_OUTCOME_LABELS = {
 }
 # 가라앉는 배: 협상 → 실행 2단계 메인게임. rounds.type CHECK 제약을 못 고쳐서
 # type='sand' + extra_json.mode='bail'로 저장한다 (grid→unique_number와 같은 방식).
+#
+# 협상하는 것은 **구조 보상금의 배분**이고(수락하면 확정), 누가 몇 번 퍼낼지는 아무도 약속하지 않는다.
+# 그래서 배신은 "보상은 챙기고 노동은 덜 하기"가 된다.
+BAIL_REWARD_POOL = 8  # 배가 뜨면 두 사람이 나눠 받는 구조 보상금
+BAIL_REWARD_CHOICES = [str(index) for index in range(BAIL_REWARD_POOL + 1)]  # 0~8
+BAIL_FAILED_REWARD_POOL = 4  # 협상 결렬 시 감액된 보상금 (둘이 균등 분배)
 BAIL_REQUIRED_SCOOPS = 6  # 배가 뜨는 데 필요한 두 사람 합계 퍼내기 횟수
 BAIL_SCOOP_CHOICES = [str(index) for index in range(BAIL_REQUIRED_SCOOPS + 1)]  # 0~6
 BAIL_SCOOP_COST = 1  # 퍼내기 1회당 차감
-BAIL_SURVIVE_REWARD = 4  # 배가 뜨면 각자 지급
-BAIL_SINK_PENALTY = 3  # 침몰 시 양쪽 차감
+# 침몰 페널티는 보상 몫에 비례한다. 많이 받기로 한 쪽이 더 크게 잃어야
+# "협상에서 욕심낸 만큼 침몰 리스크를 진다"가 성립하고, 적게 받은 쪽에 배신 카드가 생긴다.
+BAIL_SINK_PENALTY_HIGH = 4  # 보상 몫이 많은 쪽
+BAIL_SINK_PENALTY_LOW = 2  # 보상 몫이 적은 쪽
+BAIL_SINK_PENALTY_EVEN = 3  # 몫이 같을 때 (결렬 포함)
 BAIL_NEGOTIATION_MAX_OFFERS = 3  # 교대 제안 최대 횟수
 BAIL_DEFAULT_NEGOTIATION_MINUTES = 5
 BAIL_DEFAULT_EXECUTION_MINUTES = 3
-BAIL_FALLBACK_SCOOPS = BAIL_REQUIRED_SCOOPS // 2  # 합의도 제출도 없을 때의 자동 제출값
+BAIL_FALLBACK_SCOOPS = BAIL_REQUIRED_SCOOPS // 2  # 실행 단계 미제출 시의 자동 제출값
 BAIL_OUTCOME_LABELS = {
     "survived": "생존",
     "sunk": "침몰",
@@ -821,10 +830,13 @@ def game_settings_snapshot(game_key: str) -> dict[str, Any]:
         settings["number_choices"] = SAND_NUMBER_CHOICES
         settings["match_history_rounds"] = MATCH_HISTORY_ROUNDS
     elif game_key == "bail":
+        settings["reward_pool"] = BAIL_REWARD_POOL
+        settings["failed_reward_pool"] = BAIL_FAILED_REWARD_POOL
         settings["required_scoops"] = BAIL_REQUIRED_SCOOPS
         settings["scoop_cost"] = BAIL_SCOOP_COST
-        settings["survive_reward"] = BAIL_SURVIVE_REWARD
-        settings["sink_penalty"] = BAIL_SINK_PENALTY
+        settings["sink_penalty_high"] = BAIL_SINK_PENALTY_HIGH
+        settings["sink_penalty_low"] = BAIL_SINK_PENALTY_LOW
+        settings["sink_penalty_even"] = BAIL_SINK_PENALTY_EVEN
         settings["max_offers"] = BAIL_NEGOTIATION_MAX_OFFERS
         settings["fallback_scoops"] = BAIL_FALLBACK_SCOOPS
         settings["match_history_rounds"] = MATCH_HISTORY_ROUNDS
@@ -3216,17 +3228,19 @@ async def handle_sand_action(
 def bail_rules_text() -> str:
     """규칙 안내문. 점수 상수를 조정하면 안내문도 따라 바뀌도록 런타임에 만든다."""
     return (
-        f"**1** ─ 배가 가라앉기 전에 **두 사람이 합쳐 {BAIL_REQUIRED_SCOOPS}번** 물을 퍼내야 합니다.\n"
-        "**2** ─ 먼저 비공개 방에서 누가 몇 번 퍼낼지 **협상**합니다. "
-        f"제안과 수락/거절을 번갈아 최대 {BAIL_NEGOTIATION_MAX_OFFERS}번 주고받습니다.\n"
-        "**3** ─ 협상이 끝나면 각자 실제로 퍼낼 횟수를 **비공개로** 제출합니다. "
-        "**합의는 기록만 되고 점수와 무관합니다** — 약속을 지킬지는 각자의 선택입니다.\n"
-        "**4** ─ 제출하지 않으면 마감 때 합의한 몫(합의가 없으면 "
-        f"{BAIL_FALLBACK_SCOOPS}번)으로 자동 제출됩니다.\n\n"
+        f"**1** ─ 구조되면 보상금 **{BAIL_REWARD_POOL}점**이 나옵니다. 먼저 비공개 방에서 "
+        "**그 돈을 어떻게 나눌지** 협상합니다. "
+        f"(제안과 수락/거절을 번갈아 최대 {BAIL_NEGOTIATION_MAX_OFFERS}번, 수락하면 확정)\n"
+        f"**2** ─ 배가 뜨려면 **두 사람이 합쳐 {BAIL_REQUIRED_SCOOPS}번** 물을 퍼내야 합니다. "
+        "**누가 몇 번 퍼낼지는 아무도 약속하지 않습니다** — 각자 비공개로 제출합니다.\n"
+        f"**3** ─ 협상이 결렬되면 보상금이 **{BAIL_FAILED_REWARD_POOL}점**으로 줄어 "
+        f"각자 {BAIL_FAILED_REWARD_POOL // 2}점씩 받습니다.\n"
+        f"**4** ─ 제출하지 않으면 마감 때 {BAIL_FALLBACK_SCOOPS}번으로 자동 제출됩니다.\n\n"
         f"> 🪣 퍼내기 1회당 **-{BAIL_SCOOP_COST}점**\n"
-        f"> ⛵ 두 사람 합이 **{BAIL_REQUIRED_SCOOPS}번 이상**이면 배가 뜨고 각자 "
-        f"**+{BAIL_SURVIVE_REWARD}점**\n"
-        f"> 🌊 못 미치면 침몰 — **양쪽 모두 -{BAIL_SINK_PENALTY}점**"
+        f"> ⛵ 합이 **{BAIL_REQUIRED_SCOOPS}번 이상**이면 배가 뜬다 → "
+        "**보상 몫 − 내가 퍼낸 횟수**\n"
+        f"> 🌊 못 미치면 침몰 — 보상금을 못 받고 **몫이 많은 쪽 -{BAIL_SINK_PENALTY_HIGH}점 / "
+        f"적은 쪽 -{BAIL_SINK_PENALTY_LOW}점** (같으면 각 -{BAIL_SINK_PENALTY_EVEN}점)"
     )
 
 
@@ -3249,12 +3263,12 @@ def bail_side_key(pair: dict[str, Any], user_id: str) -> str:
     return "user_a" if user_id == str(pair["user_a_id"]) else "user_b"
 
 
-def bail_agreed_scoops(pair: dict[str, Any], user_id: str) -> int | None:
-    """합의된 내 몫. 합의가 없으면 None."""
-    agreement = pair.get("agreement")
-    if not agreement:
-        return None
-    return int(agreement[bail_side_key(pair, user_id)])
+def bail_reward_share(pair: dict[str, Any], side: str) -> int:
+    """생존 시 받을 보상 몫. 협상이 결렬됐으면 감액된 보상금을 균등 분배한다."""
+    split = pair.get("reward_split")
+    if not split:
+        return BAIL_FAILED_REWARD_POOL // 2
+    return int(split[side])
 
 
 def bail_new_pair(user_a_id: str, user_b_id: str) -> dict[str, Any]:
@@ -3265,48 +3279,49 @@ def bail_new_pair(user_a_id: str, user_b_id: str) -> dict[str, Any]:
         "proposer_id": random.choice([user_a_id, user_b_id]),
         "offer": None,
         "offer_count": 0,
-        "agreement": None,
+        "reward_split": None,
         "scoop_a": None,
         "scoop_b": None,
     }
 
 
-def apply_bail_offer(pair: dict[str, Any], user_id: str, scoops: int) -> str:
-    """제안권자가 분담안을 제시한다. 호출 전에 단계·차례 검증이 끝나 있어야 한다."""
-    other_scoops = BAIL_REQUIRED_SCOOPS - scoops
+def apply_bail_offer(pair: dict[str, Any], user_id: str, reward: int) -> str:
+    """제안권자가 보상금 배분안을 제시한다. 호출 전에 단계·차례 검증이 끝나 있어야 한다."""
+    other_reward = BAIL_REWARD_POOL - reward
     pair.update(
         {
-            "offer": {"proposer_id": user_id, "scoops": scoops},
+            "offer": {"proposer_id": user_id, "reward": reward},
             "offer_count": int(pair.get("offer_count", 0)) + 1,
         }
     )
     return (
-        f"제안했습니다 — 내가 **{scoops}번**, 상대가 **{other_scoops}번**.\n"
+        f"제안했습니다 — 내가 **{reward}점**, 상대가 **{other_reward}점**.\n"
         "상대의 수락/거절을 기다립니다."
     )
 
 
 def apply_bail_response(pair: dict[str, Any], user_id: str, accepted: bool) -> str:
-    """대기 중인 제안에 응답한다. 수락이면 합의 확정, 거절이면 제안권이 넘어간다."""
+    """대기 중인 제안에 응답한다. 수락이면 배분 확정, 거절이면 제안권이 넘어간다."""
     offer = pair["offer"]
     proposer_id = str(offer["proposer_id"])
-    proposer_scoops = int(offer["scoops"])
-    responder_scoops = BAIL_REQUIRED_SCOOPS - proposer_scoops
+    proposer_reward = int(offer["reward"])
+    responder_reward = BAIL_REWARD_POOL - proposer_reward
 
     if accepted:
         pair.update(
             {
-                "agreement": {
-                    bail_side_key(pair, proposer_id): proposer_scoops,
-                    bail_side_key(pair, user_id): responder_scoops,
+                "reward_split": {
+                    bail_side_key(pair, proposer_id): proposer_reward,
+                    bail_side_key(pair, user_id): responder_reward,
                 },
                 "offer": None,
                 "phase": "submitting",
             }
         )
         return (
-            f"합의했습니다 — 내가 **{responder_scoops}번**, 상대가 **{proposer_scoops}번**.\n"
-            "실행 단계에서 실제로 퍼낼 횟수를 따로 제출합니다. **합의는 점수와 무관합니다.**"
+            f"보상금 배분을 확정했습니다 — 내가 **{responder_reward}점**, "
+            f"상대가 **{proposer_reward}점**.\n"
+            "이제 실제로 퍼낼 횟수를 각자 제출합니다. **누가 몇 번 퍼낼지는 약속하지 않았습니다.**"
         )
 
     exhausted = int(pair.get("offer_count", 0)) >= BAIL_NEGOTIATION_MAX_OFFERS
@@ -3318,7 +3333,11 @@ def apply_bail_response(pair: dict[str, Any], user_id: str, accepted: bool) -> s
         }
     )
     if exhausted:
-        return "거절했습니다. 제안 횟수를 모두 소진해 **합의 없이** 실행 단계로 넘어갑니다."
+        return (
+            "거절했습니다. 제안 횟수를 모두 소진해 협상이 **결렬**되었습니다 — "
+            f"보상금이 {BAIL_FAILED_REWARD_POOL}점으로 줄어 각자 "
+            f"{BAIL_FAILED_REWARD_POOL // 2}점입니다."
+        )
     return "거절했습니다. 이제 내가 제안할 차례입니다."
 
 
@@ -3335,25 +3354,35 @@ def bail_games_complete(extra: dict[str, Any]) -> bool:
 
 
 def resolve_bail_pair(pair: dict[str, Any]) -> None:
-    """제출된 두 횟수로 생존/침몰과 점수를 확정한다.
+    """제출된 두 횟수와 확정된 보상 배분으로 생존/침몰과 점수를 확정한다.
 
-    합의는 보지 않는다. 약속을 지켰는지는 결과 공개용 기록일 뿐이다.
+    노동에 대한 약속은 애초에 없다. 배가 뜨는지는 오직 제출된 두 횟수의 합으로 결정된다.
     """
     scoop_a = int(pair["scoop_a"])
     scoop_b = int(pair["scoop_b"])
     total = scoop_a + scoop_b
     survived = total >= BAIL_REQUIRED_SCOOPS
+    share_a = bail_reward_share(pair, "user_a")
+    share_b = bail_reward_share(pair, "user_b")
+
     if survived:
-        score_a = BAIL_SURVIVE_REWARD - scoop_a * BAIL_SCOOP_COST
-        score_b = BAIL_SURVIVE_REWARD - scoop_b * BAIL_SCOOP_COST
+        score_a = share_a - scoop_a * BAIL_SCOOP_COST
+        score_b = share_b - scoop_b * BAIL_SCOOP_COST
+    elif share_a > share_b:
+        score_a, score_b = -BAIL_SINK_PENALTY_HIGH, -BAIL_SINK_PENALTY_LOW
+    elif share_b > share_a:
+        score_a, score_b = -BAIL_SINK_PENALTY_LOW, -BAIL_SINK_PENALTY_HIGH
     else:
-        score_a = score_b = -BAIL_SINK_PENALTY
+        score_a = score_b = -BAIL_SINK_PENALTY_EVEN
+
     pair.update(
         {
             "phase": "resolved",
             "outcome": "survived" if survived else "sunk",
             "result": {
                 "total_scoops": total,
+                "reward_a": share_a,
+                "reward_b": share_b,
                 "score_a": score_a,
                 "score_b": score_b,
             },
@@ -3364,17 +3393,17 @@ def resolve_bail_pair(pair: dict[str, Any]) -> None:
 def autocomplete_bail_pair(pair: dict[str, Any]) -> None:
     """마감 시점에 안 끝난 짝을 자동으로 확정한다.
 
-    미제출은 합의한 몫으로, 합의도 없으면 절반(BAIL_FALLBACK_SCOOPS)으로 채운다.
+    노동은 약속 대상이 아니라 기준으로 삼을 합의가 없다. 절반(BAIL_FALLBACK_SCOOPS)으로 채운다 —
     0으로 박으면 잠수 한 명이 상대까지 침몰시키고, 랜덤은 침몰 확률이 지나치게 높다.
+    협상 중이었다면 결렬로 처리되어 감액된 보상금을 균등 분배받는다.
     """
     if str(pair.get("phase")) == "resolved":
         return
 
     pair["offer"] = None
-    for key, user_key in (("scoop_a", "user_a_id"), ("scoop_b", "user_b_id")):
+    for key in ("scoop_a", "scoop_b"):
         if pair.get(key) is None:
-            agreed = bail_agreed_scoops(pair, str(pair[user_key]))
-            pair[key] = BAIL_FALLBACK_SCOOPS if agreed is None else agreed
+            pair[key] = BAIL_FALLBACK_SCOOPS
     pair["auto_completed"] = True
     resolve_bail_pair(pair)
 
@@ -3398,30 +3427,35 @@ def bail_pair_settlement_text(pair: dict[str, Any]) -> str:
     )
 
 
-def bail_promise_text(pair: dict[str, Any]) -> str:
-    """합의와 실제 제출을 나란히 보여준다. 약속을 어긴 사람이 드러나는 것이 게임 장치다."""
-    agreement = pair.get("agreement")
+def bail_split_text(pair: dict[str, Any]) -> str:
+    """보상 배분과 실제 퍼낸 횟수를 나란히 보여준다.
+
+    돈은 많이 받고 일은 덜 한 사람에게 ⚠️를 붙인다. 무임승차가 공개 기록으로 남는 것이
+    이벤트 전체에 걸친 평판 장치다.
+    """
+    split = pair.get("reward_split")
     scoop_a = pair.get("scoop_a")
     scoop_b = pair.get("scoop_b")
-    lines = []
-    if agreement:
-        lines.append(
-            f"합의: <@{pair['user_a_id']}> {int(agreement['user_a'])}번 · "
-            f"<@{pair['user_b_id']}> {int(agreement['user_b'])}번"
-        )
+    share_a = bail_reward_share(pair, "user_a")
+    share_b = bail_reward_share(pair, "user_b")
+
+    if split:
+        lines = [
+            f"보상 배분: <@{pair['user_a_id']}> {share_a}점 · <@{pair['user_b_id']}> {share_b}점"
+        ]
     else:
-        lines.append("합의: **없음** (협상 결렬)")
+        lines = [f"보상 배분: **결렬** → 각자 {share_a}점"]
+
     if scoop_a is not None and scoop_b is not None:
         marks = []
-        for side, scoop, user_key in (
-            ("user_a", int(scoop_a), "user_a_id"),
-            ("user_b", int(scoop_b), "user_b_id"),
+        for user_key, share, other_share, scoop, other_scoop in (
+            ("user_a_id", share_a, share_b, int(scoop_a), int(scoop_b)),
+            ("user_b_id", share_b, share_a, int(scoop_b), int(scoop_a)),
         ):
-            mark = ""
-            if agreement:
-                mark = " ✅" if scoop >= int(agreement[side]) else " ⚠️"
+            # 보상은 더 받으면서 노동은 덜 한 쪽.
+            mark = " ⚠️" if share > other_share and scoop < other_scoop else ""
             marks.append(f"<@{pair[user_key]}> {scoop}번{mark}")
-        lines.append(f"실제: {' · '.join(marks)}")
+        lines.append(f"실제 퍼내기: {' · '.join(marks)}")
     return "\n".join(lines)
 
 
@@ -3584,10 +3618,10 @@ def start_bail_execution(round_id: int) -> dict[str, Any] | None:
 def bail_pair_intro(user_a_id: str, user_b_id: str) -> str:
     return (
         f"<@{user_a_id}>님과 <@{user_b_id}>님의 **1:1 구조 협상방**입니다.\n"
-        f"> **1** ─ 둘이 합쳐 {BAIL_REQUIRED_SCOOPS}번 퍼내야 배가 뜹니다. "
-        "먼저 누가 몇 번 퍼낼지 협상하세요.\n"
-        "> **2** ─ 협상이 끝나면 각자 **실제로 퍼낼 횟수**를 비공개로 제출합니다. "
-        "합의는 점수와 무관합니다."
+        f"> **1** ─ 구조 보상금 {BAIL_REWARD_POOL}점을 **어떻게 나눌지** 협상하세요. "
+        "수락하면 확정됩니다.\n"
+        f"> **2** ─ 배가 뜨려면 둘이 합쳐 {BAIL_REQUIRED_SCOOPS}번 퍼내야 하는데, "
+        "**누가 몇 번 퍼낼지는 약속하지 않습니다** — 각자 비공개로 제출합니다."
     )
 
 
@@ -3892,7 +3926,7 @@ def load_open_bail_pair(
 async def handle_bail_offer(
     interaction: discord.Interaction,
     round_id: int,
-    scoops: int,
+    reward: int,
 ) -> None:
     user_id = str(interaction.user.id)
     with db() as conn:
@@ -3917,7 +3951,7 @@ async def handle_bail_offer(
             await interaction.response.send_message("지금은 상대가 제안할 차례입니다.", ephemeral=True)
             return
 
-        private_message = apply_bail_offer(pair, user_id, scoops)
+        private_message = apply_bail_offer(pair, user_id, reward)
         log_activity(
             conn,
             "bail",
@@ -3927,8 +3961,8 @@ async def handle_bail_offer(
             actor_user_id=user_id,
             payload={
                 "game_key": "bail",
-                "proposer_scoops": scoops,
-                "responder_scoops": BAIL_REQUIRED_SCOOPS - scoops,
+                "proposer_reward": reward,
+                "responder_reward": BAIL_REWARD_POOL - reward,
                 "offer_count": int(pair.get("offer_count", 0)),
             },
         )
@@ -3942,8 +3976,8 @@ async def handle_bail_offer(
         interaction,
         round_id,
         public_message=(
-            f"<@{user_id}>님의 제안 — 본인 **{scoops}번** / 상대 "
-            f"**{BAIL_REQUIRED_SCOOPS - scoops}번**"
+            f"<@{user_id}>님의 제안 — 본인 **{reward}점** / 상대 "
+            f"**{BAIL_REWARD_POOL - reward}점**"
         ),
         private_message=private_message,
     )
@@ -3977,7 +4011,7 @@ async def handle_bail_response(
             return
 
         proposer_id = str(offer["proposer_id"])
-        proposer_scoops = int(offer["scoops"])
+        proposer_reward = int(offer["reward"])
         private_message = apply_bail_response(pair, user_id, accepted)
         log_activity(
             conn,
@@ -3989,8 +4023,8 @@ async def handle_bail_response(
             target_user_id=proposer_id,
             payload={
                 "game_key": "bail",
-                "proposer_scoops": proposer_scoops,
-                "responder_scoops": BAIL_REQUIRED_SCOOPS - proposer_scoops,
+                "proposer_reward": proposer_reward,
+                "responder_reward": BAIL_REWARD_POOL - proposer_reward,
                 "offer_count": int(pair.get("offer_count", 0)),
                 "negotiation_closed": str(pair.get("phase")) == "submitting",
             },
@@ -4002,14 +4036,16 @@ async def handle_bail_response(
 
     if accepted:
         public_message = (
-            f"🤝 합의 — <@{proposer_id}> **{proposer_scoops}번** / "
-            f"<@{user_id}> **{BAIL_REQUIRED_SCOOPS - proposer_scoops}번**\n"
-            "> 실제로 퍼낼 횟수는 실행 단계에서 각자 따로 제출합니다."
+            f"🤝 보상금 배분 확정 — <@{proposer_id}> **{proposer_reward}점** / "
+            f"<@{user_id}> **{BAIL_REWARD_POOL - proposer_reward}점**\n"
+            f"> 배가 뜨려면 둘이 합쳐 {BAIL_REQUIRED_SCOOPS}번 퍼내야 합니다. "
+            "누가 몇 번 퍼낼지는 각자 비공개로 제출합니다."
         )
     elif str(pair.get("phase")) == "submitting":
         public_message = (
-            f"❌ <@{user_id}>님이 거절했습니다. 제안 횟수를 모두 소진해 **합의 없이** "
-            "실행 단계로 넘어갑니다."
+            f"❌ <@{user_id}>님이 거절했습니다. 제안 횟수를 모두 소진해 협상이 **결렬**되었습니다 — "
+            f"보상금이 {BAIL_FAILED_REWARD_POOL}점으로 줄어 각자 "
+            f"{BAIL_FAILED_REWARD_POOL // 2}점입니다."
         )
     else:
         public_message = f"❌ <@{user_id}>님이 거절했습니다. 이제 <@{user_id}>님의 제안 차례입니다."
@@ -4051,7 +4087,6 @@ async def handle_bail_scoop(
             )
             return
         pair[key] = scoops
-        agreed = bail_agreed_scoops(pair, user_id)
         both_submitted = pair.get("scoop_a") is not None and pair.get("scoop_b") is not None
         if both_submitted:
             resolve_bail_pair(pair)
@@ -4065,8 +4100,8 @@ async def handle_bail_scoop(
             payload={
                 "game_key": "bail",
                 "scoops": scoops,
-                "agreed_scoops": agreed,
-                "kept_promise": None if agreed is None else scoops >= agreed,
+                "reward_share": bail_reward_share(pair, bail_side_key(pair, user_id)),
+                "negotiation_failed": not pair.get("reward_split"),
             },
         )
         conn.execute(
@@ -5674,9 +5709,14 @@ class EventBot(discord.Client):
             await handle_sand_action(interaction, round_id, parts[3])
             return
 
+        # 협상은 보상금(0~8)을, 실행은 퍼낼 횟수(0~6)를 고르므로 허용 범위가 다르다.
         if action in {"bailoffer", "bailscoop"}:
-            if len(parts) != 4 or parts[3] not in BAIL_SCOOP_CHOICES:
-                await interaction.response.send_message("잘못된 퍼내기 횟수입니다.", ephemeral=True)
+            choices = BAIL_REWARD_CHOICES if action == "bailoffer" else BAIL_SCOOP_CHOICES
+            if len(parts) != 4 or parts[3] not in choices:
+                await interaction.response.send_message(
+                    "잘못된 보상금 제안입니다." if action == "bailoffer" else "잘못된 퍼내기 횟수입니다.",
+                    ephemeral=True,
+                )
                 return
             try:
                 round_id = int(parts[2])
@@ -6556,19 +6596,18 @@ def bail_pair_status_text(pair: dict[str, Any], extra: dict[str, Any]) -> str:
         offer = pair.get("offer")
         remaining = BAIL_NEGOTIATION_MAX_OFFERS - int(pair.get("offer_count", 0))
         if offer:
-            responder_scoops = BAIL_REQUIRED_SCOOPS - int(offer["scoops"])
+            responder_reward = BAIL_REWARD_POOL - int(offer["reward"])
             return (
-                f"<@{offer['proposer_id']}>님의 제안 대기 중 — "
-                f"제안자 {int(offer['scoops'])}번 / 상대 {responder_scoops}번\n"
+                f"<@{offer['proposer_id']}>님의 배분 제안 대기 중 — "
+                f"제안자 {int(offer['reward'])}점 / 상대 {responder_reward}점\n"
                 f"　└ 상대가 수락/거절을 고릅니다 (남은 제안 {remaining}회)"
             )
         return f"<@{pair['proposer_id']}> 제안 차례 (남은 제안 {remaining}회)"
 
     # submitting
     if str(extra.get("bail_phase")) != "execution":
-        agreement = pair.get("agreement")
-        if agreement:
-            return "협상 완료 · 다른 방의 협상을 기다립니다"
+        if pair.get("reward_split"):
+            return "배분 확정 · 다른 방의 협상을 기다립니다"
         return "협상 결렬 · 다른 방의 협상을 기다립니다"
     submitted = int(pair.get("scoop_a") is not None) + int(pair.get("scoop_b") is not None)
     return f"퍼낼 횟수 제출 중 : {submitted}/2"
@@ -6585,25 +6624,33 @@ def build_bail_pair_embed(title: str, pair: dict[str, Any], extra: dict[str, Any
 
     round_phase = str(extra.get("bail_phase") or "")
     pair_phase = str(pair.get("phase") or "")
-    agreement = pair.get("agreement")
-    if agreement:
+    if pair.get("reward_split"):
         embed.add_field(
-            name="🤝 합의 (점수와 무관)",
+            name="🤝 확정된 보상금 배분",
             value=(
-                f"<@{pair['user_a_id']}> {int(agreement['user_a'])}번 · "
-                f"<@{pair['user_b_id']}> {int(agreement['user_b'])}번"
+                f"<@{pair['user_a_id']}> {bail_reward_share(pair, 'user_a')}점 · "
+                f"<@{pair['user_b_id']}> {bail_reward_share(pair, 'user_b')}점"
             ),
             inline=False,
         )
-    elif pair_phase == "submitting":
-        embed.add_field(name="🤝 합의", value="**없음** (협상 결렬)", inline=False)
+    elif pair_phase != "negotiating":
+        embed.add_field(
+            name="🤝 보상금 배분",
+            value=(
+                f"**협상 결렬** → 감액된 {BAIL_FAILED_REWARD_POOL}점을 나눠 각자 "
+                f"{BAIL_FAILED_REWARD_POOL // 2}점"
+            ),
+            inline=False,
+        )
 
     if round_phase == "negotiation" and pair_phase == "negotiating":
         embed.add_field(
             name="🗣️ 협상",
             value=(
-                f"버튼의 숫자는 **내가 퍼낼 횟수**입니다. 상대는 {BAIL_REQUIRED_SCOOPS}에서 그만큼 뺀 횟수를 맡습니다.\n"
-                "> 대화는 자유롭게 하세요. 합의는 기록만 되고 **점수에는 영향이 없습니다.**"
+                f"버튼의 숫자는 **내가 가져갈 보상금**입니다. 상대는 {BAIL_REWARD_POOL}에서 "
+                "그만큼 뺀 몫을 받습니다.\n"
+                "> 수락하면 배분이 **확정**됩니다. 다만 **누가 몇 번 퍼낼지는 여기서 정하지 않습니다** — "
+                "말로 약속해도 구속력이 없습니다."
             ),
             inline=False,
         )
@@ -6612,7 +6659,8 @@ def build_bail_pair_embed(title: str, pair: dict[str, Any], extra: dict[str, Any
             name="🪣 실행",
             value=(
                 "실제로 퍼낼 횟수를 고르세요. **번복 불가**이며 상대에게 공개되지 않습니다.\n"
-                f"> 두 사람 합이 {BAIL_REQUIRED_SCOOPS}번 이상이면 배가 뜹니다."
+                f"> 두 사람 합이 {BAIL_REQUIRED_SCOOPS}번 이상이면 배가 뜨고, "
+                "내 점수는 **보상 몫 − 내가 퍼낸 횟수**입니다."
             ),
             inline=False,
         )
@@ -6629,8 +6677,8 @@ def build_bail_pair_embed(title: str, pair: dict[str, Any], extra: dict[str, Any
             name="⏳ 제한 시간",
             value=(
                 f"{label}: **{close_time_text(close_at)}**\n"
-                "> 시간 안에 제출하지 않으면 합의한 몫(합의가 없으면 "
-                f"{BAIL_FALLBACK_SCOOPS}번)으로 자동 제출됩니다."
+                f"> 협상을 못 끝내면 결렬, 퍼내기를 제출하지 않으면 {BAIL_FALLBACK_SCOOPS}번으로 "
+                "자동 제출됩니다."
             ),
             inline=False,
         )
@@ -6646,8 +6694,8 @@ def build_bail_pair_result_embed(title: str, pair: dict[str, Any]) -> discord.Em
     result = pair.get("result") or {}
     total = result.get("total_scoops")
     embed.add_field(
-        name="🪣 합의와 실제",
-        value=bail_promise_text(pair),
+        name="🪣 보상 배분과 실제 노동",
+        value=bail_split_text(pair),
         inline=False,
     )
     embed.add_field(
@@ -6745,16 +6793,17 @@ def bail_pair_view(
 
     if round_phase == "negotiation" and pair_phase == "negotiating":
         awaiting_response = bool(pair.get("offer"))
-        for index, value in enumerate(BAIL_SCOOP_CHOICES):
+        for index, value in enumerate(BAIL_REWARD_CHOICES):
             view.add_item(
                 discord.ui.Button(
-                    label=f"내가 {value}번",
+                    label=f"내가 {value}점",
                     style=discord.ButtonStyle.secondary,
                     custom_id=f"eventbot:bailoffer:{round_id}:{value}",
                     disabled=awaiting_response,
-                    row=index // 4,
+                    row=index // 5,
                 )
             )
+        response_row = (len(BAIL_REWARD_CHOICES) + 4) // 5
         view.add_item(
             discord.ui.Button(
                 label="수락",
@@ -6762,7 +6811,7 @@ def bail_pair_view(
                 style=discord.ButtonStyle.success,
                 custom_id=f"eventbot:bailrespond:{round_id}:accept",
                 disabled=not awaiting_response,
-                row=2,
+                row=response_row,
             )
         )
         view.add_item(
@@ -6772,7 +6821,7 @@ def bail_pair_view(
                 style=discord.ButtonStyle.danger,
                 custom_id=f"eventbot:bailrespond:{round_id}:reject",
                 disabled=not awaiting_response,
-                row=2,
+                row=response_row,
             )
         )
         return view
@@ -7585,7 +7634,7 @@ def close_round_record(
                 inline=False,
             )
         elif round_game_key(round_row) == "bail":
-            # 정산은 실행 단계의 제출값만 본다. 합의는 결과 공개용 기록일 뿐이다.
+            # 생존은 제출된 퍼내기 합만으로 결정되고, 보상은 협상에서 확정된 배분을 따른다.
             bail_lines: list[str] = []
             bail_auto_count = 0
             for pair in extra.get("bail_pairs", []):
@@ -7599,20 +7648,25 @@ def close_round_record(
                 pair_result = pair.get("result") or {}
                 outcome = str(pair.get("outcome") or "")
                 survived = outcome == "survived"
-                reason_label = "생존" if survived else "침몰"
-                for user_id, score_key, scoop_key in (
-                    (user_a_id, "score_a", "scoop_a"),
-                    (user_b_id, "score_b", "scoop_b"),
+                for user_id, score_key, scoop_key, reward_key in (
+                    (user_a_id, "score_a", "scoop_a", "reward_a"),
+                    (user_b_id, "score_b", "scoop_b", "reward_b"),
                 ):
+                    reason = (
+                        f"라운드 #{round_row['id']} 가라앉는 배 생존"
+                        f"(보상 {int(pair_result[reward_key])}점 − {int(pair[scoop_key])}번 퍼내기)"
+                        if survived
+                        else (
+                            f"라운드 #{round_row['id']} 가라앉는 배 침몰"
+                            f"(보상 몫 {int(pair_result[reward_key])}점)"
+                        )
+                    )
                     add_score(
                         conn,
                         user_id,
                         member_name(guild, user_id),
                         int(pair_result[score_key]),
-                        (
-                            f"라운드 #{round_row['id']} 가라앉는 배 {reason_label}"
-                            f"({int(pair[scoop_key])}번 퍼내기)"
-                        ),
+                        reason,
                         round_row["id"],
                     )
                 auto_mark = " · 자동 제출" if pair.get("auto_completed") else ""
@@ -7621,7 +7675,7 @@ def close_round_record(
                     f"　└ **{BAIL_OUTCOME_LABELS.get(outcome, '미완료')}** "
                     f"(합계 {int(pair_result['total_scoops'])}/{BAIL_REQUIRED_SCOOPS}번) · "
                     f"{bail_pair_settlement_text(pair)}{auto_mark}\n"
-                    f"　└ {bail_promise_text(pair)}"
+                    f"　└ {bail_split_text(pair)}"
                 )
 
             extra.update({"bail_phase": "scored", "bail_scored_at": now_text()})
@@ -7647,9 +7701,10 @@ def close_round_record(
             embed.add_field(
                 name="💰 정산",
                 value=(
-                    f"퍼내기 1회당 -{BAIL_SCOOP_COST}점 · 합이 {BAIL_REQUIRED_SCOOPS}번 이상이면 각자 "
-                    f"+{BAIL_SURVIVE_REWARD}점 · 못 미치면 양쪽 -{BAIL_SINK_PENALTY}점입니다.\n"
-                    "> ✅ 합의를 지킨 사람 / ⚠️ 합의보다 적게 퍼낸 사람"
+                    f"생존하면 **보상 몫 − 퍼낸 횟수**(1회당 -{BAIL_SCOOP_COST}점)입니다.\n"
+                    f"침몰하면 보상금을 못 받고 몫이 많은 쪽 -{BAIL_SINK_PENALTY_HIGH}점 / "
+                    f"적은 쪽 -{BAIL_SINK_PENALTY_LOW}점 (같으면 각 -{BAIL_SINK_PENALTY_EVEN}점).\n"
+                    "> ⚠️ 보상은 더 받고 노동은 덜 한 사람"
                 ),
                 inline=False,
             )

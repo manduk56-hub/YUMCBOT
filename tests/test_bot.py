@@ -1834,12 +1834,16 @@ class BotRegressionTests(unittest.TestCase):
         return pair
 
     @staticmethod
-    def bail_submitted_pair(scoop_a: int, scoop_b: int, agreement: dict | None = None) -> dict:
+    def bail_submitted_pair(
+        scoop_a: int,
+        scoop_b: int,
+        reward_split: dict | None = None,
+    ) -> dict:
         pair = bot.bail_new_pair("1", "2")
         pair.update(
             {
                 "phase": "submitting",
-                "agreement": agreement,
+                "reward_split": reward_split,
                 "scoop_a": scoop_a,
                 "scoop_b": scoop_b,
             }
@@ -1847,104 +1851,146 @@ class BotRegressionTests(unittest.TestCase):
         bot.resolve_bail_pair(pair)
         return pair
 
-    def test_bail_accepted_offer_records_agreement(self) -> None:
+    @staticmethod
+    def bail_even_split() -> dict:
+        half = bot.BAIL_REWARD_POOL // 2
+        return {"user_a": half, "user_b": bot.BAIL_REWARD_POOL - half}
+
+    def test_bail_accepted_offer_confirms_reward_split(self) -> None:
         pair = self.bail_pair()
 
-        bot.apply_bail_offer(pair, "1", 2)
-        self.assertEqual(pair["offer"], {"proposer_id": "1", "scoops": 2})
+        bot.apply_bail_offer(pair, "1", 6)
+        self.assertEqual(pair["offer"], {"proposer_id": "1", "reward": 6})
         self.assertEqual(pair["offer_count"], 1)
 
         bot.apply_bail_response(pair, "2", True)
 
-        # 제안자가 2번이면 상대는 나머지를 맡는다.
-        self.assertEqual(pair["agreement"], {"user_a": 2, "user_b": bot.BAIL_REQUIRED_SCOOPS - 2})
+        # 제안자가 6점이면 상대는 나머지를 받는다.
+        self.assertEqual(pair["reward_split"], {"user_a": 6, "user_b": bot.BAIL_REWARD_POOL - 6})
         self.assertEqual(pair["phase"], "submitting")
         self.assertIsNone(pair["offer"])
 
     def test_bail_rejection_hands_proposal_turn_to_responder(self) -> None:
         pair = self.bail_pair()
 
-        bot.apply_bail_offer(pair, "1", 1)
+        bot.apply_bail_offer(pair, "1", 7)
         bot.apply_bail_response(pair, "2", False)
 
         self.assertEqual(pair["phase"], "negotiating")
         self.assertEqual(pair["proposer_id"], "2")
         self.assertIsNone(pair["offer"])
-        self.assertIsNone(pair["agreement"])
+        self.assertIsNone(pair["reward_split"])
 
-    def test_bail_exhausted_offers_end_negotiation_without_agreement(self) -> None:
-        """제안 횟수를 모두 소진하면 합의 없이 실행 단계로 넘어간다."""
+    def test_bail_exhausted_offers_end_negotiation_in_failure(self) -> None:
+        """제안 횟수를 모두 소진하면 결렬 — 감액된 보상금을 균등 분배한다."""
         pair = self.bail_pair()
 
         proposer, responder = "1", "2"
         for _ in range(bot.BAIL_NEGOTIATION_MAX_OFFERS):
-            bot.apply_bail_offer(pair, proposer, 0)
+            bot.apply_bail_offer(pair, proposer, bot.BAIL_REWARD_POOL)
             bot.apply_bail_response(pair, responder, False)
             proposer, responder = responder, proposer
 
         self.assertEqual(pair["offer_count"], bot.BAIL_NEGOTIATION_MAX_OFFERS)
         self.assertEqual(pair["phase"], "submitting")
-        self.assertIsNone(pair["agreement"])
+        self.assertIsNone(pair["reward_split"])
+        self.assertEqual(
+            bot.bail_reward_share(pair, "user_a"), bot.BAIL_FAILED_REWARD_POOL // 2
+        )
 
     def test_bail_survives_when_submissions_reach_requirement(self) -> None:
-        pair = self.bail_submitted_pair(3, 3)
+        pair = self.bail_submitted_pair(3, 3, reward_split=self.bail_even_split())
 
         self.assertEqual(pair["outcome"], "survived")
         self.assertEqual(pair["result"]["total_scoops"], bot.BAIL_REQUIRED_SCOOPS)
-        # 협력은 낮은 이득: 보상에서 퍼낸 만큼을 뺀다.
-        self.assertEqual(pair["result"]["score_a"], bot.BAIL_SURVIVE_REWARD - 3)
-        self.assertEqual(pair["result"]["score_b"], bot.BAIL_SURVIVE_REWARD - 3)
+        # 공평하게 나누고 공평하게 일하면 낮은 이득: 보상 몫에서 퍼낸 만큼을 뺀다.
+        half = bot.BAIL_REWARD_POOL // 2
+        self.assertEqual(pair["result"]["score_a"], half - 3)
+        self.assertEqual(pair["result"]["score_b"], half - 3)
 
-    def test_bail_sinks_when_submissions_fall_short(self) -> None:
-        pair = self.bail_submitted_pair(3, 2)
+    def test_bail_sink_penalty_scales_with_reward_share(self) -> None:
+        """많이 받기로 한 쪽이 침몰에서 더 크게 잃는다 — 이게 배신 스위치다."""
+        greedy = self.bail_submitted_pair(3, 2, reward_split={"user_a": 6, "user_b": 2})
 
-        self.assertEqual(pair["outcome"], "sunk")
-        self.assertEqual(pair["result"]["score_a"], -bot.BAIL_SINK_PENALTY)
-        self.assertEqual(pair["result"]["score_b"], -bot.BAIL_SINK_PENALTY)
+        self.assertEqual(greedy["outcome"], "sunk")
+        self.assertEqual(greedy["result"]["score_a"], -bot.BAIL_SINK_PENALTY_HIGH)
+        self.assertEqual(greedy["result"]["score_b"], -bot.BAIL_SINK_PENALTY_LOW)
 
-    def test_bail_free_rider_takes_full_reward(self) -> None:
-        """한 명이 전부 떠안으면 무임승차한 쪽이 최고점, 떠안은 쪽은 마이너스다."""
-        pair = self.bail_submitted_pair(0, bot.BAIL_REQUIRED_SCOOPS)
+        even = self.bail_submitted_pair(3, 2, reward_split=self.bail_even_split())
+        self.assertEqual(even["result"]["score_a"], -bot.BAIL_SINK_PENALTY_EVEN)
+        self.assertEqual(even["result"]["score_b"], -bot.BAIL_SINK_PENALTY_EVEN)
+
+    def test_bail_underpaid_side_gains_by_shirking(self) -> None:
+        """보상을 적게 받은 쪽은 노동을 깎는 편이 낫다. 상대는 침몰이 더 아파서 떠안게 된다."""
+        split = {"user_a": 6, "user_b": 2}
+        # B가 합의대로 절반씩 일하면
+        fair = self.bail_submitted_pair(3, 3, reward_split=split)
+        # B가 깎고 A가 그만큼 더 떠안으면
+        shirked = self.bail_submitted_pair(4, 2, reward_split=split)
+
+        self.assertGreater(shirked["result"]["score_b"], fair["result"]["score_b"])
+        # A는 침몰(-4)보다 4번 떠안는 쪽이 낫다.
+        self.assertGreater(shirked["result"]["score_a"], -bot.BAIL_SINK_PENALTY_HIGH)
+
+    def test_bail_free_rider_takes_full_share(self) -> None:
+        """한 명이 전부 떠안으면 무임승차한 쪽이 몫을 그대로 챙긴다."""
+        split = self.bail_even_split()
+        pair = self.bail_submitted_pair(0, bot.BAIL_REQUIRED_SCOOPS, reward_split=split)
 
         self.assertEqual(pair["outcome"], "survived")
-        self.assertEqual(pair["result"]["score_a"], bot.BAIL_SURVIVE_REWARD)
+        self.assertEqual(pair["result"]["score_a"], split["user_a"])
         self.assertEqual(
             pair["result"]["score_b"],
-            bot.BAIL_SURVIVE_REWARD - bot.BAIL_REQUIRED_SCOOPS,
+            split["user_b"] - bot.BAIL_REQUIRED_SCOOPS,
         )
-        # 침몰(-3)보다는 나아야 떠안는 선택이 성립한다.
-        self.assertGreater(pair["result"]["score_b"], -bot.BAIL_SINK_PENALTY)
+        # 떠안는 선택이 침몰보다 나아야 성립한다.
+        self.assertGreater(pair["result"]["score_b"], -bot.BAIL_SINK_PENALTY_EVEN)
 
-    def test_bail_agreement_never_changes_score(self) -> None:
-        """합의는 기록만 된다. 같은 제출값이면 합의 내용이 무엇이든 점수가 같다."""
-        kept = self.bail_submitted_pair(2, 4, agreement={"user_a": 2, "user_b": 4})
-        broken = self.bail_submitted_pair(2, 4, agreement={"user_a": 4, "user_b": 2})
+    def test_bail_failed_negotiation_is_worse_than_agreeing(self) -> None:
+        """결렬은 확실히 손해다. 그래서 '합의 안 해준다'가 자기 살을 깎는 위협이 된다."""
+        agreed = self.bail_submitted_pair(3, 3, reward_split=self.bail_even_split())
+        failed = self.bail_submitted_pair(3, 3)
 
-        self.assertEqual(kept["result"], broken["result"])
+        self.assertLess(failed["result"]["score_a"], agreed["result"]["score_a"])
+        self.assertEqual(
+            failed["result"]["score_a"], bot.BAIL_FAILED_REWARD_POOL // 2 - 3
+        )
 
-    def test_bail_autocomplete_uses_agreed_share(self) -> None:
+    def test_bail_labor_is_never_bound_by_negotiation(self) -> None:
+        """노동은 협상 대상이 아니다. 같은 배분이라도 제출값에 따라 점수가 달라진다."""
+        split = self.bail_even_split()
+        worked = self.bail_submitted_pair(4, 2, reward_split=split)
+        shirked = self.bail_submitted_pair(2, 4, reward_split=split)
+
+        self.assertNotEqual(worked["result"]["score_a"], shirked["result"]["score_a"])
+        # 두 경우 모두 배는 뜬다 — 합계가 같기 때문이다.
+        self.assertEqual(worked["outcome"], shirked["outcome"])
+
+    def test_bail_autocomplete_fills_missing_submissions(self) -> None:
         pair = self.bail_pair(
             phase="submitting",
-            agreement={"user_a": 4, "user_b": 2},
+            reward_split=self.bail_even_split(),
             scoop_a=None,
             scoop_b=1,
         )
 
         bot.autocomplete_bail_pair(pair)
 
-        # 미제출자는 합의한 몫으로, 이미 낸 사람은 낸 값 그대로.
-        self.assertEqual(pair["scoop_a"], 4)
+        # 미제출자만 절반으로 채우고, 이미 낸 사람은 낸 값 그대로.
+        self.assertEqual(pair["scoop_a"], bot.BAIL_FALLBACK_SCOOPS)
         self.assertEqual(pair["scoop_b"], 1)
         self.assertEqual(pair["phase"], "resolved")
         self.assertTrue(pair["auto_completed"])
 
-    def test_bail_autocomplete_without_agreement_splits_evenly(self) -> None:
-        pair = self.bail_pair(phase="negotiating", offer={"proposer_id": "1", "scoops": 0})
+    def test_bail_autocomplete_during_negotiation_counts_as_failure(self) -> None:
+        pair = self.bail_pair(phase="negotiating", offer={"proposer_id": "1", "reward": 8})
 
         bot.autocomplete_bail_pair(pair)
 
         self.assertEqual(pair["scoop_a"], bot.BAIL_FALLBACK_SCOOPS)
         self.assertEqual(pair["scoop_b"], bot.BAIL_FALLBACK_SCOOPS)
+        self.assertIsNone(pair["reward_split"])
+        self.assertEqual(pair["result"]["reward_a"], bot.BAIL_FAILED_REWARD_POOL // 2)
         self.assertIsNone(pair["offer"])
         # 절반씩이면 배가 뜬다 — 잠수 한 명이 상대까지 침몰시키지 않는다.
         self.assertEqual(pair["outcome"], "survived")
@@ -1986,11 +2032,11 @@ class BotRegressionTests(unittest.TestCase):
         self.assertEqual(extra["bail_pairs"][0]["phase"], "negotiating")
 
     def test_bail_execution_transition_drops_pending_offers(self) -> None:
-        """협상 시간이 끝나면 대기 중인 제안은 합의 없이 사라진다."""
-        pending = self.bail_pair(offer={"proposer_id": "1", "scoops": 0}, offer_count=1)
-        agreed = self.bail_pair(phase="submitting", agreement={"user_a": 3, "user_b": 3})
+        """협상 시간이 끝나면 대기 중인 제안은 결렬로 사라진다."""
+        pending = self.bail_pair(offer={"proposer_id": "1", "reward": 8}, offer_count=1)
+        settled = self.bail_pair(phase="submitting", reward_split={"user_a": 6, "user_b": 2})
         round_id = self.insert_bail_round(
-            {"bail_phase": "negotiation", "bail_pairs": [pending, agreed]}
+            {"bail_phase": "negotiation", "bail_pairs": [pending, settled]}
         )
 
         transition = bot.start_bail_execution(round_id)
@@ -2005,9 +2051,9 @@ class BotRegressionTests(unittest.TestCase):
         self.assertEqual(extra["bail_phase"], "execution")
         self.assertEqual(extra["bail_pairs"][0]["phase"], "submitting")
         self.assertIsNone(extra["bail_pairs"][0]["offer"])
-        self.assertIsNone(extra["bail_pairs"][0]["agreement"])
-        # 이미 합의한 짝은 그대로 유지된다.
-        self.assertEqual(extra["bail_pairs"][1]["agreement"], {"user_a": 3, "user_b": 3})
+        self.assertIsNone(extra["bail_pairs"][0]["reward_split"])
+        # 이미 배분을 확정한 짝은 그대로 유지된다.
+        self.assertEqual(extra["bail_pairs"][1]["reward_split"], {"user_a": 6, "user_b": 2})
 
     def test_bail_execution_transition_requires_negotiation_phase(self) -> None:
         round_id = self.insert_bail_round({"bail_phase": "execution", "bail_pairs": []})
@@ -2017,13 +2063,18 @@ class BotRegressionTests(unittest.TestCase):
     def test_bail_close_autocompletes_and_scores_pairs(self) -> None:
         for user_id in ("1", "2", "3", "4", "5", "6"):
             self.add_user(user_id, f"참가자{user_id}", 0)
-        survived = self.bail_submitted_pair(2, 4)
-        sunk = {**self.bail_submitted_pair(3, 2), "user_a_id": "3", "user_b_id": "4"}
+        split = {"user_a": 6, "user_b": 2}
+        survived = self.bail_submitted_pair(2, 4, reward_split=split)
+        sunk = {
+            **self.bail_submitted_pair(3, 2, reward_split=split),
+            "user_a_id": "3",
+            "user_b_id": "4",
+        }
         unfinished = self.bail_pair(
             user_a_id="5",
             user_b_id="6",
             phase="submitting",
-            agreement={"user_a": 3, "user_b": 3},
+            reward_split=self.bail_even_split(),
             scoop_a=3,
         )
         round_id = self.insert_bail_round(
@@ -2032,16 +2083,19 @@ class BotRegressionTests(unittest.TestCase):
 
         result = bot.close_round_record(round_id, None)
 
+        half = bot.BAIL_REWARD_POOL // 2
         self.assertEqual(
             {user_id: self.score_of(user_id) for user_id in ("1", "2", "3", "4", "5", "6")},
             {
-                "1": bot.BAIL_SURVIVE_REWARD - 2,
-                "2": bot.BAIL_SURVIVE_REWARD - 4,
-                "3": -bot.BAIL_SINK_PENALTY,
-                "4": -bot.BAIL_SINK_PENALTY,
-                # 미제출자는 합의한 3번으로 자동 제출되어 배가 뜬다.
-                "5": bot.BAIL_SURVIVE_REWARD - 3,
-                "6": bot.BAIL_SURVIVE_REWARD - 3,
+                # 6점 받고 2번, 2점 받고 4번 → 배는 떴다.
+                "1": 6 - 2,
+                "2": 2 - 4,
+                # 침몰: 많이 받기로 한 3번이 더 크게 잃는다.
+                "3": -bot.BAIL_SINK_PENALTY_HIGH,
+                "4": -bot.BAIL_SINK_PENALTY_LOW,
+                # 미제출자는 절반(3번)으로 자동 제출되어 배가 뜬다.
+                "5": half - 3,
+                "6": half - 3,
             },
         )
         with bot.db() as conn:
@@ -2056,22 +2110,23 @@ class BotRegressionTests(unittest.TestCase):
         self.assertIn("자동 제출", rendered)
         self.assertIn("침몰", rendered)
 
-    def test_bail_result_shows_agreement_next_to_actual(self) -> None:
-        """약속을 어긴 사람이 결과에 드러나야 한다 — 이게 평판 장치다."""
-        pair = self.bail_submitted_pair(4, 2, agreement={"user_a": 3, "user_b": 3})
+    def test_bail_result_flags_the_free_rider(self) -> None:
+        """돈은 더 받고 일은 덜 한 사람이 결과에 드러나야 한다 — 이게 평판 장치다."""
+        pair = self.bail_submitted_pair(2, 4, reward_split={"user_a": 6, "user_b": 2})
 
-        rendered = bot.bail_promise_text(pair)
+        rendered = bot.bail_split_text(pair)
 
-        self.assertIn("4번 ✅", rendered)  # 합의(3) 이상을 냈다
-        self.assertIn("2번 ⚠️", rendered)  # 합의보다 적게 냈다
+        self.assertIn("2번 ⚠️", rendered)  # 6점 받고 2번만 퍼냈다
+        self.assertIn("4번", rendered)
+        self.assertNotIn("4번 ⚠️", rendered)
 
-    def test_bail_promise_text_marks_failed_negotiation(self) -> None:
+    def test_bail_split_text_marks_failed_negotiation(self) -> None:
         pair = self.bail_submitted_pair(3, 3)
 
-        rendered = bot.bail_promise_text(pair)
+        rendered = bot.bail_split_text(pair)
 
-        self.assertIn("협상 결렬", rendered)
-        self.assertNotIn("✅", rendered)
+        self.assertIn("결렬", rendered)
+        self.assertNotIn("⚠️", rendered)
 
     def test_bail_emergency_join_starts_a_new_negotiation(self) -> None:
         extra = {"bail_phase": "negotiation", "unmatched_user_id": "3", "auto_close_at": 100.0}
@@ -2096,12 +2151,12 @@ class BotRegressionTests(unittest.TestCase):
         bot.apply_emergency_join(extra, "bail", "4")
 
         self.assertEqual(extra["bail_pairs"][0]["phase"], "submitting")
-        self.assertIsNone(extra["bail_pairs"][0]["agreement"])
+        self.assertIsNone(extra["bail_pairs"][0]["reward_split"])
         self.assertEqual(extra["execution_close_at"], extra["auto_close_at"])
 
     def test_bail_rules_text_is_generated_from_constants(self) -> None:
-        with patch.object(bot, "BAIL_SURVIVE_REWARD", 9):
-            self.assertIn("+9점", bot.build_bail_registration_embed(1, "배", 2).fields[1].value)
+        with patch.object(bot, "BAIL_SINK_PENALTY_HIGH", 9):
+            self.assertIn("-9점", bot.build_bail_registration_embed(1, "배", 2).fields[1].value)
 
     def test_bail_pair_view_fits_discord_button_limits(self) -> None:
         """버튼은 한 줄에 5개가 상한이다. 넘기면 View 생성 자체가 터진다."""
@@ -2109,7 +2164,7 @@ class BotRegressionTests(unittest.TestCase):
             ({"bail_phase": "negotiation"}, self.bail_pair()),
             (
                 {"bail_phase": "negotiation"},
-                self.bail_pair(offer={"proposer_id": "1", "scoops": 3}, offer_count=1),
+                self.bail_pair(offer={"proposer_id": "1", "reward": 5}, offer_count=1),
             ),
             ({"bail_phase": "execution"}, self.bail_pair(phase="submitting")),
         ]
@@ -2128,7 +2183,7 @@ class BotRegressionTests(unittest.TestCase):
     def test_bail_pair_view_locks_proposals_while_offer_pending(self) -> None:
         extra = {"bail_phase": "negotiation"}
         pending = bot.bail_pair_view(
-            1, self.bail_pair(offer={"proposer_id": "1", "scoops": 3}), extra
+            1, self.bail_pair(offer={"proposer_id": "1", "reward": 5}), extra
         )
 
         disabled = {
@@ -2147,7 +2202,7 @@ class BotRegressionTests(unittest.TestCase):
         for phase, pair in (
             ("negotiation", self.bail_pair()),
             ("execution", self.bail_pair(phase="submitting", scoop_a=2)),
-            ("scored", self.bail_submitted_pair(2, 4, agreement={"user_a": 3, "user_b": 3})),
+            ("scored", self.bail_submitted_pair(2, 4, reward_split={"user_a": 6, "user_b": 2})),
         ):
             extra = {
                 "bail_phase": phase,
@@ -2165,12 +2220,27 @@ class BotRegressionTests(unittest.TestCase):
                 for field in embed.fields:
                     self.assertLessEqual(len(field.value), 1024, (phase, field.name))
 
-    def test_bail_scoop_choices_cover_every_share(self) -> None:
-        # 0번부터 전부 떠안는 경우까지 고를 수 있어야 협상 폭이 나온다.
+    def test_bail_choices_cover_full_range(self) -> None:
+        # 협상은 보상금 전부를, 실행은 노동 전부를 요구할 수 있어야 폭이 나온다.
+        self.assertEqual(
+            bot.BAIL_REWARD_CHOICES,
+            [str(index) for index in range(bot.BAIL_REWARD_POOL + 1)],
+        )
         self.assertEqual(
             bot.BAIL_SCOOP_CHOICES,
             [str(index) for index in range(bot.BAIL_REQUIRED_SCOOPS + 1)],
         )
+
+    def test_bail_greedy_split_cannot_beat_a_moderate_one(self) -> None:
+        """8:0으로 이겨도 6:2보다 나을 게 없다 — 상대가 노동할 이유를 없애면 자기도 못 챈다."""
+        # 상대(B)는 몫이 0이면 퍼낼수록 손해라 0번을 낸다. A가 전부 떠안아야 배가 뜬다.
+        greedy = self.bail_submitted_pair(
+            bot.BAIL_REQUIRED_SCOOPS, 0, reward_split={"user_a": 8, "user_b": 0}
+        )
+        moderate = self.bail_submitted_pair(4, 2, reward_split={"user_a": 6, "user_b": 2})
+
+        self.assertEqual(greedy["outcome"], "survived")
+        self.assertLessEqual(greedy["result"]["score_a"], moderate["result"]["score_a"])
 
     # --- 돌 세공 ------------------------------------------------------------
 
