@@ -82,6 +82,16 @@ CUTTING_SUCCESS_RATES = {
 }
 TOP3_NONE_CHOICE = "__none__"
 UNIQUE_NUMBER_CHOICES = [str(index) for index in range(1, 16)]
+BASEBALL_TOTAL_PITCHES = 3
+BASEBALL_SWING_SECONDS = 3.0
+BASEBALL_RESULT_SECONDS = 7.0
+BASEBALL_WINDUP_SECONDS = 3.0
+BASEBALL_MISSED_SWING_SECONDS = 7.0
+BASEBALL_BUTTON_GRID_SIZE = 3
+BASEBALL_BUTTON_SLOT_COUNT = BASEBALL_BUTTON_GRID_SIZE**2
+BASEBALL_RANK_POINTS = {1: 3, 2: 2, 3: 1}
+BASEBALL_IMAGE_FILENAME = "baseball-batter.png"
+BASEBALL_IMAGE_PATH = BASE_DIR / "assets" / BASEBALL_IMAGE_FILENAME
 TRUST_REGISTRATION_DEFAULT_MINUTES = 2
 TRUST_DECISION_SECONDS = 180
 MATCH_HISTORY_ROUNDS = 3  # 메인게임 1:1 매칭에서 이 라운드 수만큼 직전 짝을 회피 (trust·sand 공유)
@@ -96,7 +106,7 @@ TRUST_OUTCOME_LABELS = {
 # round_game_key()를 쓴다.
 MAIN_GAME_TYPES = {"trust", "sand", "bail"}
 # 'grid'(관리자 시점 타일)는 제거된 미니게임이다. 불변인 rounds.type CHECK 제약의 grid 값은
-# extra_json.mode='unique_number'인 새 유일 숫자 게임의 저장 타입으로만 재사용한다.
+# extra_json.mode로 구분되는 유일 숫자 게임과 야구의 저장 타입으로 재사용한다.
 MINI_GAME_TYPES = {
     "balance",
     "minority_balance",
@@ -104,6 +114,7 @@ MINI_GAME_TYPES = {
     "cutting",
     "top3",
     "unique_number",
+    "baseball",
 }
 GAME_NAMES = {
     "balance": "밸런스 게임",
@@ -114,6 +125,7 @@ GAME_NAMES = {
     "cutting": "돌 세공 예측",
     "top3": "상위 3명 견제",
     "unique_number": "홍피겔만의 황금금고",
+    "baseball": "야구",
     "trust": "딜레마의 섬",
     "sand": "모래성 게임",
     # DB type은 sand를 재사용하고 extra_json.mode='bail'로 갈라 쓴다.
@@ -497,6 +509,31 @@ MIGRATIONS: dict[int, list[str]] = {
         # '이 판으로 몇 연승이 됐는지'를 users 테이블만 봐서는 알 수 없다.
         "ALTER TABLE russian_roulette_games ADD COLUMN winner_stack_after INTEGER",
     ],
+    # 야구는 한 라운드에서 3번의 선택 이력을 모두 보존해야 하므로, (round_id, user_id)를
+    # 덮어쓰는 votes 대신 투구 번호까지 PK에 포함한 전용 append 형태 테이블을 사용한다.
+    7: [
+        """
+        CREATE TABLE IF NOT EXISTS baseball_swings (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            round_id INTEGER NOT NULL,
+            pitch_number INTEGER NOT NULL CHECK (pitch_number BETWEEN 1 AND 3),
+            user_id TEXT NOT NULL,
+            display_name TEXT NOT NULL,
+            swung_at REAL NOT NULL,
+            elapsed_seconds REAL NOT NULL,
+            rank INTEGER,
+            score INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL,
+            UNIQUE (round_id, pitch_number, user_id),
+            FOREIGN KEY (round_id) REFERENCES rounds(id) ON DELETE CASCADE,
+            FOREIGN KEY (user_id) REFERENCES users(user_id) ON DELETE CASCADE
+        )
+        """,
+        """
+        CREATE INDEX IF NOT EXISTS idx_baseball_pitch_order
+        ON baseball_swings(round_id, pitch_number, id)
+        """,
+    ],
 }
 
 SCHEMA_VERSION = max([BASELINE_VERSION, *MIGRATIONS])
@@ -842,6 +879,16 @@ def game_settings_snapshot(game_key: str) -> dict[str, Any]:
         settings["match_history_rounds"] = MATCH_HISTORY_ROUNDS
     elif game_key == "unique_number":
         settings["number_choices"] = UNIQUE_NUMBER_CHOICES
+    elif game_key == "baseball":
+        settings["total_pitches"] = BASEBALL_TOTAL_PITCHES
+        settings["swing_seconds"] = BASEBALL_SWING_SECONDS
+        settings["result_seconds"] = BASEBALL_RESULT_SECONDS
+        settings["windup_seconds"] = BASEBALL_WINDUP_SECONDS
+        settings["missed_swing_seconds"] = BASEBALL_MISSED_SWING_SECONDS
+        settings["button_grid_size"] = BASEBALL_BUTTON_GRID_SIZE
+        settings["button_slot_count"] = BASEBALL_BUTTON_SLOT_COUNT
+        settings["rank_points"] = BASEBALL_RANK_POINTS
+        settings["ranking_rule"] = "three_pitch_average"
     elif game_key == "defuse4":
         settings["colors"] = [color["id"] for color in DEFUSE_COLORS]
 
@@ -1959,6 +2006,23 @@ async def archive_round_discussion_thread(
         thread = bot.get_channel(int(thread_id)) or await bot.fetch_channel(int(thread_id))
         if isinstance(thread, discord.Thread):
             await thread.edit(archived=True, locked=True, reason=reason)
+    except (discord.HTTPException, ValueError):
+        pass
+
+
+async def delete_baseball_control_message(round_row: sqlite3.Row | dict[str, Any]) -> None:
+    if round_game_key(round_row) != "baseball":
+        return
+    control_message_id = str(round_extra(round_row).get("baseball_control_message_id") or "")
+    channel_id = str(round_row["channel_id"] or "")
+    if not control_message_id or not channel_id:
+        return
+    channel = await resolve_text_channel(channel_id)
+    if channel is None:
+        return
+    try:
+        message = await channel.fetch_message(int(control_message_id))
+        await message.delete()
     except (discord.HTTPException, ValueError):
         pass
 
@@ -5299,6 +5363,843 @@ async def handle_roulette_trigger(interaction: discord.Interaction, game_id: int
         else:
             client.cancel_roulette_turn(game_id)
 
+def prepare_baseball_pitch(
+    round_id: int,
+    actor_user_id: str,
+    *,
+    activate_at: float | None = None,
+) -> dict[str, Any]:
+    activate_at = (
+        time.time() + BASEBALL_WINDUP_SECONDS
+        if activate_at is None
+        else float(activate_at)
+    )
+    with db() as conn:
+        round_row = conn.execute(
+            "SELECT * FROM rounds WHERE id = ? AND status = 'open'",
+            (round_id,),
+        ).fetchone()
+        if not round_row or round_game_key(round_row) != "baseball":
+            raise ValueError("진행 중인 야구 라운드를 찾을 수 없습니다.")
+
+        extra = round_extra(round_row)
+        phase = str(extra.get("baseball_phase") or "")
+        if phase == "winding_up":
+            raise ValueError("이미 투수가 와인드업 중입니다. 잠시 기다려주세요.")
+        if phase != "waiting_prepare":
+            raise ValueError("지금은 투구를 준비할 수 없습니다.")
+
+        pitch_number = int(extra.get("baseball_pitch") or 1)
+        log_activity(
+            conn,
+            "round",
+            "baseball_pitch_prepared",
+            event_session_id=round_row["event_session_id"],
+            round_id=round_id,
+            actor_user_id=actor_user_id,
+            payload={
+                "pitch_number": pitch_number,
+                "previous_phase": phase,
+                "activate_at": activate_at,
+            },
+        )
+        extra.update(
+            {
+                "baseball_phase": "winding_up",
+                "baseball_prepared_by": actor_user_id,
+                "baseball_prepared_at": time.time(),
+                "baseball_activate_at": activate_at,
+            }
+        )
+        conn.execute(
+            "UPDATE rounds SET extra_json = ? WHERE id = ?",
+            (json.dumps(extra, ensure_ascii=False), round_id),
+        )
+        return {"round": dict(round_row), "extra": extra, "pitch_number": pitch_number}
+
+
+def set_baseball_activation_at(
+    round_id: int,
+    pitch_number: int,
+    activate_at: float,
+    control_message_id: str,
+) -> None:
+    """비활성 스트라이크존이 보인 시각을 기준으로 자동 활성화 시각을 확정한다."""
+    with db() as conn:
+        round_row = conn.execute(
+            "SELECT * FROM rounds WHERE id = ? AND status = 'open'",
+            (round_id,),
+        ).fetchone()
+        if not round_row or round_game_key(round_row) != "baseball":
+            raise ValueError("진행 중인 야구 라운드를 찾을 수 없습니다.")
+        extra = round_extra(round_row)
+        if (
+            extra.get("baseball_phase") != "winding_up"
+            or int(extra.get("baseball_pitch") or 1) != pitch_number
+        ):
+            raise ValueError("활성화를 기다리는 투구가 아닙니다.")
+        log_activity(
+            conn,
+            "round",
+            "baseball_windup_visible",
+            event_session_id=round_row["event_session_id"],
+            round_id=round_id,
+            payload={
+                "pitch_number": pitch_number,
+                "previous_activate_at": extra.get("baseball_activate_at"),
+                "activate_at": float(activate_at),
+                "control_message_id": control_message_id,
+            },
+        )
+        extra["baseball_activate_at"] = float(activate_at)
+        extra["baseball_control_message_id"] = control_message_id
+        conn.execute(
+            "UPDATE rounds SET extra_json = ? WHERE id = ?",
+            (json.dumps(extra, ensure_ascii=False), round_id),
+        )
+
+
+def reset_baseball_prepare(round_id: int, pitch_number: int) -> None:
+    """와인드업 판 게시나 활성화에 실패하면 관리자가 /준비를 다시 실행할 수 있게 한다."""
+    with db() as conn:
+        round_row = conn.execute(
+            "SELECT * FROM rounds WHERE id = ? AND status = 'open'",
+            (round_id,),
+        ).fetchone()
+        if not round_row or round_game_key(round_row) != "baseball":
+            return
+        extra = round_extra(round_row)
+        if (
+            extra.get("baseball_phase") != "winding_up"
+            or int(extra.get("baseball_pitch") or 1) != pitch_number
+        ):
+            return
+        log_activity(
+            conn,
+            "round",
+            "baseball_prepare_reset",
+            event_session_id=round_row["event_session_id"],
+            round_id=round_id,
+            payload={
+                "pitch_number": pitch_number,
+                "activate_at": extra.get("baseball_activate_at"),
+                "reason": "strike_zone_publish_or_activation_failed",
+            },
+        )
+        extra["baseball_phase"] = "waiting_prepare"
+        extra.pop("baseball_activate_at", None)
+        extra.pop("baseball_prepared_by", None)
+        extra.pop("baseball_prepared_at", None)
+        conn.execute(
+            "UPDATE rounds SET extra_json = ? WHERE id = ?",
+            (json.dumps(extra, ensure_ascii=False), round_id),
+        )
+
+
+def begin_baseball_pitch(
+    round_id: int,
+    actor_user_id: str,
+    *,
+    started_at: float | None = None,
+) -> dict[str, Any]:
+    started_at = time.time() if started_at is None else float(started_at)
+    with db() as conn:
+        round_row = conn.execute(
+            "SELECT * FROM rounds WHERE id = ? AND status = 'open'",
+            (round_id,),
+        ).fetchone()
+        if not round_row or round_game_key(round_row) != "baseball":
+            raise ValueError("진행 중인 야구 라운드를 찾을 수 없습니다.")
+
+        extra = round_extra(round_row)
+        if extra.get("baseball_phase") != "winding_up":
+            raise ValueError("먼저 관리자가 `/준비` 명령어를 실행해주세요.")
+        pitch_number = int(extra.get("baseball_pitch") or 1)
+        result_at = started_at + BASEBALL_RESULT_SECONDS
+        log_activity(
+            conn,
+            "round",
+            "baseball_pitch_started",
+            event_session_id=round_row["event_session_id"],
+            round_id=round_id,
+            actor_user_id=actor_user_id,
+            payload={
+                "pitch_number": pitch_number,
+                "started_at": started_at,
+                "result_at": result_at,
+                "scheduled_activate_at": extra.get("baseball_activate_at"),
+            },
+        )
+        extra.update(
+            {
+                "baseball_phase": "swinging",
+                "baseball_started_at": started_at,
+                "baseball_result_at": result_at,
+                "baseball_started_by": actor_user_id,
+            }
+        )
+        extra.pop("baseball_activate_at", None)
+        conn.execute(
+            "UPDATE rounds SET extra_json = ? WHERE id = ?",
+            (json.dumps(extra, ensure_ascii=False), round_id),
+        )
+        return {
+            "round": dict(round_row),
+            "extra": extra,
+            "pitch_number": pitch_number,
+            "started_at": started_at,
+            "result_at": result_at,
+        }
+
+
+def set_baseball_pitch_visible_at(
+    round_id: int,
+    pitch_number: int,
+    visible_at: float,
+    control_message_id: str | None = None,
+    button_position: int | None = None,
+) -> dict[str, float]:
+    """Discord가 버튼 편집을 완료한 시각으로 반응 시간의 0초를 다시 맞춘다."""
+    visible_at = float(visible_at)
+    result_at = visible_at + BASEBALL_RESULT_SECONDS
+    with db() as conn:
+        round_row = conn.execute(
+            "SELECT * FROM rounds WHERE id = ? AND status = 'open'",
+            (round_id,),
+        ).fetchone()
+        if not round_row or round_game_key(round_row) != "baseball":
+            raise ValueError("진행 중인 야구 라운드를 찾을 수 없습니다.")
+        extra = round_extra(round_row)
+        if (
+            extra.get("baseball_phase") != "swinging"
+            or int(extra.get("baseball_pitch") or 1) != pitch_number
+        ):
+            raise ValueError("활성화 중인 투구가 아닙니다.")
+        log_activity(
+            conn,
+            "round",
+            "baseball_pitch_visible",
+            event_session_id=round_row["event_session_id"],
+            round_id=round_id,
+            payload={
+                "pitch_number": pitch_number,
+                "visible_at": visible_at,
+                "result_at": result_at,
+                "control_message_id": control_message_id,
+                "button_position": button_position,
+                "previous_started_at": extra.get("baseball_started_at"),
+            },
+        )
+        extra.update(
+            {
+                "baseball_started_at": visible_at,
+                "baseball_result_at": result_at,
+            }
+        )
+        if control_message_id is not None:
+            extra["baseball_control_message_id"] = control_message_id
+        if button_position is not None:
+            extra["baseball_button_position"] = button_position
+        conn.execute(
+            "UPDATE rounds SET extra_json = ? WHERE id = ?",
+            (json.dumps(extra, ensure_ascii=False), round_id),
+        )
+    return {"started_at": visible_at, "result_at": result_at}
+
+
+def record_baseball_swing(
+    round_id: int,
+    pitch_number: int,
+    user: discord.abc.User,
+    *,
+    swung_at: float | None = None,
+    button_visible_at: float | None = None,
+    control_message_id: str | None = None,
+) -> dict[str, Any]:
+    swung_at = time.time() if swung_at is None else float(swung_at)
+    user_id = str(user.id)
+    with db() as conn:
+        round_row = conn.execute(
+            "SELECT * FROM rounds WHERE id = ? AND status = 'open'",
+            (round_id,),
+        ).fetchone()
+        if not round_row or round_game_key(round_row) != "baseball":
+            raise ValueError("이미 끝났거나 존재하지 않는 야구 라운드입니다.")
+        if not can_join_round(conn, round_id, user_id):
+            raise PermissionError("이번 이벤트에서 `참여하기`를 누른 유저만 타격할 수 있습니다.")
+
+        extra = round_extra(round_row)
+        expected_control_id = str(extra.get("baseball_control_message_id") or "")
+        if control_message_id is not None and expected_control_id != control_message_id:
+            raise ValueError("이미 교체된 야구 조작판입니다. 가장 아래의 최신 버튼을 사용해주세요.")
+        current_pitch = int(extra.get("baseball_pitch") or 1)
+        if extra.get("baseball_phase") != "swinging" or current_pitch != pitch_number:
+            raise ValueError("지금은 이 투구의 치기 버튼을 사용할 수 없습니다.")
+
+        existing = conn.execute(
+            """
+            SELECT elapsed_seconds, rank, score FROM baseball_swings
+            WHERE round_id = ? AND pitch_number = ? AND user_id = ?
+            """,
+            (round_id, pitch_number, user_id),
+        ).fetchone()
+        if existing:
+            return {
+                "already": True,
+                "elapsed_seconds": float(existing["elapsed_seconds"]),
+                "rank": existing["rank"],
+                "score": int(existing["score"]),
+            }
+
+        try:
+            started_at = float(
+                button_visible_at
+                if button_visible_at is not None
+                else extra["baseball_started_at"]
+            )
+        except (KeyError, TypeError, ValueError) as error:
+            raise ValueError("투구 시작 시각을 확인할 수 없습니다.") from error
+        elapsed = max(0.0, swung_at - started_at)
+        rank: int | None = None
+        if elapsed < BASEBALL_SWING_SECONDS:
+            rank = int(
+                conn.execute(
+                    """
+                    SELECT COUNT(*) AS count FROM baseball_swings
+                    WHERE round_id = ? AND pitch_number = ? AND elapsed_seconds < ?
+                    """,
+                    (round_id, pitch_number, BASEBALL_SWING_SECONDS),
+                ).fetchone()["count"]
+            ) + 1
+
+        ensure_user(conn, user)
+        display_name = user_display_name(user) or f"User {user_id}"
+        conn.execute(
+            """
+            INSERT INTO baseball_swings
+                (round_id, pitch_number, user_id, display_name, swung_at,
+                 elapsed_seconds, rank, score, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?)
+            """,
+            (
+                round_id,
+                pitch_number,
+                user_id,
+                display_name,
+                swung_at,
+                elapsed,
+                rank,
+                now_text(),
+            ),
+        )
+        log_activity(
+            conn,
+            "round",
+            "baseball_swing",
+            event_session_id=round_row["event_session_id"],
+            round_id=round_id,
+            actor_user_id=user_id,
+            payload={
+                "pitch_number": pitch_number,
+                "elapsed_seconds": elapsed,
+                "rank_at_click": rank,
+                "valid": rank is not None,
+            },
+        )
+        return {
+            "already": False,
+            "elapsed_seconds": elapsed,
+            "rank": rank,
+            "score": 0,
+        }
+
+
+def _baseball_pitch_result(
+    conn: sqlite3.Connection,
+    round_row: sqlite3.Row,
+    pitch_number: int,
+) -> dict[str, Any]:
+    extra = round_extra(round_row)
+    participants = [
+        dict(row)
+        for row in conn.execute(
+            """
+            SELECT event_participants.user_id, users.display_name
+            FROM event_participants
+            JOIN users ON users.user_id = event_participants.user_id
+            WHERE event_participants.event_session_id = ?
+            ORDER BY event_participants.joined_at ASC
+            """,
+            (round_row["event_session_id"],),
+        ).fetchall()
+    ]
+    swings = [
+        dict(row)
+        for row in conn.execute(
+            """
+            SELECT * FROM baseball_swings
+            WHERE round_id = ? AND pitch_number = ?
+            ORDER BY CASE WHEN rank IS NULL THEN 1 ELSE 0 END, rank ASC, id ASC
+            """,
+            (round_row["id"], pitch_number),
+        ).fetchall()
+    ]
+    return {
+        "round_id": int(round_row["id"]),
+        "event_session_id": round_row["event_session_id"],
+        "channel_id": str(round_row["channel_id"]),
+        "message_id": str(round_row["message_id"] or ""),
+        "control_message_id": str(extra.get("baseball_control_message_id") or ""),
+        "button_position": max(
+            0,
+            min(
+                BASEBALL_BUTTON_SLOT_COUNT - 1,
+                int(extra.get("baseball_button_position") or 0),
+            ),
+        ),
+        "title": str(round_row["title"]),
+        "pitch_number": pitch_number,
+        "participants": participants,
+        "swings": swings,
+    }
+
+
+def baseball_final_standings(
+    conn: sqlite3.Connection,
+    round_row: sqlite3.Row,
+    completed_pitches: set[int],
+) -> list[dict[str, Any]]:
+    """미입력 투구를 7초로 채우고 세 투구의 평균 반응 시간으로 정렬한다."""
+    rows = conn.execute(
+        """
+        SELECT event_participants.user_id, users.display_name,
+               COUNT(baseball_swings.id) AS swing_count,
+               COALESCE(SUM(
+                   CASE WHEN baseball_swings.elapsed_seconds < ? THEN 1 ELSE 0 END
+               ), 0) AS valid_swing_count,
+               COALESCE(SUM(baseball_swings.elapsed_seconds), 0) AS recorded_seconds
+        FROM event_participants
+        JOIN users ON users.user_id = event_participants.user_id
+        LEFT JOIN baseball_swings
+          ON baseball_swings.round_id = ?
+         AND baseball_swings.user_id = event_participants.user_id
+        WHERE event_participants.event_session_id = ?
+        GROUP BY event_participants.user_id, users.display_name
+        """,
+        (
+            BASEBALL_SWING_SECONDS,
+            round_row["id"],
+            round_row["event_session_id"],
+        ),
+    ).fetchall()
+    all_pitches_complete = completed_pitches.issuperset(
+        range(1, BASEBALL_TOTAL_PITCHES + 1)
+    )
+    standings = []
+    for row in rows:
+        valid_swing_count = int(row["valid_swing_count"] or 0)
+        swing_count = min(int(row["swing_count"] or 0), BASEBALL_TOTAL_PITCHES)
+        missed_swing_count = BASEBALL_TOTAL_PITCHES - swing_count
+        average_seconds = (
+            float(row["recorded_seconds"])
+            + (missed_swing_count * BASEBALL_MISSED_SWING_SECONDS)
+        ) / BASEBALL_TOTAL_PITCHES
+        standings.append(
+            {
+                "user_id": str(row["user_id"]),
+                "display_name": str(row["display_name"]),
+                "swing_count": swing_count,
+                "missed_swing_count": missed_swing_count,
+                "valid_swing_count": valid_swing_count,
+                "average_seconds": average_seconds,
+                "eligible": all_pitches_complete,
+                "rank": None,
+                "score": 0,
+            }
+        )
+
+    standings.sort(
+        key=lambda standing: (
+            not standing["eligible"],
+            (
+                float(standing["average_seconds"])
+                if standing["average_seconds"] is not None
+                else float("inf")
+            ),
+            standing["display_name"],
+            standing["user_id"],
+        )
+    )
+    rank = 0
+    for standing in standings:
+        if not standing["eligible"]:
+            continue
+        rank += 1
+        standing["rank"] = rank
+        standing["score"] = BASEBALL_RANK_POINTS.get(rank, 0)
+    return standings
+
+
+def settle_baseball_pitch(round_id: int, pitch_number: int) -> dict[str, Any] | None:
+    """한 투구의 순위만 확정한다. 점수는 3구 평균 최종 순위에서 한 번 지급한다."""
+    with db() as conn:
+        round_row = conn.execute(
+            "SELECT * FROM rounds WHERE id = ? AND status = 'open'",
+            (round_id,),
+        ).fetchone()
+        if not round_row or round_game_key(round_row) != "baseball":
+            return None
+        extra = round_extra(round_row)
+        if int(extra.get("baseball_pitch") or 1) != pitch_number:
+            return None
+        if extra.get("baseball_phase") == "result_ready":
+            return _baseball_pitch_result(conn, round_row, pitch_number)
+        if extra.get("baseball_phase") != "swinging":
+            return None
+
+        swing_rows = conn.execute(
+            """
+            SELECT * FROM baseball_swings
+            WHERE round_id = ? AND pitch_number = ?
+            ORDER BY id ASC
+            """,
+            (round_id, pitch_number),
+        ).fetchall()
+        valid_rank = 0
+        settlements: list[dict[str, Any]] = []
+        for swing in swing_rows:
+            rank: int | None = None
+            if float(swing["elapsed_seconds"]) < BASEBALL_SWING_SECONDS:
+                valid_rank += 1
+                rank = valid_rank
+            conn.execute(
+                "UPDATE baseball_swings SET rank = ?, score = ? WHERE id = ?",
+                (rank, 0, swing["id"]),
+            )
+            settlements.append(
+                {
+                    "user_id": str(swing["user_id"]),
+                    "elapsed_seconds": float(swing["elapsed_seconds"]),
+                    "rank": rank,
+                }
+            )
+
+        log_activity(
+            conn,
+            "round",
+            "baseball_pitch_recorded",
+            event_session_id=round_row["event_session_id"],
+            round_id=round_id,
+            payload={"pitch_number": pitch_number, "results": settlements},
+        )
+        settled_pitches = [int(value) for value in extra.get("baseball_settled_pitches", [])]
+        if pitch_number not in settled_pitches:
+            settled_pitches.append(pitch_number)
+        extra.update(
+            {
+                "baseball_phase": "result_ready",
+                "baseball_settled_pitches": sorted(settled_pitches),
+            }
+        )
+        conn.execute(
+            "UPDATE rounds SET extra_json = ? WHERE id = ?",
+            (json.dumps(extra, ensure_ascii=False), round_id),
+        )
+        return _baseball_pitch_result(conn, round_row, pitch_number)
+
+
+def advance_baseball_pitch(
+    round_id: int,
+    pitch_number: int,
+    result_message_id: str,
+    next_control_message_id: str | None = None,
+) -> dict[str, Any] | None:
+    with db() as conn:
+        round_row = conn.execute(
+            "SELECT * FROM rounds WHERE id = ? AND status = 'open'",
+            (round_id,),
+        ).fetchone()
+        if not round_row or round_game_key(round_row) != "baseball":
+            return None
+        extra = round_extra(round_row)
+        if (
+            extra.get("baseball_phase") != "result_ready"
+            or int(extra.get("baseball_pitch") or 1) != pitch_number
+        ):
+            return None
+
+        next_pitch = pitch_number + 1
+        next_phase = "waiting_prepare" if next_pitch <= BASEBALL_TOTAL_PITCHES else "complete"
+        result_message_ids = dict(extra.get("baseball_result_message_ids") or {})
+        result_message_ids[str(pitch_number)] = result_message_id
+        log_activity(
+            conn,
+            "round",
+            "baseball_result_published",
+            event_session_id=round_row["event_session_id"],
+            round_id=round_id,
+            payload={
+                "pitch_number": pitch_number,
+                "result_message_id": result_message_id,
+                "next_control_message_id": next_control_message_id,
+                "next_phase": next_phase,
+            },
+        )
+        extra.update(
+            {
+                "baseball_phase": next_phase,
+                "baseball_pitch": min(next_pitch, BASEBALL_TOTAL_PITCHES),
+                "baseball_result_message_ids": result_message_ids,
+            }
+        )
+        if next_control_message_id is not None:
+            extra["baseball_control_message_id"] = next_control_message_id
+        elif next_phase == "complete":
+            extra.pop("baseball_control_message_id", None)
+        extra.pop("baseball_button_position", None)
+        conn.execute(
+            "UPDATE rounds SET extra_json = ? WHERE id = ?",
+            (json.dumps(extra, ensure_ascii=False), round_id),
+        )
+        return {"round": dict(round_row), "extra": extra, "complete": next_phase == "complete"}
+
+
+async def handle_baseball_swing(
+    interaction: discord.Interaction,
+    round_id: int,
+    pitch_number: int,
+) -> None:
+    if interaction.user.bot:
+        await interaction.response.send_message("봇 계정은 타격할 수 없습니다.", ephemeral=True)
+        return
+    try:
+        visible_datetime = (
+            getattr(interaction.message, "edited_at", None)
+            or getattr(interaction.message, "created_at", None)
+        )
+        clicked_datetime = getattr(interaction, "created_at", None)
+        result = record_baseball_swing(
+            round_id,
+            pitch_number,
+            interaction.user,
+            swung_at=(
+                clicked_datetime.timestamp()
+                if clicked_datetime is not None
+                else None
+            ),
+            button_visible_at=(
+                visible_datetime.timestamp() if visible_datetime is not None else None
+            ),
+            control_message_id=str(interaction.message.id),
+        )
+    except (ValueError, PermissionError) as error:
+        await interaction.response.send_message(str(error), ephemeral=True)
+        return
+
+    elapsed = float(result["elapsed_seconds"])
+    if result["already"]:
+        message = f"이미 이번 투구에 스윙했습니다. 기록: **{elapsed:.2f}초**"
+    elif result["rank"] is None:
+        message = f"💨 헛스윙! **{elapsed:.2f}초** · 이 시간이 최종 평균에 반영됩니다."
+    else:
+        message = f"⚾ 스윙 기록 완료! **{elapsed:.2f}초** · 결과는 7초 후 공개됩니다."
+    await interaction.response.send_message(message, ephemeral=True)
+
+
+async def activate_baseball_pitch(
+    round_id: int,
+    pitch_number: int,
+    expected_activate_at: float | None = None,
+) -> bool:
+    """와인드업 3초 뒤 같은 3×3 판의 무작위 한 칸을 활성화한다."""
+    with db() as conn:
+        round_row = conn.execute(
+            "SELECT * FROM rounds WHERE id = ? AND status = 'open'",
+            (round_id,),
+        ).fetchone()
+        if not round_row or round_game_key(round_row) != "baseball":
+            return False
+        extra = round_extra(round_row)
+        if (
+            extra.get("baseball_phase") != "winding_up"
+            or int(extra.get("baseball_pitch") or 1) != pitch_number
+        ):
+            return False
+        try:
+            activate_at = float(extra.get("baseball_activate_at") or 0)
+        except (TypeError, ValueError):
+            return False
+        if expected_activate_at is not None and abs(activate_at - expected_activate_at) > 0.05:
+            return False
+        channel_id = str(round_row["channel_id"])
+        main_message_id = str(round_row["message_id"] or "")
+        control_message_id = str(extra.get("baseball_control_message_id") or "")
+        prepared_by = str(extra.get("baseball_prepared_by") or "system")
+        title = str(round_row["title"])
+
+    channel = await resolve_text_channel(channel_id)
+    if channel is None or not control_message_id:
+        reset_baseball_prepare(round_id, pitch_number)
+        return False
+    try:
+        control_message = await channel.fetch_message(int(control_message_id))
+    except (discord.HTTPException, ValueError):
+        reset_baseball_prepare(round_id, pitch_number)
+        return False
+
+    button_position = random.randrange(BASEBALL_BUTTON_SLOT_COUNT)
+    try:
+        activated_message = await control_message.edit(
+            content=baseball_control_content(pitch_number, "swinging"),
+            view=baseball_swing_view(
+                round_id,
+                pitch_number,
+                button_position=button_position,
+            ),
+        )
+    except discord.HTTPException:
+        reset_baseball_prepare(round_id, pitch_number)
+        return False
+
+    edited_at = getattr(activated_message, "edited_at", None)
+    visible_at = edited_at.timestamp() if edited_at is not None else time.time()
+    try:
+        begin_baseball_pitch(round_id, prepared_by, started_at=visible_at)
+        timing = set_baseball_pitch_visible_at(
+            round_id,
+            pitch_number,
+            visible_at,
+            control_message_id,
+            button_position,
+        )
+    except ValueError:
+        try:
+            await control_message.edit(
+                content=baseball_control_content(pitch_number, "winding_up"),
+                view=baseball_swing_view(
+                    round_id,
+                    pitch_number,
+                    disabled=True,
+                    button_position=None,
+                ),
+            )
+        except discord.HTTPException:
+            pass
+        return False
+
+    if main_message_id:
+        try:
+            main_message = await channel.fetch_message(int(main_message_id))
+            await main_message.edit(
+                embed=build_baseball_embed(
+                    round_id,
+                    title,
+                    pitch_number,
+                    "swinging",
+                ),
+                view=None,
+            )
+        except (discord.HTTPException, ValueError):
+            pass
+
+    bot.schedule_baseball_pitch(round_id, float(timing["result_at"]), pitch_number)
+    return True
+
+
+async def publish_baseball_pitch_result(round_id: int, pitch_number: int) -> bool:
+    result = settle_baseball_pitch(round_id, pitch_number)
+    if not result:
+        return False
+    channel = await resolve_text_channel(str(result["channel_id"]))
+    if channel is None:
+        return False
+
+    old_control_message = None
+    if result["control_message_id"]:
+        try:
+            old_control_message = await channel.fetch_message(
+                int(result["control_message_id"])
+            )
+            await old_control_message.edit(
+                content=baseball_control_content(pitch_number, "result_ready"),
+                view=baseball_swing_view(
+                    round_id,
+                    pitch_number,
+                    disabled=True,
+                    button_position=int(result["button_position"]),
+                ),
+            )
+        except (discord.HTTPException, ValueError):
+            old_control_message = None
+
+    if result["message_id"]:
+        try:
+            message = await channel.fetch_message(int(result["message_id"]))
+            await message.edit(
+                embed=build_baseball_embed(
+                    round_id,
+                    str(result["title"]),
+                    pitch_number,
+                    "result_ready",
+                ),
+                view=None,
+            )
+        except (discord.HTTPException, ValueError):
+            pass
+
+    result_message = await channel.send(embed=build_baseball_pitch_result_embed(result))
+    next_pitch = pitch_number + 1
+    next_control_message = None
+    if next_pitch <= BASEBALL_TOTAL_PITCHES:
+        next_control_message = await channel.send(
+            content=baseball_control_content(next_pitch, "waiting_prepare"),
+            view=None,
+        )
+
+    advanced = advance_baseball_pitch(
+        round_id,
+        pitch_number,
+        str(result_message.id),
+        str(next_control_message.id) if next_control_message is not None else None,
+    )
+    if not advanced:
+        if next_control_message is not None:
+            try:
+                await next_control_message.delete()
+            except discord.HTTPException:
+                pass
+        return False
+
+    if old_control_message is not None:
+        try:
+            await old_control_message.delete()
+        except discord.HTTPException:
+            pass
+
+    round_row = advanced["round"]
+    extra = advanced["extra"]
+    if result["message_id"]:
+        try:
+            message = await channel.fetch_message(int(result["message_id"]))
+            await message.edit(
+                embed=build_baseball_embed(
+                    round_id,
+                    str(result["title"]),
+                    int(extra["baseball_pitch"]),
+                    str(extra["baseball_phase"]),
+                ),
+                view=None,
+            )
+        except (discord.HTTPException, ValueError):
+            pass
+
+    if advanced["complete"]:
+        final = close_round_record(round_id, getattr(channel, "guild", None), closed_by="3구 완료")
+        if final:
+            await channel.send(embed=final[1], view=planned_mini_game_view(round_id))
+        await publish_event_summary_if_complete(round_row["event_session_id"])
+    return True
+
 
 class EventBot(discord.Client):
     def __init__(self) -> None:
@@ -5311,6 +6212,8 @@ class EventBot(discord.Client):
         self.auto_close_tasks: dict[int, asyncio.Task[None]] = {}
         # 라운드 타이머와 키가 겹치면 안 된다(둘 다 int 키인데 round_id와 game_id는 별개다).
         self.roulette_turn_tasks: dict[int, asyncio.Task[None]] = {}
+        self.baseball_activation_tasks: dict[int, asyncio.Task[None]] = {}
+        self.baseball_pitch_tasks: dict[int, asyncio.Task[None]] = {}
         self.auto_close_restored = False
         self.afk_coin_task: asyncio.Task[None] | None = None
         self.sand_board_locks: dict[int, asyncio.Lock] = {}
@@ -5344,6 +6247,8 @@ class EventBot(discord.Client):
             # 이걸 빠뜨리면 재시작 순간 진행 중이던 차례의 타이머가 사라져, 상대가
             # 방아쇠를 안 당기면 예치금이 영구 동결된다(자동 패배가 영영 안 온다).
             self.restore_roulette_turn_tasks()
+            # 야구의 3초 버튼 활성화와 7초 결과 타이머도 DB 시각으로 복구한다.
+            self.restore_baseball_pitch_tasks()
         if self.afk_coin_task is None or self.afk_coin_task.done():
             self.afk_coin_task = asyncio.create_task(self.afk_coin_loop())
         # 로그인 + 진행 중이던 라운드 타이머 복구까지 끝나야 배포가 성공으로 처리된다.
@@ -5397,6 +6302,114 @@ class EventBot(discord.Client):
                 continue
             if close_at > 0:
                 self.schedule_auto_close(int(row["id"]), close_at)
+
+    def schedule_baseball_pitch(
+        self,
+        round_id: int,
+        result_at: float,
+        pitch_number: int,
+    ) -> None:
+        existing = self.baseball_pitch_tasks.pop(round_id, None)
+        if existing:
+            existing.cancel()
+        self.baseball_pitch_tasks[round_id] = asyncio.create_task(
+            self.watch_baseball_pitch(round_id, result_at, pitch_number)
+        )
+
+    def schedule_baseball_activation(
+        self,
+        round_id: int,
+        activate_at: float,
+        pitch_number: int,
+    ) -> None:
+        existing = self.baseball_activation_tasks.pop(round_id, None)
+        if existing:
+            existing.cancel()
+        self.baseball_activation_tasks[round_id] = asyncio.create_task(
+            self.watch_baseball_activation(round_id, activate_at, pitch_number)
+        )
+
+    def restore_baseball_pitch_tasks(self) -> None:
+        with db() as conn:
+            rows = conn.execute(
+                "SELECT * FROM rounds WHERE type = 'grid' AND status = 'open'"
+            ).fetchall()
+        for row in rows:
+            extra = round_extra(row)
+            if extra.get("mode") != "baseball":
+                continue
+            phase = str(extra.get("baseball_phase") or "")
+            try:
+                pitch_number = int(extra.get("baseball_pitch") or 1)
+            except (TypeError, ValueError):
+                continue
+            if phase == "winding_up":
+                try:
+                    activate_at = float(extra.get("baseball_activate_at") or 0)
+                except (TypeError, ValueError):
+                    continue
+                if activate_at > 0:
+                    self.schedule_baseball_activation(
+                        int(row["id"]), activate_at, pitch_number
+                    )
+                continue
+            if phase not in {"swinging", "result_ready"}:
+                continue
+            try:
+                result_at = float(extra.get("baseball_result_at") or 0)
+            except (TypeError, ValueError):
+                continue
+            if result_at > 0:
+                self.schedule_baseball_pitch(int(row["id"]), result_at, pitch_number)
+
+    async def watch_baseball_activation(
+        self,
+        round_id: int,
+        activate_at: float,
+        pitch_number: int,
+    ) -> None:
+        try:
+            await asyncio.sleep(max(0, activate_at - time.time()))
+            await activate_baseball_pitch(round_id, pitch_number, activate_at)
+        except asyncio.CancelledError:
+            raise
+        finally:
+            if self.baseball_activation_tasks.get(round_id) is asyncio.current_task():
+                self.baseball_activation_tasks.pop(round_id, None)
+
+    async def watch_baseball_pitch(
+        self,
+        round_id: int,
+        result_at: float,
+        pitch_number: int,
+    ) -> None:
+        try:
+            await asyncio.sleep(max(0, result_at - time.time()))
+            with db() as conn:
+                row = conn.execute(
+                    "SELECT * FROM rounds WHERE id = ? AND status = 'open'",
+                    (round_id,),
+                ).fetchone()
+                extra = round_extra(row) if row else {}
+            if (
+                not row
+                or extra.get("mode") != "baseball"
+                or extra.get("baseball_phase") not in {"swinging", "result_ready"}
+                or int(extra.get("baseball_pitch") or 1) != pitch_number
+            ):
+                return
+            try:
+                current_result_at = float(extra.get("baseball_result_at") or 0)
+            except (TypeError, ValueError):
+                return
+            if abs(current_result_at - result_at) > 0.05:
+                return
+            await publish_baseball_pitch_result(round_id, pitch_number)
+        except asyncio.CancelledError:
+            raise
+        finally:
+            if self.baseball_pitch_tasks.get(round_id) is asyncio.current_task():
+                self.baseball_pitch_tasks.pop(round_id, None)
 
     def schedule_roulette_turn(
         self, game_id: int, deadline: float, shot_index: int
@@ -5834,6 +6847,22 @@ class EventBot(discord.Client):
             await handle_cutting_button(interaction, round_id)
             return
 
+        if action == "baseballswing":
+            if len(parts) != 4:
+                await interaction.response.send_message("잘못된 치기 버튼입니다.", ephemeral=True)
+                return
+            try:
+                round_id = int(parts[2])
+                pitch_number = int(parts[3])
+            except ValueError:
+                await interaction.response.send_message("잘못된 야구 투구 번호입니다.", ephemeral=True)
+                return
+            if not 1 <= pitch_number <= BASEBALL_TOTAL_PITCHES:
+                await interaction.response.send_message("잘못된 야구 투구 번호입니다.", ephemeral=True)
+                return
+            await handle_baseball_swing(interaction, round_id, pitch_number)
+            return
+
         if len(parts) < 4:
             await interaction.response.send_message("알 수 없는 버튼입니다.", ephemeral=True)
             return
@@ -6257,6 +7286,194 @@ def build_unique_number_embed(round_id: int, title: str) -> discord.Embed:
         name="🎯 배점",
         value="```\n1~5     +1점\n6~10    +2점\n11~15   +3점\n```",
         inline=False,
+    )
+    return embed
+
+
+def build_baseball_embed(
+    round_id: int,
+    title: str,
+    pitch_number: int,
+    phase: str = "waiting_prepare",
+) -> discord.Embed:
+    pitch_number = max(1, min(BASEBALL_TOTAL_PITCHES, int(pitch_number)))
+    status_by_phase = {
+        "waiting_prepare": "투수가 준비중입니다.",
+        "winding_up": "투수가 와인드업 중입니다. 3초 후 치기 버튼이 활성화됩니다.",
+        "swinging": "지금 `치기` 버튼을 누르세요! 3.00초부터는 헛스윙입니다.",
+        "result_ready": "이번 투구 결과를 집계하고 있습니다.",
+        "complete": "3구가 모두 끝났습니다.",
+    }
+    embed = discord.Embed(
+        title=f"⚾ {title}",
+        description=f"## <{pitch_number}구/{BASEBALL_TOTAL_PITCHES}구>",
+        color=discord.Color.blue(),
+    )
+    embed.set_image(url=f"attachment://{BASEBALL_IMAGE_FILENAME}")
+    embed.add_field(
+        name="현재 상태",
+        value=status_by_phase.get(phase, status_by_phase["waiting_prepare"]),
+        inline=False,
+    )
+    embed.add_field(
+        name="최종 배점",
+        value="3구 평균 기록 기준",
+        inline=False,
+    )
+    for medal, rank, score in (("🥇", 1, 3), ("🥈", 2, 2), ("🥉", 3, 1)):
+        embed.add_field(
+            name=f"{medal} {rank}위",
+            value=f"**+{score}점**",
+            inline=True,
+        )
+    embed.add_field(
+        name="미입력 처리",
+        value="누르지 못한 투구는 평균 계산에서 **7.00초**로 반영됩니다.",
+        inline=False,
+    )
+    embed.set_footer(text=f"라운드 #{round_id} · 치기 버튼이 열린 뒤 7초 후 결과 공개")
+    return embed
+
+
+def baseball_control_content(pitch_number: int, phase: str) -> str:
+    pitch_number = max(1, min(BASEBALL_TOTAL_PITCHES, int(pitch_number)))
+    guide_by_phase = {
+        "waiting_prepare": "",
+        "winding_up": "투수 와인드업",
+        "swinging": "지금 `치기`를 누르세요!",
+        "result_ready": "이번 투구 결과를 집계하고 있습니다.",
+        "complete": "3구가 모두 끝났습니다.",
+    }
+    guide = guide_by_phase.get(phase, guide_by_phase["waiting_prepare"])
+    title = (
+        f"⚾ **투수 와인드업 · <{pitch_number}구/{BASEBALL_TOTAL_PITCHES}구>**"
+        if phase == "winding_up"
+        else f"⚾ **야구 조작판 · <{pitch_number}구/{BASEBALL_TOTAL_PITCHES}구>**"
+    )
+    if phase == "winding_up":
+        return title
+    return f"{title}\n{guide}" if guide else title
+
+
+def baseball_swing_view(
+    round_id: int,
+    pitch_number: int,
+    disabled: bool = False,
+    button_position: int | None = 0,
+) -> discord.ui.View:
+    if button_position is not None:
+        button_position = max(
+            0,
+            min(BASEBALL_BUTTON_SLOT_COUNT - 1, int(button_position)),
+        )
+    view = discord.ui.View(timeout=None)
+    for slot in range(BASEBALL_BUTTON_SLOT_COUNT):
+        is_swing_button = button_position is not None and slot == button_position
+        view.add_item(
+            discord.ui.Button(
+                label="치기",
+                emoji="🏏",
+                style=(
+                    discord.ButtonStyle.success
+                    if is_swing_button
+                    else discord.ButtonStyle.secondary
+                ),
+                custom_id=(
+                    f"eventbot:baseballswing:{round_id}:{pitch_number}"
+                    if is_swing_button
+                    else f"eventbot:baseballslot:{round_id}:{pitch_number}:{slot}"
+                ),
+                disabled=disabled or not is_swing_button,
+                row=slot // BASEBALL_BUTTON_GRID_SIZE,
+            )
+        )
+    return view
+
+
+def baseball_result_lines(
+    participants: list[dict[str, Any]],
+    swings: list[dict[str, Any]],
+) -> list[str]:
+    """개별 투구는 정산 없이 반응 시간만 빠른 순서로 보여준다."""
+    swing_by_user = {str(row["user_id"]): row for row in swings}
+    ordered = sorted(
+        participants,
+        key=lambda participant: (
+            float(
+                swing_by_user.get(str(participant["user_id"]), {}).get(
+                    "elapsed_seconds",
+                    BASEBALL_MISSED_SWING_SECONDS,
+                )
+            ),
+            str(participant["display_name"]),
+        ),
+    )
+    lines: list[str] = []
+    for participant in ordered:
+        user_id = str(participant["user_id"])
+        display_name = discord.utils.escape_markdown(str(participant["display_name"]))
+        swing = swing_by_user.get(user_id)
+        if swing and swing.get("rank") is not None:
+            elapsed = float(swing["elapsed_seconds"])
+            lines.append(f"🏏 {display_name} · **{elapsed:.2f}초**")
+        elif swing:
+            lines.append(
+                f"💨 {display_name} · **{float(swing['elapsed_seconds']):.2f}초** (헛스윙)"
+            )
+        else:
+            lines.append(
+                f"💨 {display_name} · **{BASEBALL_MISSED_SWING_SECONDS:.2f}초** (미입력)"
+            )
+    return lines
+
+
+def build_baseball_pitch_result_embed(result: dict[str, Any]) -> discord.Embed:
+    lines = baseball_result_lines(result["participants"], result["swings"])
+    embed = discord.Embed(
+        title=f"⚾ {result['pitch_number']}구 결과 · {result['title']}",
+        description="\n".join(lines) if lines else "참가자가 없어 기록이 없습니다.",
+        color=discord.Color.gold(),
+    )
+    embed.set_footer(
+        text=(
+            f"3.00초부터 헛스윙 · {result['pitch_number']}구/{BASEBALL_TOTAL_PITCHES}구 · "
+            "점수는 3구 평균 최종 순위에서 지급"
+        )
+    )
+    return embed
+
+
+def build_baseball_final_result_embed(
+    title: str,
+    standings: list[dict[str, Any]],
+) -> discord.Embed:
+    medals = {1: "🥇", 2: "🥈", 3: "🥉"}
+    lines: list[str] = []
+    for standing in standings:
+        display_name = discord.utils.escape_markdown(str(standing["display_name"]))
+        rank = standing.get("rank")
+        if rank is not None:
+            average_seconds = float(standing["average_seconds"])
+            score = int(standing["score"])
+            missed_swing_count = int(standing["missed_swing_count"])
+            missed_text = (
+                f" · 미입력 {missed_swing_count}구는 7.00초 반영"
+                if missed_swing_count
+                else ""
+            )
+            lines.append(
+                f"{medals.get(int(rank), '▫️')} **{rank}위** · {display_name} · "
+                f"평균 **{average_seconds:.2f}초** · +{score}점{missed_text}"
+            )
+        else:
+            lines.append(
+                f"▫️ **라운드 미완료** · {display_name} · 0점"
+            )
+
+    embed = discord.Embed(
+        title=f"⚾ 최종 결과 · {title}",
+        description="\n".join(lines) if lines else "참가자가 없어 기록이 없습니다.",
+        color=discord.Color.gold(),
     )
     return embed
 
@@ -7445,6 +8662,31 @@ def close_round_record(
                     ),
                     inline=False,
                 )
+        elif round_row["type"] == "grid" and extra.get("mode") == "baseball":
+            completed_pitches = {
+                int(value) for value in extra.get("baseball_settled_pitches", [])
+            }
+            standings = baseball_final_standings(conn, round_row, completed_pitches)
+            for standing in standings:
+                score = int(standing["score"])
+                if not score:
+                    continue
+                add_score(
+                    conn,
+                    str(standing["user_id"]),
+                    str(standing["display_name"]),
+                    score,
+                    (
+                        f"라운드 #{round_row['id']} 야구 3구 평균 "
+                        f"{float(standing['average_seconds']):.2f}초 "
+                        f"{standing['rank']}위"
+                    ),
+                    round_row["id"],
+                )
+            embed = build_baseball_final_result_embed(
+                str(round_row["title"]),
+                standings,
+            )
         elif round_row["type"] == "grid" and extra.get("mode") == "unique_number":
             grouped: dict[int, list[str]] = {}
             for row in votes:
@@ -8008,16 +9250,18 @@ class StartSetupModal(discord.ui.Modal):
         self.game_title = discord.ui.TextInput(
             label="제목",
             placeholder="게임 제목 또는 질문",
+            default="야구" if game == "baseball" else None,
             max_length=120,
         )
-        self.duration = discord.ui.TextInput(
-            label="매칭 준비 시간(분)" if game in MAIN_GAME_TYPES else "진행 시간(분)",
-            placeholder="예: 2" if game in MAIN_GAME_TYPES else "예: 5",
-            default=str(TRUST_REGISTRATION_DEFAULT_MINUTES) if game in MAIN_GAME_TYPES else "5",
-            max_length=4,
-        )
         self.add_item(self.game_title)
-        self.add_item(self.duration)
+        if game != "baseball":
+            self.duration = discord.ui.TextInput(
+                label="매칭 준비 시간(분)" if game in MAIN_GAME_TYPES else "진행 시간(분)",
+                placeholder="예: 2" if game in MAIN_GAME_TYPES else "예: 5",
+                default=str(TRUST_REGISTRATION_DEFAULT_MINUTES) if game in MAIN_GAME_TYPES else "5",
+                max_length=4,
+            )
+            self.add_item(self.duration)
 
         # 가라앉는 배는 협상·실행 두 단계라 각 시간을 운영자가 따로 정한다.
         # (딜레마의 섬·모래성은 플레이 시간이 상수로 고정돼 있다.)
@@ -8045,7 +9289,11 @@ class StartSetupModal(discord.ui.Modal):
 
     async def on_submit(self, interaction: discord.Interaction) -> None:
         try:
-            duration = parse_duration_minutes(str(self.duration.value))
+            duration = (
+                0
+                if self.game == "baseball"
+                else parse_duration_minutes(str(self.duration.value))
+            )
             title = str(self.game_title.value).strip()
             if not title:
                 raise ValueError("제목을 입력해주세요.")
@@ -8169,6 +9417,7 @@ async def open_event(interaction: discord.Interaction) -> None:
         app_commands.Choice(name="돌 세공 예측", value="cutting"),
         app_commands.Choice(name="상위 3명 견제", value="top3"),
         app_commands.Choice(name="홍피겔만의 황금금고", value="unique_number"),
+        app_commands.Choice(name="야구", value="baseball"),
     ],
 )
 @app_commands.describe(메인게임="먼저 진행할 메인게임", 미니게임="메인게임 뒤에 진행할 미니게임")
@@ -8201,6 +9450,7 @@ async def start(interaction: discord.Interaction, 메인게임: str, 미니게�
         app_commands.Choice(name="돌 세공 예측", value="cutting"),
         app_commands.Choice(name="상위 3명 견제", value="top3"),
         app_commands.Choice(name="홍피겔만의 황금금고", value="unique_number"),
+        app_commands.Choice(name="야구", value="baseball"),
     ]
 )
 @app_commands.describe(게임="바로 시작할 미니게임")
@@ -8220,6 +9470,112 @@ async def start_mini_game(interaction: discord.Interaction, 게임: str) -> None
             )
             return
     await interaction.response.send_modal(StartSetupModal(게임, standalone_mini_game=True))
+
+
+@bot.tree.command(name="준비", description="야구 투구를 준비하고 와인드업을 알립니다.")
+@app_commands.default_permissions()
+@admin_only()
+async def baseball_prepare(interaction: discord.Interaction) -> None:
+    await interaction.response.defer(ephemeral=True)
+    with db() as conn:
+        round_row = get_open_round(conn)
+        if not round_row or round_game_key(round_row) != "baseball":
+            await interaction.followup.send("진행 중인 야구 라운드가 없습니다.", ephemeral=True)
+            return
+        round_id = int(round_row["id"])
+        channel_id = str(round_row["channel_id"])
+        main_message_id = str(round_row["message_id"] or "")
+        old_control_message_id = str(
+            round_extra(round_row).get("baseball_control_message_id") or ""
+        )
+
+    channel = await resolve_text_channel(channel_id)
+    if channel is None:
+        await interaction.followup.send("야구 채널을 찾을 수 없습니다.", ephemeral=True)
+        return
+
+    try:
+        transition = prepare_baseball_pitch(round_id, str(interaction.user.id))
+    except ValueError as error:
+        await interaction.followup.send(str(error), ephemeral=True)
+        return
+
+    pitch_number = int(transition["pitch_number"])
+    windup_view = baseball_swing_view(
+        round_id,
+        pitch_number,
+        disabled=True,
+        button_position=None,
+    )
+    control_message = None
+    if old_control_message_id:
+        try:
+            control_message = await channel.fetch_message(int(old_control_message_id))
+            control_message = await control_message.edit(
+                content=baseball_control_content(pitch_number, "winding_up"),
+                view=windup_view,
+            )
+        except (discord.HTTPException, ValueError):
+            control_message = None
+
+    if control_message is None:
+        try:
+            control_message = await channel.send(
+                content=baseball_control_content(pitch_number, "winding_up"),
+                view=windup_view,
+            )
+        except discord.HTTPException:
+            control_message = None
+
+    if control_message is None:
+        reset_baseball_prepare(round_id, pitch_number)
+        await interaction.followup.send(
+            "비활성 스트라이크존을 게시하지 못했습니다. 다시 시도해주세요.",
+            ephemeral=True,
+        )
+        return
+
+    visible_datetime = (
+        getattr(control_message, "edited_at", None)
+        or getattr(control_message, "created_at", None)
+    )
+    visible_at = (
+        visible_datetime.timestamp() if visible_datetime is not None else time.time()
+    )
+    activate_at = visible_at + BASEBALL_WINDUP_SECONDS
+    try:
+        set_baseball_activation_at(
+            round_id,
+            pitch_number,
+            activate_at,
+            str(control_message.id),
+        )
+    except ValueError as error:
+        reset_baseball_prepare(round_id, pitch_number)
+        await interaction.followup.send(str(error), ephemeral=True)
+        return
+
+    bot.schedule_baseball_activation(round_id, activate_at, pitch_number)
+
+    if main_message_id:
+        try:
+            main_message = await channel.fetch_message(int(main_message_id))
+            await main_message.edit(
+                embed=build_baseball_embed(
+                    round_id,
+                    str(transition["round"]["title"]),
+                    pitch_number,
+                    "winding_up",
+                ),
+                view=None,
+            )
+        except (discord.HTTPException, ValueError):
+            pass
+
+    await interaction.followup.send(
+        f"{pitch_number}구 와인드업을 시작했습니다. 3초 후 치기 버튼이 자동으로 활성화됩니다.",
+        ephemeral=True,
+    )
 
 
 async def create_round_from_setup(
@@ -8266,6 +9622,13 @@ async def create_round_from_setup(
         )
         return
 
+    if 게임 == "baseball" and not BASEBALL_IMAGE_PATH.is_file():
+        await interaction.followup.send(
+            f"야구 이미지 자산을 찾을 수 없습니다: `{BASEBALL_IMAGE_PATH.name}`",
+            ephemeral=True,
+        )
+        return
+
     if 게임 in MAIN_GAME_TYPES and not await ensure_pair_thread_permissions(
         interaction,
         게임,
@@ -8274,10 +9637,9 @@ async def create_round_from_setup(
         return
 
     close_at = time.time() + (int(진행시간분) * 60)
-    extra: dict[str, Any] = {
-        "auto_close_at": close_at,
-        "duration_minutes": int(진행시간분),
-    }
+    extra: dict[str, Any] = {"duration_minutes": int(진행시간분)}
+    if 게임 != "baseball":
+        extra["auto_close_at"] = close_at
     if 게임 in MAIN_GAME_TYPES:
         if 예정_미니게임 not in MINI_GAME_TYPES:
             await interaction.followup.send("시작할 미니게임을 함께 선택해주세요.", ephemeral=True)
@@ -8581,6 +9943,34 @@ async def create_round_from_setup(
             round_id = int(cursor.lastrowid)
             embed = build_unique_number_embed(round_id, 제목)
             view = unique_number_vote_view(round_id)
+        elif 게임 == "baseball":
+            # BASE_SCHEMA의 불변 CHECK 제약에 남아 있는 레거시 grid 슬롯을 사용한다.
+            extra.update(
+                {
+                    "mode": "baseball",
+                    "baseball_pitch": 1,
+                    "baseball_phase": "waiting_prepare",
+                    "baseball_settled_pitches": [],
+                    "baseball_result_message_ids": {},
+                }
+            )
+            cursor = conn.execute(
+                """
+                INSERT INTO rounds
+                    (type, title, question, status, channel_id, extra_json, created_at)
+                VALUES ('grid', ?, ?, 'open', ?, ?, ?)
+                """,
+                (
+                    제목,
+                    제목,
+                    main_channel_id,
+                    json.dumps(extra, ensure_ascii=False),
+                    now_text(),
+                ),
+            )
+            round_id = int(cursor.lastrowid)
+            embed = build_baseball_embed(round_id, 제목, 1)
+            view = None
         else:
             extra.update({"max_level": 6})
             cursor = conn.execute(
@@ -8699,13 +10089,25 @@ async def create_round_from_setup(
                 ),
                 inline=False,
             )
-    else:
+    elif 게임 != "baseball":
         embed.add_field(
             name="자동 마감",
             value=f"{진행시간분}분 후 자동으로 종료됩니다.\n예정 시각: {close_time_text(close_at)}",
             inline=False,
         )
-    message = await main_channel.send(embed=embed, view=view)
+    send_kwargs: dict[str, Any] = {"embed": embed, "view": view}
+    if 게임 == "baseball":
+        send_kwargs["file"] = discord.File(
+            BASEBALL_IMAGE_PATH,
+            filename=BASEBALL_IMAGE_FILENAME,
+        )
+    message = await main_channel.send(**send_kwargs)
+    if 게임 == "baseball":
+        control_message = await main_channel.send(
+            content=baseball_control_content(1, "waiting_prepare"),
+            view=None,
+        )
+        extra["baseball_control_message_id"] = str(control_message.id)
 
     discussion_thread_id = None
     if 게임 in {"balance", "minority_balance", "defuse4", "unique_number"}:
@@ -8748,6 +10150,19 @@ async def create_round_from_setup(
             discussion_thread_id = None
 
     with db() as conn:
+        if 게임 == "baseball":
+            log_activity(
+                conn,
+                "round",
+                "baseball_control_published",
+                event_session_id=event_session_id,
+                round_id=round_id,
+                actor_user_id=str(interaction.user.id),
+                payload={
+                    "pitch_number": 1,
+                    "control_message_id": extra.get("baseball_control_message_id"),
+                },
+            )
         conn.execute(
             """
             UPDATE rounds
@@ -8762,7 +10177,8 @@ async def create_round_from_setup(
             ),
         )
 
-    bot.schedule_auto_close(round_id, close_at)
+    if 게임 != "baseball":
+        bot.schedule_auto_close(round_id, close_at)
     await interaction.followup.send(
         f"게임 메시지를 <#{main_channel_id}>에 게시했습니다.",
         ephemeral=True,
@@ -8901,6 +10317,15 @@ async def close_round(interaction: discord.Interaction) -> None:
     task = bot.auto_close_tasks.pop(int(round_row["id"]), None)
     if task:
         task.cancel()
+    baseball_task = bot.baseball_pitch_tasks.pop(int(round_row["id"]), None)
+    if baseball_task:
+        baseball_task.cancel()
+    baseball_activation_task = bot.baseball_activation_tasks.pop(
+        int(round_row["id"]), None
+    )
+    if baseball_activation_task:
+        baseball_activation_task.cancel()
+    await delete_baseball_control_message(round_row)
 
     channel_id, embed = result
     if publishes_pair_results:
@@ -8969,6 +10394,15 @@ async def force_end_event(interaction: discord.Interaction) -> None:
         task = bot.auto_close_tasks.pop(int(round_row["id"]), None)
         if task:
             task.cancel()
+        baseball_task = bot.baseball_pitch_tasks.pop(int(round_row["id"]), None)
+        if baseball_task:
+            baseball_task.cancel()
+        baseball_activation_task = bot.baseball_activation_tasks.pop(
+            int(round_row["id"]), None
+        )
+        if baseball_activation_task:
+            baseball_activation_task.cancel()
+        await delete_baseball_control_message(round_row)
 
         channel_id = round_row["channel_id"]
         message_id = round_row["message_id"]
@@ -9137,7 +10571,8 @@ async def list_events(interaction: discord.Interaction) -> None:
     for round_row in round_rows:
         extra = round_extra(round_row)
         game_key = round_game_key(round_row)
-        phase = main_game_phase(round_row)
+        # 메인게임은 main_game_phase가 모아두고, 단계가 있는 미니게임은 여기서 붙인다.
+        phase = main_game_phase(round_row) or extra.get("baseball_phase")
         round_status = "진행 중" if round_row["status"] == "open" else "마감"
         lines.append(
             f"#{round_row['id']} {GAME_NAMES.get(game_key, game_key)} · {round_status}"

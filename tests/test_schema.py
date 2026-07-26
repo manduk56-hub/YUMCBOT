@@ -95,6 +95,30 @@ class FreshDatabaseTest(unittest.TestCase):
         self.assertIn("live_chamber", columns)
         self.assertIn("winner_id", columns)
 
+    def test_baseball_swings_table_is_created(self) -> None:
+        """v7 마이그레이션. 3구의 클릭 순서와 반응 시간을 각각 보존한다."""
+        bot.init_db()
+        with bot.db() as conn:
+            columns = {
+                row["name"]
+                for row in conn.execute("PRAGMA table_info(baseball_swings)").fetchall()
+            }
+        self.assertEqual(
+            columns,
+            {
+                "id",
+                "round_id",
+                "pitch_number",
+                "user_id",
+                "display_name",
+                "swung_at",
+                "elapsed_seconds",
+                "rank",
+                "score",
+                "created_at",
+            },
+        )
+
     def test_init_db_is_idempotent(self) -> None:
         bot.init_db()
         bot.init_db()
