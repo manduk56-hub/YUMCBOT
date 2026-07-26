@@ -8939,16 +8939,6 @@ def close_round_record(
                     value=f"제한 시간이 끝나 **{bail_auto_count}개 방**의 미제출분이 자동 제출되었습니다.",
                     inline=False,
                 )
-            embed.add_field(
-                name="💰 정산",
-                value=(
-                    f"생존하면 **보상 몫 − 퍼낸 횟수**(1회당 -{BAIL_SCOOP_COST}점)입니다.\n"
-                    f"침몰하면 보상금을 못 받고 몫이 많은 쪽 -{BAIL_SINK_PENALTY_HIGH}점 / "
-                    f"적은 쪽 -{BAIL_SINK_PENALTY_LOW}점 (같으면 각 -{BAIL_SINK_PENALTY_EVEN}점).\n"
-                    "> ⚠️ 보상은 더 받고 노동은 덜 한 사람"
-                ),
-                inline=False,
-            )
         elif round_row["type"] == "sand":
             result_lines: list[str] = []
             completed_count = 0
