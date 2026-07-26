@@ -6732,7 +6732,7 @@ def build_bail_play_embed(round_row: sqlite3.Row, extra: dict[str, Any]) -> disc
         value=(
             "**2단계 · 실행** — 각자 실제로 퍼낼 횟수를 비공개 제출"
             if round_phase == "execution"
-            else "**1단계 · 협상** — 누가 몇 번 퍼낼지 교대로 제안"
+            else "**1단계 · 협상** — 구조 보상금의 배분을 교대로 제안"
         ),
         inline=False,
     )
