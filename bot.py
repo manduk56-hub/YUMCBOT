@@ -3774,10 +3774,13 @@ async def redraw_bail_pair_board(
     thread: discord.Thread,
     pair_user_id: str,
 ) -> None:
-    """방 하나의 진행판을 지우고 맨 아래에 다시 붙인다.
+    """방 하나의 진행판을 **제자리에서 고쳐 쓴다.**
 
-    ephemeral 응답이 쌓여 버튼이 위로 밀리므로 모래성과 같은 방식으로 재부착한다.
-    두 사람이 동시에 누르면 옛 진행판을 가리킬 수 있어, 락을 잡고 DB에서 id를 다시 읽는다.
+    모래성처럼 지웠다 맨 아래에 다시 붙이면 상호작용마다 진행판이 사라졌다 나타나 읽기가 어렵다.
+    그래서 가라앉는 배는 협상·퍼내기 모두 같은 메시지를 `edit`만 한다 — ephemeral이 쌓여 진행판이
+    위로 밀리더라도 위치가 고정되는 쪽을 택했다. 새로 보내는 건 진행판을 잃어버린 경우뿐이다.
+
+    두 사람이 동시에 누르면 서로의 edit이 겹치므로, 락을 잡고 DB에서 현재 상태를 다시 읽는다.
     (락 dict는 모래성과 공유한다 — 키가 thread_id라 서로 충돌하지 않는다.)
     """
     async with bot.sand_board_lock(thread.id):
@@ -3790,27 +3793,18 @@ async def redraw_bail_pair_board(
         if not pair:
             return
 
-        resolved = str(pair.get("phase")) == "resolved"
         embed = build_bail_pair_embed(str(round_row["title"]), pair, extra)
         view = bail_pair_view(round_id, pair, extra)
 
         board_message_id = str(pair.get("play_message_id") or "")
-        if resolved:
-            # 더 누를 버튼이 없으므로 제자리에서 비활성화만 한다.
-            if board_message_id:
-                try:
-                    message = await thread.fetch_message(int(board_message_id))
-                    await message.edit(embed=embed, view=view)
-                except (discord.NotFound, discord.HTTPException, ValueError):
-                    pass
-            return
-
         if board_message_id:
             try:
-                old_board = await thread.fetch_message(int(board_message_id))
-                await old_board.delete()
+                message = await thread.fetch_message(int(board_message_id))
+                await message.edit(embed=embed, view=view)
+                return
             except (discord.NotFound, discord.HTTPException, ValueError):
                 pass
+
         try:
             new_board = await thread.send(embed=embed, view=view)
         except discord.HTTPException:

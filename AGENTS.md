@@ -81,6 +81,9 @@ embed/view 빌더 → `close_round_record`(정산) → 슬래시 명령어 → s
 - ephemeral 응답이 쌓여 진행판을 위로 밀어내므로 모래성은 상호작용마다 진행판을 지우고 맨 아래에
   다시 붙인다(`refresh_sand_pair_board`). 두 사람이 동시에 누르면 `interaction.message`가 이미 사라진
   옛 진행판일 수 있어, `EventBot.sand_board_lock(thread_id)`을 잡고 DB에서 id를 다시 읽는다.
+- **가라앉는 배는 반대로 제자리에서 `edit`만 한다**(`redraw_bail_pair_board`). 협상·퍼내기가 여러 번
+  오가는 게임이라 매번 지웠다 다시 붙이면 방이 깜빡여 읽기가 나쁘다는 판단이다. 진행판이 위로 밀리는
+  것은 감수한다. 새로 `send`하는 건 진행판을 잃어버렸을 때뿐이고, 동시 클릭 때문에 락은 그대로 잡는다.
 - 홀수 인원은 `extra_json.unmatched_user_id`로 남고 **긴급 투입** 버튼으로 아무나 짝이 된다
   (`apply_emergency_join`). **누가 투입됐는지는 메인 채널에만 공개하고, 각 방에는 시간 연장만 알린다** —
   상대가 누구인지가 게임의 일부라 다른 방에 이름이 새면 안 된다.
