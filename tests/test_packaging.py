@@ -17,11 +17,11 @@ from pathlib import Path
 from unittest.mock import patch
 
 import bot
-from yumcbot import activity, config, scoring
+from yumcbot import activity, config, roulette, scoring
 from yumcbot import db as schema
 
 # bot.py가 재노출하는 모듈들. 새로 추출할 때마다 여기에 추가한다.
-EXTRACTED = (config, schema, activity, scoring)
+EXTRACTED = (config, schema, activity, scoring, roulette)
 
 
 def public_names(module: types.ModuleType) -> set[str]:
@@ -72,6 +72,36 @@ class ReexportWiringTest(unittest.TestCase):
                 with bot.db() as conn:
                     conn.execute("CREATE TABLE probe (id INTEGER)")
             self.assertTrue(target.exists(), "db()가 patch된 경로를 쓰지 않았습니다.")
+
+
+class RouletteTimerProtocolTest(unittest.TestCase):
+    """룰렛 모듈은 EventBot을 구체 타입으로 알지 못한다 (알면 순환 import).
+
+    대신 프로토콜로 '타이머를 걸 수 있는 클라이언트인가'만 확인하는데, EventBot 쪽에서
+    메서드 이름이 바뀌면 isinstance가 조용히 False가 된다. 그러면 차례 타이머가 걸리지
+    않고 — 예외도 로그도 없이 — 예치금이 영구 동결되고 상대까지 묶인다.
+    증상이 없는 실패라서 여기서 붙잡는다.
+    """
+
+    def test_event_bot_satisfies_timer_protocol(self) -> None:
+        self.assertIsInstance(bot.bot, roulette.RouletteTimerClient)
+
+    def test_protocol_rejects_unrelated_objects(self) -> None:
+        """메서드 이름만 보는 프로토콜이라 아무 객체나 통과하지 않는지 확인한다."""
+
+        class Unrelated:
+            pass
+
+        self.assertNotIsInstance(Unrelated(), roulette.RouletteTimerClient)
+
+    def test_turn_timer_restore_is_registered_on_ready(self) -> None:
+        """라운드 타이머(restore_auto_close_tasks)와 별개라 따로 등록해야 한다.
+
+        빠뜨리면 재시작 순간 타이머가 사라져 위와 같은 동결이 재현된다.
+        """
+        self.assertIn(
+            "restore_roulette_turn_tasks", bot.EventBot.on_ready.__code__.co_names
+        )
 
 
 class EntrypointTest(unittest.TestCase):
