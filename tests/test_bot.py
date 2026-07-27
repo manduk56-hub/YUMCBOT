@@ -10,12 +10,15 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 import bot
+from yumcbot import config
 
 
 class BotRegressionTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temp_dir = tempfile.TemporaryDirectory()
-        self.db_patch = patch.object(bot, "DB_PATH", Path(self.temp_dir.name) / "test.sqlite3")
+        # db()가 호출 시점에 config.DB_PATH를 읽으므로 patch 대상도 config다.
+        # bot.DB_PATH는 재노출된 사본이라 갈아끼워도 연결 경로가 바뀌지 않는다.
+        self.db_patch = patch.object(config, "DB_PATH", Path(self.temp_dir.name) / "test.sqlite3")
         self.db_patch.start()
         bot.init_db()
 

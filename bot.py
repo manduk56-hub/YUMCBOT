@@ -11,223 +11,98 @@ import signal
 import socket
 import sqlite3
 import time
-from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 import discord
 from discord import app_commands
-from dotenv import load_dotenv
 
 
-BASE_DIR = Path(__file__).resolve().parent
+from yumcbot import config
 
-# 배포 환경(systemd)이 넘겨준 실제 환경변수가 우선이고, 없으면 로컬 .env로 채운다.
-load_dotenv(BASE_DIR / ".env")
-
-# 운영 서버는 DB를 코드 디렉터리 밖(/var/lib/yumcbot/data)에 두어 배포로 덮이지 않게 한다.
-DATA_DIR = Path(os.getenv("YUMCBOT_DATA_DIR") or (BASE_DIR / "data")).resolve()
-DB_PATH = DATA_DIR / (os.getenv("YUMCBOT_DB_NAME") or "event_game.sqlite3")
-KST_LABEL = "Asia/Seoul"
-
-
-def _detect_bot_version() -> str:
-    """활동 로그에 남길 코드 버전. '어느 코드로 돈 게임인가'를 사후에 알기 위한 것.
-
-    배포는 릴리스를 /opt/yumcbot/releases/<sha>/ 에 풀고 current 링크를 갈아끼운다.
-    따라서 운영에서는 코드 디렉터리 이름이 곧 커밋 SHA다 (deploy/deploy.sh 참고).
-    로컬 체크아웃에서는 그렇지 않으므로 'dev'로 둔다. 부팅 시 한 번만 계산한다.
-    """
-    override = os.getenv("YUMCBOT_VERSION")
-    if override:
-        return override
-    name = BASE_DIR.name
-    if len(name) >= 7 and all(char in "0123456789abcdef" for char in name):
-        return name[:12]
-    return "dev"
-
-
-BOT_VERSION = _detect_bot_version()
-DEFUSE_COLORS = [
-    {"id": "red", "name": "빨강", "emoji": "🟥"},
-    {"id": "blue", "name": "파랑", "emoji": "🟦"},
-    {"id": "green", "name": "초록", "emoji": "🟩"},
-]
-DEFUSE_COLOR_BY_ID = {color["id"]: color for color in DEFUSE_COLORS}
-# 배포 전에 열린 구방식 라운드의 버튼 응답 문구를 위해서만 남긴다.
-DEFUSE_COLOR_BY_ID.update(
-    {
-        "black": {"id": "black", "name": "검정", "emoji": "⬛"},
-        "white": {"id": "white", "name": "흰색", "emoji": "⬜"},
-    }
+# 경로·상수는 yumcbot.config로, 스키마·연결은 yumcbot.db로 옮겼다.
+# 여기서 다시 노출하는 이유: bot.py의 함수들이 아직 이 이름들을 모듈 전역으로 읽고,
+# 테스트도 patch.object(bot, ...)로 일부를 갈아끼운다. 게임 모듈 이관이 끝나면 사라진다.
+from yumcbot.config import (
+    AFK_COIN_PER_TICK,
+    AFK_TICK_SECONDS,
+    ANONYMOUS_EMBED_COLORS,
+    ANONYMOUS_GUIDE_TEXT,
+    AUTO_CLOSE_COUNTDOWN_SECONDS,
+    AUTO_CLOSE_WARNING_SECONDS,
+    BAIL_DEFAULT_EXECUTION_MINUTES,
+    BAIL_DEFAULT_NEGOTIATION_MINUTES,
+    BAIL_FAILED_REWARD_POOL,
+    BAIL_FALLBACK_SCOOPS,
+    BAIL_NEGOTIATION_MAX_OFFERS,
+    BAIL_OUTCOME_LABELS,
+    BAIL_REQUIRED_SCOOPS,
+    BAIL_REWARD_CHOICES,
+    BAIL_REWARD_POOL,
+    BAIL_SCOOP_CHOICES,
+    BAIL_SCOOP_COST,
+    BAIL_SINK_PENALTY_EVEN,
+    BAIL_SINK_PENALTY_HIGH,
+    BAIL_SINK_PENALTY_LOW,
+    BALANCE_VOTE_CHOICES,
+    BASEBALL_BUTTON_GRID_SIZE,
+    BASEBALL_BUTTON_SLOT_COUNT,
+    BASEBALL_IMAGE_FILENAME,
+    BASEBALL_IMAGE_PATH,
+    BASEBALL_MISSED_SWING_SECONDS,
+    BASEBALL_RANK_POINTS,
+    BASEBALL_RESULT_SECONDS,
+    BASEBALL_SWING_SECONDS,
+    BASEBALL_TOTAL_PITCHES,
+    BASEBALL_WINDUP_SECONDS,
+    BOT_VERSION,
+    CUTTING_LEVEL_CHOICES,
+    CUTTING_REWARD_POINTS,
+    CUTTING_SUCCESS_RATES,
+    DEFUSE_COLORS,
+    DEFUSE_COLOR_BY_ID,
+    EMERGENCY_EXTENSION_SECONDS,
+    EVENT_STATUS_LABELS,
+    GAME_NAMES,
+    KST_LABEL,
+    MAIN_GAME_TYPES,
+    MATCH_HISTORY_ROUNDS,
+    MINI_GAME_TYPES,
+    ROULETTE_BETTING_SECONDS,
+    ROULETTE_CHALLENGE_SECONDS,
+    ROULETTE_DAILY_LIMIT,
+    ROULETTE_MAX_BET,
+    ROULETTE_MIN_BET,
+    ROULETTE_PAIR_DAILY_LIMIT,
+    ROULETTE_STACK_GOAL,
+    ROULETTE_STACK_REWARD,
+    ROULETTE_TURN_SECONDS,
+    SAND_NUMBER_CHOICES,
+    SAND_OUTCOME_LABELS,
+    SAND_PLAY_SECONDS,
+    SAND_RULES_TEXT,
+    SCORE_REVEAL_COST,
+    TOP3_NONE_CHOICE,
+    TRUST_DECISION_SECONDS,
+    TRUST_OUTCOME_LABELS,
+    TRUST_REGISTRATION_DEFAULT_MINUTES,
+    UNIQUE_NUMBER_CHOICES,
 )
-CUTTING_LEVEL_CHOICES = [str(index) for index in range(0, 7)]
-CUTTING_REWARD_POINTS = {
-    0: 3,
-    1: 3,
-    2: 1,
-    3: 1,
-    4: 1,
-    5: 2,
-    6: 6,
-}
-CUTTING_SUCCESS_RATES = {
-    0: 0.9,
-    1: 0.9,
-    2: 0.6,
-    3: 0.6,
-    4: 0.5,
-    5: 0.15,
-}
-TOP3_NONE_CHOICE = "__none__"
-UNIQUE_NUMBER_CHOICES = [str(index) for index in range(1, 16)]
-BASEBALL_TOTAL_PITCHES = 3
-BASEBALL_SWING_SECONDS = 3.0
-BASEBALL_RESULT_SECONDS = 7.0
-BASEBALL_WINDUP_SECONDS = 3.0
-BASEBALL_MISSED_SWING_SECONDS = 7.0
-BASEBALL_BUTTON_GRID_SIZE = 3
-BASEBALL_BUTTON_SLOT_COUNT = BASEBALL_BUTTON_GRID_SIZE**2
-BASEBALL_RANK_POINTS = {1: 3, 2: 2, 3: 1}
-BASEBALL_IMAGE_FILENAME = "baseball-batter.png"
-BASEBALL_IMAGE_PATH = BASE_DIR / "assets" / BASEBALL_IMAGE_FILENAME
-TRUST_REGISTRATION_DEFAULT_MINUTES = 2
-TRUST_DECISION_SECONDS = 180
-MATCH_HISTORY_ROUNDS = 3  # 메인게임 1:1 매칭에서 이 라운드 수만큼 직전 짝을 회피 (trust·sand 공유)
-TRUST_OUTCOME_LABELS = {
-    "mutual": "신뢰",
-    "single": "단독 배신",
-    "double": "동시 배신",
-    "incomplete": "미선택",
-}
-# 게임 키 집합이다 (rounds.type 값 집합이 아니다). 'bail'은 type='sand'로 저장되므로
-# `round_row["type"] in MAIN_GAME_TYPES` 검사도 그대로 통과한다. 게임을 갈라야 할 때는
-# round_game_key()를 쓴다.
-MAIN_GAME_TYPES = {"trust", "sand", "bail"}
-# 'grid'(관리자 시점 타일)는 제거된 미니게임이다. 불변인 rounds.type CHECK 제약의 grid 값은
-# extra_json.mode로 구분되는 유일 숫자 게임과 야구의 저장 타입으로 재사용한다.
-MINI_GAME_TYPES = {
-    "balance",
-    "minority_balance",
-    "defuse4",
-    "cutting",
-    "top3",
-    "unique_number",
-    "baseball",
-}
-GAME_NAMES = {
-    "balance": "밸런스 게임",
-    # 참가자에게는 1차 집계가 끝날 때까지 일반 밸런스 게임으로 보여야 한다.
-    "minority_balance": "밸런스 게임",
-    # DB 호환을 위해 내부 키는 defuse4를 유지하지만 현재 규칙은 3선 방식이다.
-    "defuse4": "몰리면 터진다!",
-    "cutting": "돌 세공 예측",
-    "top3": "상위 3명 견제",
-    "unique_number": "홍피겔만의 황금금고",
-    "baseball": "야구",
-    "trust": "딜레마의 섬",
-    "sand": "모래성 게임",
-    # DB type은 sand를 재사용하고 extra_json.mode='bail'로 갈라 쓴다.
-    "bail": "가라앉는 배",
-}
-BALANCE_VOTE_CHOICES = [("A 선택", "A"), ("B 선택", "B")]
-ANONYMOUS_EMBED_COLORS = (
-    # 가까운 번호끼리 색상·명도 차이가 크게 나도록 고대비 순서로 배치한다.
-    0xD1382A,
-    0x0AD10A,
-    0x940CF5,
-    0x31C4F5,
-    0xD1B00A,
-    0xAD3D91,
-    0x3DAD75,
-    0x3172F5,
-    0xAD753D,
-    0xF556F5,
-    0xF50C6D,
-    0x3D6CAD,
-    0xF5810C,
-    0x74AD23,
-    0xAD3D59,
-    0xF50CA7,
-    0x8D49D1,
-    0x0AD1D1,
-    0x2AD162,
-    0xF50C0C,
+from yumcbot.db import (
+    BASELINE_VERSION,
+    BASE_SCHEMA,
+    MIGRATIONS,
+    SCHEMA_VERSION,
+    apply_baseline_schema,
+    canonical_schema,
+    db,
+    ensure_event_session_schema,
+    ensure_trust_pairing_schema,
+    init_db,
+    migrate_round_type_check,
+    verify_schema,
 )
-ANONYMOUS_GUIDE_TEXT = (
-    "아래 버튼으로 익명 발언을 남겨주세요. 일반 메시지는 익명 보호를 위해 삭제됩니다.\n"
-    "발언 횟수 제한은 없으며, 같은 라운드에서는 계속 같은 색상으로 표시됩니다."
-)
-SAND_NUMBER_CHOICES = [str(index) for index in range(1, 11)]
-SAND_PLAY_SECONDS = 600
-SAND_RULES_TEXT = (
-    "**1** ─ 각 참여자가 1~10 중 모래성이 무너질 횟수를 정합니다.\n"
-    "**2** ─ 두 수의 차이만큼은 안전하게 덜 수 있고, 그 횟수를 초과해서 더는 순간 무너집니다. "
-    "(예: 9와 7이면 차이가 2 → 2번까지는 성공, 3번째에 붕괴. 차이가 0이면 첫 덜기에서 붕괴)\n"
-    "**3** ─ 참여자는 번갈아가며 `포기하기` 또는 `모래 덜기`를 결정합니다.\n"
-    "**4** ─ 숫자를 안 내거나 제한 시간 안에 끝내지 못하면 마감 때 랜덤으로 자동 진행됩니다.\n\n"
-    "> 🏳️ 둘 다 포기 선택 시: **서로 -3점**\n"
-    "> ⚖️ 한 명이 포기(A), 다른 한 명이 모래 덜기(B) 선택 시:\n"
-    "> 　├ 덜기 성공: A는 **-3점**, B는 **+5점**\n"
-    "> 　└ 무너짐: B는 **-3점**, A는 **+2점**\n"
-    "> 💥 서로 덜기를 하다 무너진 경우: 그 턴의 사람이 **-3점**"
-)
-SAND_OUTCOME_LABELS = {
-    "mutual_quit": "둘 다 포기",
-    "quit_success": "포기 후 상대 덜기 성공",
-    "quit_collapse": "포기 후 상대 모래성 붕괴",
-    "plain_collapse": "일반 모래성 붕괴",
-}
-# 가라앉는 배: 협상 → 실행 2단계 메인게임. rounds.type CHECK 제약을 못 고쳐서
-# type='sand' + extra_json.mode='bail'로 저장한다 (grid→unique_number와 같은 방식).
-#
-# 협상하는 것은 **구조 보상금의 배분**이고(수락하면 확정), 누가 몇 번 퍼낼지는 아무도 약속하지 않는다.
-# 그래서 배신은 "보상은 챙기고 노동은 덜 하기"가 된다.
-BAIL_REWARD_POOL = 10  # 배가 뜨면 두 사람이 나눠 받는 구조 보상금
-BAIL_REWARD_CHOICES = [str(index) for index in range(BAIL_REWARD_POOL + 1)]  # 0~10
-BAIL_FAILED_REWARD_POOL = 6  # 협상 결렬 시 감액된 보상금 (둘이 균등 분배)
-BAIL_REQUIRED_SCOOPS = 6  # 배가 뜨는 데 필요한 두 사람 합계 퍼내기 횟수
-BAIL_SCOOP_CHOICES = [str(index) for index in range(BAIL_REQUIRED_SCOOPS + 1)]  # 0~6
-BAIL_SCOOP_COST = 1  # 퍼내기 1회당 차감
-# 침몰 페널티는 보상 몫에 비례한다. 많이 받기로 한 쪽이 더 크게 잃어야
-# "협상에서 욕심낸 만큼 침몰 리스크를 진다"가 성립하고, 적게 받은 쪽에 배신 카드가 생긴다.
-BAIL_SINK_PENALTY_HIGH = 4  # 보상 몫이 많은 쪽
-BAIL_SINK_PENALTY_LOW = 2  # 보상 몫이 적은 쪽
-BAIL_SINK_PENALTY_EVEN = 3  # 몫이 같을 때 (결렬 포함)
-BAIL_NEGOTIATION_MAX_OFFERS = 3  # 교대 제안 최대 횟수
-BAIL_DEFAULT_NEGOTIATION_MINUTES = 5
-BAIL_DEFAULT_EXECUTION_MINUTES = 3
-BAIL_FALLBACK_SCOOPS = BAIL_REQUIRED_SCOOPS // 2  # 실행 단계 미제출 시의 자동 제출값
-BAIL_OUTCOME_LABELS = {
-    "survived": "생존",
-    "sunk": "침몰",
-}
-EVENT_STATUS_LABELS = {
-    "recruiting": "참가 모집 중",
-    "active": "게임 진행 중",
-    "closed": "종료",
-}
-# 참가자가 홀수라 짝이 없는 사람이 생겼을 때, 새 참가자가 긴급 투입되면 전체 마감이 이만큼 밀린다.
-EMERGENCY_EXTENSION_SECONDS = 60
-AUTO_CLOSE_WARNING_SECONDS = 10
-AUTO_CLOSE_COUNTDOWN_SECONDS = (5, 4, 3, 2, 1)
-AFK_TICK_SECONDS = 60
-AFK_COIN_PER_TICK = 1
-SCORE_REVEAL_COST = 30
-ROULETTE_CHALLENGE_SECONDS = 300
-ROULETTE_BETTING_SECONDS = 180
-# 자기 차례에 방아쇠를 안 당기면 자동 패배. 없으면 예치금이 영구 동결되고
-# 동시 1결투 제한 때문에 상대까지 묶인다(배포도 check_idle에서 영구 차단된다).
-ROULETTE_TURN_SECONDS = 180
-ROULETTE_MIN_BET = 1
-ROULETTE_MAX_BET = 3
-ROULETTE_DAILY_LIMIT = 3
-ROULETTE_PAIR_DAILY_LIMIT = 1
-# 최소 베팅액도 못 내는 유저(=신용 유저)는 강제로 1점을 걸고, 이기면 점수가 오르지 않는
-# 대신 연승 스택이 쌓인다. 스택이 목표치에 닿으면 보상 점수를 받고 스택은 0으로 돌아간다.
-ROULETTE_STACK_GOAL = 2
-ROULETTE_STACK_REWARD = 2
 
 
 def now_text() -> str:
@@ -271,426 +146,6 @@ def cutting_reward_text() -> str:
         rows.append((span, f"+{points}점"))
     width = max(len(span) for span, _ in rows)
     return "\n".join(f"{span:<{width}} {value}" for span, value in rows)
-
-
-@contextmanager
-def db() -> sqlite3.Connection:
-    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(DB_PATH, timeout=5.0)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA foreign_keys = ON")
-    # WAL: 재시작/급종료 시 DB 손상 방지, /데이터백업 중에도 쓰기가 막히지 않는다.
-    conn.execute("PRAGMA journal_mode = WAL")
-    conn.execute("PRAGMA synchronous = NORMAL")
-    conn.execute("PRAGMA busy_timeout = 5000")
-    try:
-        yield conn
-        conn.commit()
-    finally:
-        conn.close()
-
-
-# v1 베이스라인. 이 문자열은 절대 수정하지 않는다.
-# 스키마를 바꾸려면 SCHEMA_VERSION을 올리고 MIGRATIONS에 항목을 추가한다.
-# (여기를 고치면 새 DB와 기존 운영 DB의 스키마가 갈라진다.)
-BASE_SCHEMA = """
-            CREATE TABLE IF NOT EXISTS users (
-                user_id TEXT PRIMARY KEY,
-                display_name TEXT NOT NULL,
-                total_score INTEGER NOT NULL DEFAULT 0,
-                created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL
-            );
-
-            CREATE TABLE IF NOT EXISTS rounds (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                type TEXT NOT NULL CHECK (type IN ('balance', 'bomb', 'grid', 'cutting', 'top3', 'trust', 'sand')),
-                title TEXT NOT NULL,
-                question TEXT NOT NULL,
-                option_a TEXT,
-                option_b TEXT,
-                status TEXT NOT NULL CHECK (status IN ('open', 'closed')) DEFAULT 'open',
-                channel_id TEXT,
-                message_id TEXT,
-                discussion_thread_id TEXT,
-                extra_json TEXT NOT NULL DEFAULT '{}',
-                created_at TEXT NOT NULL,
-                closed_at TEXT
-            );
-
-            CREATE TABLE IF NOT EXISTS event_sessions (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                status TEXT NOT NULL CHECK (status IN ('recruiting', 'active', 'closed')),
-                channel_id TEXT NOT NULL,
-                message_id TEXT,
-                created_at TEXT NOT NULL,
-                closed_at TEXT
-            );
-
-            CREATE TABLE IF NOT EXISTS event_participants (
-                event_session_id INTEGER NOT NULL,
-                user_id TEXT NOT NULL,
-                joined_at TEXT NOT NULL,
-                PRIMARY KEY (event_session_id, user_id),
-                FOREIGN KEY (event_session_id) REFERENCES event_sessions(id) ON DELETE CASCADE,
-                FOREIGN KEY (user_id) REFERENCES users(user_id) ON DELETE CASCADE
-            );
-
-            CREATE TABLE IF NOT EXISTS votes (
-                round_id INTEGER NOT NULL,
-                user_id TEXT NOT NULL,
-                choice TEXT NOT NULL,
-                created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL,
-                PRIMARY KEY (round_id, user_id),
-                FOREIGN KEY (round_id) REFERENCES rounds(id) ON DELETE CASCADE
-            );
-
-            CREATE TABLE IF NOT EXISTS discussion_posts (
-                round_id INTEGER NOT NULL,
-                user_id TEXT NOT NULL,
-                message_id TEXT NOT NULL,
-                content TEXT NOT NULL,
-                created_at TEXT NOT NULL,
-                PRIMARY KEY (round_id, user_id),
-                FOREIGN KEY (round_id) REFERENCES rounds(id) ON DELETE CASCADE
-            );
-
-            CREATE TABLE IF NOT EXISTS trust_registrations (
-                round_id INTEGER NOT NULL,
-                user_id TEXT NOT NULL,
-                registered_at TEXT NOT NULL,
-                PRIMARY KEY (round_id, user_id),
-                FOREIGN KEY (round_id) REFERENCES rounds(id) ON DELETE CASCADE
-            );
-
-            CREATE TABLE IF NOT EXISTS trust_pairings (
-                round_id INTEGER NOT NULL,
-                user_a_id TEXT NOT NULL,
-                user_b_id TEXT NOT NULL,
-                discussion_thread_id TEXT,
-                created_at TEXT NOT NULL,
-                PRIMARY KEY (round_id, user_a_id),
-                UNIQUE (round_id, user_b_id),
-                FOREIGN KEY (round_id) REFERENCES rounds(id) ON DELETE CASCADE
-            );
-
-            CREATE TABLE IF NOT EXISTS score_logs (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                round_id INTEGER,
-                user_id TEXT NOT NULL,
-                delta INTEGER NOT NULL,
-                reason TEXT NOT NULL,
-                created_at TEXT NOT NULL,
-                FOREIGN KEY (round_id) REFERENCES rounds(id) ON DELETE SET NULL
-            );
-"""
-
-BASELINE_VERSION = 1
-
-# 스키마 변경은 전부 여기로. 예:
-#   MIGRATIONS = {2: ["ALTER TABLE rounds ADD COLUMN foo TEXT"]}
-# 롤백 가능하도록 반드시 '추가' 형태(ADD COLUMN 등)로만 작성한다.
-MIGRATIONS: dict[int, list[str]] = {
-    # discussion_posts는 PK가 (round_id, user_id)라 유저당 한 건만 담을 수 있다.
-    # 발언 횟수 제한을 없애면서 익명 번호를 고정하려면 별도 테이블이 필요하다.
-    # (BASE_SCHEMA는 불변이므로 기존 테이블의 PK를 고칠 수 없다.)
-    2: [
-        """
-        CREATE TABLE IF NOT EXISTS discussion_messages (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            round_id INTEGER NOT NULL,
-            user_id TEXT NOT NULL,
-            anon_number INTEGER NOT NULL,
-            message_id TEXT NOT NULL,
-            content TEXT NOT NULL,
-            created_at TEXT NOT NULL,
-            FOREIGN KEY (round_id) REFERENCES rounds(id) ON DELETE CASCADE
-        )
-        """,
-    ],
-    # 음성채널 체류로 쌓이는 잠수 코인. /지목으로 소모한다.
-    3: [
-        """
-        CREATE TABLE IF NOT EXISTS afk_coins (
-            user_id TEXT PRIMARY KEY,
-            coins INTEGER NOT NULL DEFAULT 0,
-            updated_at TEXT NOT NULL,
-            FOREIGN KEY (user_id) REFERENCES users(user_id) ON DELETE CASCADE
-        )
-        """,
-    ],
-    # 유저 간 상시 1:1 러시안룰렛. 진행 상태와 예치금을 DB에 보존해 재시작 뒤에도 이어진다.
-    4: [
-        """
-        CREATE TABLE IF NOT EXISTS russian_roulette_games (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            guild_id TEXT NOT NULL,
-            channel_id TEXT NOT NULL,
-            message_id TEXT,
-            challenger_id TEXT NOT NULL,
-            target_id TEXT NOT NULL,
-            challenger_name TEXT NOT NULL,
-            target_name TEXT NOT NULL,
-            status TEXT NOT NULL CHECK (
-                status IN ('pending', 'betting', 'playing', 'finished', 'declined', 'expired')
-            ),
-            challenger_bet INTEGER,
-            target_bet INTEGER,
-            current_player_id TEXT,
-            live_chamber INTEGER CHECK (live_chamber BETWEEN 0 AND 5),
-            shots_fired INTEGER NOT NULL DEFAULT 0 CHECK (shots_fired BETWEEN 0 AND 6),
-            winner_id TEXT,
-            loser_id TEXT,
-            created_at TEXT NOT NULL,
-            expires_at REAL,
-            accepted_at TEXT,
-            finished_at TEXT,
-            FOREIGN KEY (challenger_id) REFERENCES users(user_id) ON DELETE CASCADE,
-            FOREIGN KEY (target_id) REFERENCES users(user_id) ON DELETE CASCADE
-        )
-        """,
-        """
-        CREATE INDEX IF NOT EXISTS idx_roulette_active_users
-        ON russian_roulette_games(status, challenger_id, target_id)
-        """,
-    ],
-    # 활동 로그. 사후 분석(SQL/에이전트)용 append-only 이벤트 스트림.
-    #
-    # 기존 테이블 대부분은 '현재 상태'라 덮어쓰기·삭제가 일어난다
-    # (votes는 choice를 upsert, event_participants는 취소 시 DELETE,
-    #  russian_roulette_games는 shots_fired 카운터만 증가, extra_json은 통째로 교체).
-    # 그래서 '무슨 일이 있었는지'는 그 테이블들만으로 복원할 수 없다.
-    # 이 테이블은 일어난 순간을 그대로 적재해 그 구멍을 메운다. UPDATE/DELETE 하지 않는다.
-    #
-    # FK를 걸지 않는 이유: 로그는 참조 대상이 지워져도 남아야 하고(score_logs가
-    # ON DELETE SET NULL을 쓰는 것과 같은 이유), append 비용도 줄인다.
-    5: [
-        """
-        CREATE TABLE IF NOT EXISTS activity_logs (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            created_at TEXT NOT NULL,
-            category TEXT NOT NULL,
-            action TEXT NOT NULL,
-            event_session_id INTEGER,
-            round_id INTEGER,
-            actor_user_id TEXT,
-            target_user_id TEXT,
-            payload_json TEXT NOT NULL DEFAULT '{}'
-        )
-        """,
-        """
-        CREATE INDEX IF NOT EXISTS idx_activity_event
-        ON activity_logs(event_session_id, created_at)
-        """,
-        """
-        CREATE INDEX IF NOT EXISTS idx_activity_round
-        ON activity_logs(round_id, created_at)
-        """,
-        """
-        CREATE INDEX IF NOT EXISTS idx_activity_actor
-        ON activity_logs(actor_user_id, created_at)
-        """,
-    ],
-    # 러시안룰렛 신용 유저(최소 베팅액도 못 내는 유저) 지원.
-    #
-    # roulette_win_stack: 신용 유저가 이겨도 점수는 안 오르므로 대신 쌓이는 연승 카운터.
-    # *_negative: '신용 유저였는지'는 예치 시점의 점수로 정해지는데, 예치 자체가 점수를
-    #   깎아서 정산 시점에 다시 계산할 수가 없다. 그래서 게임 시작 때 박아둔다.
-    6: [
-        "ALTER TABLE users ADD COLUMN roulette_win_stack INTEGER NOT NULL DEFAULT 0",
-        "ALTER TABLE russian_roulette_games "
-        "ADD COLUMN challenger_negative INTEGER NOT NULL DEFAULT 0",
-        "ALTER TABLE russian_roulette_games "
-        "ADD COLUMN target_negative INTEGER NOT NULL DEFAULT 0",
-        # 실탄 격발로 끝났는지 시간 초과로 끝났는지. 둘 다 shots_fired만으로는 구분되지 않는다.
-        "ALTER TABLE russian_roulette_games ADD COLUMN finish_cause TEXT",
-        # 이 판 직후의 승자 스택. 보상을 받으면 스택이 0으로 돌아가버려서, 나중에
-        # '이 판으로 몇 연승이 됐는지'를 users 테이블만 봐서는 알 수 없다.
-        "ALTER TABLE russian_roulette_games ADD COLUMN winner_stack_after INTEGER",
-    ],
-    # 야구는 한 라운드에서 3번의 선택 이력을 모두 보존해야 하므로, (round_id, user_id)를
-    # 덮어쓰는 votes 대신 투구 번호까지 PK에 포함한 전용 append 형태 테이블을 사용한다.
-    7: [
-        """
-        CREATE TABLE IF NOT EXISTS baseball_swings (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            round_id INTEGER NOT NULL,
-            pitch_number INTEGER NOT NULL CHECK (pitch_number BETWEEN 1 AND 3),
-            user_id TEXT NOT NULL,
-            display_name TEXT NOT NULL,
-            swung_at REAL NOT NULL,
-            elapsed_seconds REAL NOT NULL,
-            rank INTEGER,
-            score INTEGER NOT NULL DEFAULT 0,
-            created_at TEXT NOT NULL,
-            UNIQUE (round_id, pitch_number, user_id),
-            FOREIGN KEY (round_id) REFERENCES rounds(id) ON DELETE CASCADE,
-            FOREIGN KEY (user_id) REFERENCES users(user_id) ON DELETE CASCADE
-        )
-        """,
-        """
-        CREATE INDEX IF NOT EXISTS idx_baseball_pitch_order
-        ON baseball_swings(round_id, pitch_number, id)
-        """,
-    ],
-}
-
-SCHEMA_VERSION = max([BASELINE_VERSION, *MIGRATIONS])
-
-
-def apply_baseline_schema(conn: sqlite3.Connection) -> None:
-    """v1 베이스라인 = BASE_SCHEMA + 아래 세 개의 멱등 보정.
-
-    user_version이 도입되기 전부터 굴러온 DB들은 매 부팅마다 이 보정을 거쳐 왔다.
-    따라서 이미 존재하는 모든 DB의 실제 스키마가 곧 v1이다. 여기에 ADD COLUMN을
-    새로 끼워 넣으면 기존 DB에서 'duplicate column' 으로 터지므로 손대지 말고,
-    앞으로의 변경은 MIGRATIONS(v2~)에 추가한다.
-    """
-    conn.executescript(BASE_SCHEMA)
-    migrate_round_type_check(conn)
-    ensure_event_session_schema(conn)
-    ensure_trust_pairing_schema(conn)
-
-
-def _schema_snapshot(conn: sqlite3.Connection) -> dict[str, set[str]]:
-    tables = [
-        row[0]
-        for row in conn.execute(
-            "SELECT name FROM sqlite_master "
-            "WHERE type = 'table' AND name NOT LIKE 'sqlite_%'"
-        )
-    ]
-    return {
-        table: {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
-        for table in tables
-    }
-
-
-def canonical_schema() -> dict[str, set[str]]:
-    """베이스라인 + 모든 마이그레이션을 적용했을 때 나와야 하는 스키마."""
-    mem = sqlite3.connect(":memory:")
-    mem.row_factory = sqlite3.Row  # ensure_* 보정이 row["name"]으로 접근한다
-    try:
-        apply_baseline_schema(mem)
-        for version in range(BASELINE_VERSION + 1, SCHEMA_VERSION + 1):
-            for statement in MIGRATIONS[version]:
-                mem.execute(statement)
-        return _schema_snapshot(mem)
-    finally:
-        mem.close()
-
-
-def verify_schema() -> None:
-    """실제 DB가 코드가 기대하는 스키마를 만족하는지 확인한다.
-
-    마이그레이션을 빠뜨린 채 배포하면 봇은 정상 로그인까지 해버리고 게임 도중에
-    'no such column'으로 터진다. 부팅 시점에 미리 죽여서 배포 헬스체크가 잡아내게 한다.
-    구버전으로 롤백한 경우 DB에 모르는 컬럼이 더 있을 수 있는데, 그건 허용한다.
-    """
-    expected = canonical_schema()
-    with db() as conn:
-        actual = _schema_snapshot(conn)
-
-    problems: list[str] = []
-    for table, columns in sorted(expected.items()):
-        if table not in actual:
-            problems.append(f"테이블 누락: {table}")
-            continue
-        missing = columns - actual[table]
-        if missing:
-            problems.append(f"{table} 컬럼 누락: {', '.join(sorted(missing))}")
-
-    if problems:
-        detail = "\n  - ".join(problems)
-        raise RuntimeError(
-            f"DB 스키마가 코드와 일치하지 않습니다 (기대 v{SCHEMA_VERSION}):\n  - {detail}\n"
-            "MIGRATIONS에 변경분을 등록했는지 확인하세요."
-        )
-
-
-def init_db() -> None:
-    with db() as conn:
-        apply_baseline_schema(conn)
-
-        version = int(conn.execute("PRAGMA user_version").fetchone()[0])
-        if version == 0:
-            # 새로 만든 DB이거나, user_version 도입 이전부터 굴러온 기존 DB. 둘 다 v1이다.
-            version = BASELINE_VERSION
-            conn.execute(f"PRAGMA user_version = {BASELINE_VERSION}")
-
-        if version > SCHEMA_VERSION:
-            print(
-                f"경고: DB 스키마(v{version})가 코드(v{SCHEMA_VERSION})보다 최신입니다. "
-                "구버전으로 롤백된 상태일 수 있습니다.",
-                flush=True,
-            )
-            return
-
-        for target in range(version + 1, SCHEMA_VERSION + 1):
-            for statement in MIGRATIONS[target]:
-                conn.execute(statement)
-            conn.execute(f"PRAGMA user_version = {target}")
-            print(f"스키마 마이그레이션 적용: v{target}", flush=True)
-
-
-def migrate_round_type_check(conn: sqlite3.Connection) -> None:
-    row = conn.execute(
-        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'rounds'"
-    ).fetchone()
-    if not row or "sand" in row["sql"]:
-        return
-
-    conn.execute("PRAGMA foreign_keys = OFF")
-    conn.executescript(
-        """
-        CREATE TABLE rounds_new (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            type TEXT NOT NULL CHECK (type IN ('balance', 'bomb', 'grid', 'cutting', 'top3', 'trust', 'sand')),
-            title TEXT NOT NULL,
-            question TEXT NOT NULL,
-            option_a TEXT,
-            option_b TEXT,
-            status TEXT NOT NULL CHECK (status IN ('open', 'closed')) DEFAULT 'open',
-            channel_id TEXT,
-            message_id TEXT,
-            discussion_thread_id TEXT,
-            extra_json TEXT NOT NULL DEFAULT '{}',
-            created_at TEXT NOT NULL,
-            closed_at TEXT
-        );
-
-        INSERT INTO rounds_new
-            (id, type, title, question, option_a, option_b, status, channel_id,
-             message_id, discussion_thread_id, extra_json, created_at, closed_at)
-        SELECT
-            id, type, title, question, option_a, option_b, status, channel_id,
-            message_id, discussion_thread_id, extra_json, created_at, closed_at
-        FROM rounds;
-
-        DROP TABLE rounds;
-        ALTER TABLE rounds_new RENAME TO rounds;
-        """
-    )
-    conn.execute("PRAGMA foreign_keys = ON")
-
-
-def ensure_event_session_schema(conn: sqlite3.Connection) -> None:
-    columns = {
-        str(row["name"])
-        for row in conn.execute("PRAGMA table_info(rounds)").fetchall()
-    }
-    if "event_session_id" not in columns:
-        conn.execute("ALTER TABLE rounds ADD COLUMN event_session_id INTEGER")
-
-
-def ensure_trust_pairing_schema(conn: sqlite3.Connection) -> None:
-    columns = {
-        str(row["name"])
-        for row in conn.execute("PRAGMA table_info(trust_pairings)").fetchall()
-    }
-    if "discussion_thread_id" not in columns:
-        conn.execute("ALTER TABLE trust_pairings ADD COLUMN discussion_thread_id TEXT")
 
 
 def assign_anonymous_number(conn: sqlite3.Connection, round_id: int, user_id: str) -> int:
@@ -6260,7 +5715,7 @@ class EventBot(discord.Client):
 
     async def on_ready(self) -> None:
         print(f"Logged in as {self.user} ({self.user.id if self.user else 'unknown'})")
-        print(f"Database: {DB_PATH}")
+        print(f"Database: {config.DB_PATH}")
         if not self.auto_close_restored:
             self.auto_close_restored = True
             self.restore_auto_close_tasks()
@@ -10950,7 +10405,7 @@ def backup_database(dest: Path) -> None:
     단순 복사하면 그 내용이 빠진다. backup()은 WAL까지 반영한 일관된 스냅샷을
     만들고, 봇이 돌고 있는 중에 호출해도 안전하다.
     """
-    src = sqlite3.connect(DB_PATH, timeout=10.0)
+    src = sqlite3.connect(config.DB_PATH, timeout=10.0)
     dst = sqlite3.connect(dest)
     try:
         with dst:
@@ -10964,11 +10419,11 @@ def backup_database(dest: Path) -> None:
 @app_commands.default_permissions()
 @admin_only()
 async def backup_data(interaction: discord.Interaction) -> None:
-    if not DB_PATH.exists():
+    if not config.DB_PATH.exists():
         await interaction.response.send_message("아직 데이터베이스 파일이 없습니다.", ephemeral=True)
         return
 
-    backup_dir = DATA_DIR / "backups"
+    backup_dir = config.DATA_DIR / "backups"
     backup_dir.mkdir(parents=True, exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     backup_path = backup_dir / f"event_game_{timestamp}.sqlite3"
@@ -11053,7 +10508,7 @@ def main() -> None:
 
     init_db()
     verify_schema()
-    print(f"DB: {DB_PATH} (schema v{SCHEMA_VERSION})", flush=True)
+    print(f"DB: {config.DB_PATH} (schema v{SCHEMA_VERSION})", flush=True)
 
     # bot.run()을 우회하므로 discord.py 로깅을 직접 켠다 (journald로 흘러간다).
     discord.utils.setup_logging()
