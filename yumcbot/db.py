@@ -17,8 +17,14 @@ from __future__ import annotations
 
 import sqlite3
 from contextlib import contextmanager
+from datetime import datetime
 
 from . import config
+
+
+def now_text() -> str:
+    """DB에 저장하는 타임스탬프 포맷. created_at/updated_at 계열이 전부 이걸 쓴다."""
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 
 @contextmanager

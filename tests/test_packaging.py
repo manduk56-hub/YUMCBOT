@@ -17,8 +17,11 @@ from pathlib import Path
 from unittest.mock import patch
 
 import bot
-from yumcbot import config
+from yumcbot import activity, config, scoring
 from yumcbot import db as schema
+
+# bot.py가 재노출하는 모듈들. 새로 추출할 때마다 여기에 추가한다.
+EXTRACTED = (config, schema, activity, scoring)
 
 
 def public_names(module: types.ModuleType) -> set[str]:
@@ -36,7 +39,7 @@ class ReexportWiringTest(unittest.TestCase):
     def test_bot_reexports_are_the_same_objects(self) -> None:
         """bot이 재노출한 이름은 원본과 같은 객체여야 한다 (사본이 아니라)."""
         mismatched = []
-        for module in (config, schema):
+        for module in EXTRACTED:
             for name in public_names(module) | {"db", "init_db", "verify_schema"}:
                 if not hasattr(module, name) or not hasattr(bot, name):
                     continue
