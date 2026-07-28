@@ -11,6 +11,7 @@ from unittest.mock import AsyncMock, patch
 
 import bot
 from yumcbot import config, runtime
+from yumcbot.games import bail
 
 
 class BotRegressionTests(unittest.TestCase):
@@ -2199,7 +2200,8 @@ class BotRegressionTests(unittest.TestCase):
         self.assertEqual(extra["execution_close_at"], extra["auto_close_at"])
 
     def test_bail_rules_text_is_generated_from_constants(self) -> None:
-        with patch.object(bot, "BAIL_SINK_PENALTY_HIGH", 9):
+        # 상수를 읽는 것은 bail 모듈이다. bot의 재노출은 사본이라 갈아끼워도 안 통한다.
+        with patch.object(bail, "BAIL_SINK_PENALTY_HIGH", 9):
             self.assertIn("-9점", bot.build_bail_registration_embed(1, "배", 2).fields[1].value)
 
     def test_bail_pair_view_fits_discord_button_limits(self) -> None:

@@ -47,6 +47,7 @@ shellcheck deploy/*.sh                                # CI가 도는 배포 스�
 | `yumcbot/games/registry.py` | 게임 목록(`GameSpec`)과 정산 훅 디스패치 |
 | `yumcbot/games/pairing.py` | 메인게임 셋이 공유하는 1:1 짝 매칭·비공개 방 |
 | `yumcbot/games/baseball.py` | 야구 전체 (`/준비` 껍데기만 bot.py) |
+| `yumcbot/games/bail.py` | 가라앉는 배 전체 |
 | `bot.py` | 아직 옮기지 않은 게임들 + `EventBot` + 슬래시 명령어 + 엔트리포인트 |
 
 의존은 위에서 아래 한 방향이다. `bot.py`는 옮긴 이름을 재노출해서 기존 호출부와 테스트를 그대로
@@ -63,14 +64,17 @@ shellcheck deploy/*.sh                                # CI가 도는 배포 스�
 
 | 등록 | 쓰는 곳 | 빠뜨리면 |
 | --- | --- | --- |
-| `runtime.set_client(bot)` | `resolve_text_channel`, 타이머 스케줄 | 클릭으로 하는 조작은 멀쩡하고 타이머 경로만 죽는다 |
+| `runtime.set_client(bot)` | `resolve_text_channel`·`resolve_thread`, 타이머 스케줄 | 클릭으로 하는 조작은 멀쩡하고 타이머 경로만 죽는다 |
 | `runtime.set_round_finisher(...)` | 게임이 스스로 라운드를 끝낼 때(야구 3구 완료) | 마지막 결과만 뜨고 정산이 안 된다 |
 
 `EventBot`의 메서드가 필요할 때는 구체 타입 대신 `runtime_checkable` 프로토콜로 확인한다
-(`roulette.RouletteTimerClient`, `games.baseball.BaseballTimerClient`). **타이머 태스크 자체는
-`EventBot`이 들고 있고**(재시작 복구도 거기서 한다) 게임 모듈은 스케줄을 요청만 한다.
-프로토콜은 메서드 이름만 보므로 `EventBot` 쪽 이름이 바뀌면 `isinstance`가 조용히 False가 된다 —
-`tests/test_packaging.py`가 양쪽을 붙잡아 둔다.
+(`roulette.RouletteTimerClient`, `games.baseball.BaseballTimerClient`, `games.pairing.PairBoardClient`).
+**타이머 태스크와 진행판 락은 `EventBot`이 들고 있고**(재시작 복구도 거기서 한다) 게임 모듈은
+요청만 한다. 프로토콜은 메서드 이름만 보므로 `EventBot` 쪽 이름이 바뀌면 `isinstance`가 조용히
+False가 된다 — `tests/test_packaging.py`가 양쪽을 붙잡아 둔다.
+
+**게임 모듈의 상수를 테스트에서 갈아끼울 때는 그 모듈을 patch한다.** `patch.object(bot, "BAIL_...")`은
+bot.py의 재노출 사본만 바꾸므로 게임 모듈에 닿지 않는다 — `patch.object(bail, "BAIL_...")`이 맞다.
 
 `bot.py`에 남은 구역 순서는 대략:
 게임별 상태 전이 함수 → `EventBot` 클래스 → embed/view 빌더 → `close_round_record`(정산) →

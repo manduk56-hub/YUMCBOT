@@ -17,17 +17,44 @@
 
 from __future__ import annotations
 
+import asyncio
 import random
 import sqlite3
+from typing import Protocol, runtime_checkable
 
 import discord
 
+from .. import runtime
 from ..config import (
     MATCH_HISTORY_ROUNDS,
 )
 from ..db import (
     db,
 )
+
+
+@runtime_checkable
+class PairBoardClient(Protocol):
+    """짝 진행판을 다루는 데 필요한 클라이언트 기능. 실체는 EventBot이다.
+
+    구체 타입 대신 프로토콜로 확인하는 이유는 순환 import를 피하기 위해서다
+    (bot.py가 게임 모듈을 부른다). 프로토콜은 메서드 **이름**만 보므로 EventBot 쪽에서
+    이름이 바뀌면 `isinstance`가 조용히 False가 된다 — `tests/test_packaging.py`가
+    양쪽을 붙잡아 둔다.
+    """
+
+    def schedule_auto_close(self, round_id: int, close_at: float) -> None: ...
+
+    def sand_board_lock(self, thread_id: int) -> asyncio.Lock: ...
+
+    def release_board_lock(self, thread_id: int) -> None: ...
+
+
+def board_client() -> PairBoardClient:
+    client = runtime.get_client()
+    if not isinstance(client, PairBoardClient):
+        raise RuntimeError("짝 진행판을 다룰 수 없는 클라이언트입니다.")
+    return client
 
 
 def recent_match_pairs(

@@ -68,3 +68,19 @@ async def resolve_text_channel(channel_id: str) -> discord.TextChannel | None:
         except (discord.HTTPException, ValueError):
             return None
     return channel if isinstance(channel, discord.TextChannel) else None
+
+
+async def resolve_thread(thread_id: str) -> discord.Thread | None:
+    """1:1 비공개 방을 연다. 캐시에 없으면 가져오고, 실패하면 None.
+
+    메인게임 셋이 짝마다 스레드를 열기 때문에 같은 조회가 반복된다. 방 하나를
+    못 찾는 것은 정상 동작에 속하므로(수동 삭제·권한 변경) 예외 대신 None을 준다.
+    """
+    client = get_client()
+    try:
+        thread = client.get_channel(int(thread_id)) or await client.fetch_channel(
+            int(thread_id)
+        )
+    except (discord.HTTPException, ValueError):
+        return None
+    return thread if isinstance(thread, discord.Thread) else None

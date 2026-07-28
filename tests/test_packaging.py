@@ -19,11 +19,12 @@ from unittest.mock import patch
 import bot
 from yumcbot import activity, config, rounds, roulette, runtime, scoring, ui
 from yumcbot import db as schema
-from yumcbot.games import baseball, pairing, registry
+from yumcbot.games import bail, baseball, pairing, registry
 
 # bot.py가 재노출하는 모듈들. 새로 추출할 때마다 여기에 추가한다.
 EXTRACTED = (
-    config, schema, activity, scoring, roulette, registry, rounds, baseball, ui, pairing,
+    config, schema, activity, scoring, roulette, registry, rounds, baseball, ui,
+    pairing, bail,
 )
 
 
@@ -157,6 +158,27 @@ class BaseballWiringTest(unittest.TestCase):
     def test_prepare_command_is_registered_as_slash_command(self) -> None:
         """`/준비`가 야구를 진행시키는 유일한 입구다."""
         self.assertIsNotNone(bot.bot.tree.get_command("준비"))
+
+
+class PairGameWiringTest(unittest.TestCase):
+    """1:1 짝 게임(딜레마의 섬·모래성·가라앉는 배)이 EventBot과 이어지는 지점."""
+
+    def test_board_protocol_is_satisfied_by_event_bot(self) -> None:
+        """진행판 락과 자동 마감 타이머를 EventBot에서 빌려 쓴다.
+
+        끊기면 두 사람이 동시에 눌렀을 때 진행판이 여러 개 남거나(락), 단계가
+        제때 넘어가지 않는다(타이머). 둘 다 예외 없이 조용히 어긋난다.
+        """
+        self.assertIsInstance(bot.bot, pairing.PairBoardClient)
+
+    def test_board_protocol_rejects_unrelated_objects(self) -> None:
+        class Unrelated:
+            pass
+
+        self.assertNotIsInstance(Unrelated(), pairing.PairBoardClient)
+
+    def test_bail_settles_through_the_registry(self) -> None:
+        self.assertIs(registry.settler_for("bail"), bail.settle_bail)
 
 
 class EntrypointTest(unittest.TestCase):
