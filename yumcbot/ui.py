@@ -71,3 +71,16 @@ def member_name(guild: discord.Guild | None, user_id: str) -> str | None:
         if member:
             return member.display_name
     return None
+
+
+def vote_view(round_id: int, choices: list[tuple[str, str]]) -> discord.ui.View:
+    view = discord.ui.View(timeout=None)
+    for label, value in choices:
+        view.add_item(
+            discord.ui.Button(
+                label=label,
+                style=discord.ButtonStyle.primary,
+                custom_id=f"eventbot:vote:{round_id}:{value}",
+            )
+        )
+    return view

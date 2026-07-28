@@ -19,14 +19,37 @@ from pathlib import Path
 from unittest.mock import patch
 
 import bot
-from yumcbot import activity, config, rounds, roulette, runtime, scoring, ui
+from yumcbot import (
+    activity,
+    config,
+    discussion,
+    permissions,
+    rounds,
+    roulette,
+    runtime,
+    scoring,
+    ui,
+)
 from yumcbot import db as schema
-from yumcbot.games import bail, baseball, pairing, registry, sand, trust
+from yumcbot.games import (
+    bail,
+    balance,
+    baseball,
+    cutting,
+    defuse,
+    pairing,
+    registry,
+    sand,
+    top3,
+    trust,
+    unique_number,
+)
 
 # bot.py가 재노출하는 모듈들. 새로 추출할 때마다 여기에 추가한다.
 EXTRACTED = (
-    config, schema, activity, scoring, roulette, registry, rounds, baseball, ui,
-    pairing, bail, sand, trust,
+    config, schema, activity, scoring, roulette, registry, rounds, ui, pairing,
+    permissions, discussion,
+    bail, sand, trust, baseball, balance, cutting, defuse, top3, unique_number,
 )
 
 
@@ -179,11 +202,24 @@ class PairGameWiringTest(unittest.TestCase):
 
         self.assertNotIsInstance(Unrelated(), pairing.PairBoardClient)
 
-    def test_main_games_settle_through_the_registry(self) -> None:
+    def test_every_game_settles_through_the_registry(self) -> None:
+        """정산 훅이 없는 게임은 '더 이상 지원하지 않는 게임'으로 점수 없이 닫힌다.
+
+        `close_round_record`에 게임별 분기가 더는 없으므로, 등록을 빠뜨리면 라운드가
+        정상으로 진행되다가 마감에서만 조용히 0점이 된다.
+        """
+        for key in registry.GAMES:
+            with self.subTest(game=key):
+                self.assertIsNotNone(
+                    registry.settler_for(key), f"'{key}'의 정산 훅이 등록되지 않았습니다."
+                )
+
+    def test_main_game_settlers_live_in_their_own_modules(self) -> None:
         for key, expected in (
             ("bail", bail.settle_bail),
             ("sand", sand.settle_sand),
             ("trust", trust.settle_trust),
+            ("baseball", baseball.settle_baseball),
         ):
             with self.subTest(game=key):
                 self.assertIs(registry.settler_for(key), expected)

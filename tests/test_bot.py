@@ -11,7 +11,7 @@ from unittest.mock import AsyncMock, patch
 
 import bot
 from yumcbot import config, runtime
-from yumcbot.games import bail
+from yumcbot.games import bail, cutting
 
 
 class BotRegressionTests(unittest.TestCase):
@@ -2305,7 +2305,10 @@ class BotRegressionTests(unittest.TestCase):
         self.assertIn("2~4강화 +1점", rendered)
 
         # 상수를 바꾸면 안내문도 따라 바뀌어야 한다 (하드코딩 재발 방지).
-        with patch.object(bot, "CUTTING_REWARD_POINTS", {0: 5, 1: 5, 2: 5, 3: 5, 4: 5, 5: 5, 6: 5}):
+        # 상수를 읽는 것은 cutting 모듈이다. bot의 재노출은 사본이라 갈아끼워도 안 통한다.
+        with patch.object(
+            cutting, "CUTTING_REWARD_POINTS", {0: 5, 1: 5, 2: 5, 3: 5, 4: 5, 5: 5, 6: 5}
+        ):
             self.assertIn("0~6강화 +5점", bot.cutting_reward_text())
 
     # --- 익명 발언 ----------------------------------------------------------

@@ -43,12 +43,13 @@ shellcheck deploy/*.sh                                # CI가 도는 배포 스�
 | `yumcbot/rounds.py` | 라운드 행 조회(`round_extra`·`round_game_key`·`can_join_round` 등). 순수 조회만 |
 | `yumcbot/runtime.py` | 게임 모듈이 bot.py 쪽 기능을 부르는 통로 (아래 참고) |
 | `yumcbot/roulette.py` | 러시안룰렛 전체 |
-| `yumcbot/ui.py` | 임베드 표시 유틸(`field_text`·`close_time_text` 등). 전부 순수 함수 |
+| `yumcbot/ui.py` | 임베드 표시 유틸(`field_text`·`close_time_text`·`vote_view` 등). 전부 순수 함수 |
+| `yumcbot/permissions.py` | 운영자 판정(`is_operator_user`·`admin_only`) |
+| `yumcbot/discussion.py` | 익명 토론(스레드 발언·번호 배정·토론방 버튼판) |
 | `yumcbot/games/registry.py` | 게임 목록(`GameSpec`)과 정산 훅 디스패치 |
 | `yumcbot/games/pairing.py` | 메인게임 셋이 공유하는 1:1 짝 매칭·비공개 방 |
-| `yumcbot/games/baseball.py` | 야구 전체 (`/준비` 껍데기만 bot.py) |
-| `yumcbot/games/bail.py` · `sand.py` · `trust.py` | 메인게임 셋 |
-| `bot.py` | 아직 옮기지 않은 게임들 + `EventBot` + 슬래시 명령어 + 엔트리포인트 |
+| `yumcbot/games/*.py` | **게임 하나가 한 파일이다.** `trust`·`sand`·`bail`(메인), `balance`·`defuse`·`top3`·`unique_number`·`cutting`·`baseball`(미니) |
+| `bot.py` | `EventBot` + 슬래시 명령어 + 이벤트/라운드 생성 + 엔트리포인트 |
 
 의존은 위에서 아래 한 방향이다. `bot.py`는 옮긴 이름을 재노출해서 기존 호출부와 테스트를 그대로
 살려두고 있는데, 재노출은 사본이라 원본과 갈라질 수 있다 — `tests/test_packaging.py`가 그걸 막는다.
@@ -94,9 +95,11 @@ bot.py의 재노출 사본만 바꾸므로 게임 모듈에 닿지 않는다 —
 분류(메인/미니)·`rounds.type`·`extra_json.mode`를 **함께** 들고 있다. 저장하는 곳과 되읽는 곳이
 떨어져 있으면 한쪽만 고쳤을 때 라운드는 열리는데 정산에서 조용히 빠지므로, 그 쌍을 한 줄로 묶는다.
 
-정산은 `register_settler(key, fn)`로 훅을 올리면 `close_round_record`가 기존 if/elif보다 먼저
-그쪽으로 보낸다. 아직 훅을 올리지 않은 게임은 기존 분기로 떨어진다 — **둘이 공존하는 것이
-현재 의도된 상태다.** 게임을 하나씩 옮기는 동안 유지된다. 훅을 올린 게임은 야구뿐이다.
+정산은 각 게임 모듈이 `register_settler(key, fn)`로 훅을 올린다. **`close_round_record`에는
+게임별 분기가 더 이상 없다** — 레지스트리 디스패치와 공통 후처리(다음 미니게임 안내, 활동 로그)만
+남았다. 새 게임을 추가하면서 여기에 `elif`를 넣지 말 것. 훅을 빠뜨리면 라운드는 정상으로
+진행되다가 마감에서만 "더 이상 지원하지 않는 게임"으로 조용히 0점이 된다
+(`test_every_game_settles_through_the_registry`가 지킨다).
 
 ### 상태는 전부 SQLite에 있다 (재시작 안전성)
 
