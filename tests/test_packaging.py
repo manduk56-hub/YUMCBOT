@@ -19,9 +19,10 @@ from unittest.mock import patch
 import bot
 from yumcbot import activity, config, roulette, scoring
 from yumcbot import db as schema
+from yumcbot.games import registry
 
 # bot.py가 재노출하는 모듈들. 새로 추출할 때마다 여기에 추가한다.
-EXTRACTED = (config, schema, activity, scoring, roulette)
+EXTRACTED = (config, schema, activity, scoring, roulette, registry)
 
 
 def public_names(module: types.ModuleType) -> set[str]:

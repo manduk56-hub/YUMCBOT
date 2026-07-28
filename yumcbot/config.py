@@ -100,36 +100,9 @@ TRUST_OUTCOME_LABELS = {
     "double": "동시 배신",
     "incomplete": "미선택",
 }
-# 게임 키 집합이다 (rounds.type 값 집합이 아니다). 'bail'은 type='sand'로 저장되므로
-# `round_row["type"] in MAIN_GAME_TYPES` 검사도 그대로 통과한다. 게임을 갈라야 할 때는
-# round_game_key()를 쓴다.
-MAIN_GAME_TYPES = {"trust", "sand", "bail"}
-# 'grid'(관리자 시점 타일)는 제거된 미니게임이다. 불변인 rounds.type CHECK 제약의 grid 값은
-# extra_json.mode로 구분되는 유일 숫자 게임과 야구의 저장 타입으로 재사용한다.
-MINI_GAME_TYPES = {
-    "balance",
-    "minority_balance",
-    "defuse4",
-    "cutting",
-    "top3",
-    "unique_number",
-    "baseball",
-}
-GAME_NAMES = {
-    "balance": "밸런스 게임",
-    # 참가자에게는 1차 집계가 끝날 때까지 일반 밸런스 게임으로 보여야 한다.
-    "minority_balance": "밸런스 게임",
-    # DB 호환을 위해 내부 키는 defuse4를 유지하지만 현재 규칙은 3선 방식이다.
-    "defuse4": "몰리면 터진다!",
-    "cutting": "돌 세공 예측",
-    "top3": "상위 3명 견제",
-    "unique_number": "홍피겔만의 황금금고",
-    "baseball": "야구",
-    "trust": "딜레마의 섬",
-    "sand": "모래성 게임",
-    # DB type은 sand를 재사용하고 extra_json.mode='bail'로 갈라 쓴다.
-    "bail": "가라앉는 배",
-}
+# 게임 목록(MAIN_GAME_TYPES / MINI_GAME_TYPES / GAME_NAMES)은 yumcbot.games.registry에
+# 있다. 여기 두면 config가 최하단 레이어라는 성질이 깨진다 — 레지스트리는 정산 훅을
+# 들고 있어서 discord에 의존하는데, config는 아무것도 import 하지 않아야 한다.
 BALANCE_VOTE_CHOICES = [("A 선택", "A"), ("B 선택", "B")]
 ANONYMOUS_EMBED_COLORS = (
     # 가까운 번호끼리 색상·명도 차이가 크게 나도록 고대비 순서로 배치한다.

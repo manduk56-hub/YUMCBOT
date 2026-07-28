@@ -64,11 +64,8 @@ from yumcbot.config import (
     DEFUSE_COLOR_BY_ID,
     EMERGENCY_EXTENSION_SECONDS,
     EVENT_STATUS_LABELS,
-    GAME_NAMES,
     KST_LABEL,
-    MAIN_GAME_TYPES,
     MATCH_HISTORY_ROUNDS,
-    MINI_GAME_TYPES,
     ROULETTE_BETTING_SECONDS,
     ROULETTE_CHALLENGE_SECONDS,
     ROULETTE_DAILY_LIMIT,
@@ -108,6 +105,14 @@ from yumcbot.activity import (
     game_settings_snapshot,
     log_activity,
     user_display_name,
+)
+from yumcbot.games.registry import (
+    GAME_NAMES,
+    MAIN_GAME_TYPES,
+    MINI_GAME_TYPES,
+    SettleContext,
+    register_settler,
+    settler_for,
 )
 from yumcbot.scoring import (
     add_score,
@@ -4348,6 +4353,34 @@ async def publish_baseball_pitch_result(round_id: int, pitch_number: int) -> boo
     return True
 
 
+def settle_baseball(ctx: SettleContext) -> discord.Embed:
+    """3구 평균 순위로 한 번만 지급한다. 구별 순위(baseball_swings.score)는 표시용이다."""
+    completed_pitches = {
+        int(value) for value in ctx.extra.get("baseball_settled_pitches", [])
+    }
+    standings = baseball_final_standings(ctx.conn, ctx.round_row, completed_pitches)
+    for standing in standings:
+        score = int(standing["score"])
+        if not score:
+            continue
+        add_score(
+            ctx.conn,
+            str(standing["user_id"]),
+            str(standing["display_name"]),
+            score,
+            (
+                f"라운드 #{ctx.round_row['id']} 야구 3구 평균 "
+                f"{float(standing['average_seconds']):.2f}초 "
+                f"{standing['rank']}위"
+            ),
+            ctx.round_row["id"],
+        )
+    return build_baseball_final_result_embed(str(ctx.round_row["title"]), standings)
+
+
+register_settler("baseball", settle_baseball)
+
+
 class EventBot(discord.Client):
     def __init__(self) -> None:
         intents = discord.Intents.default()
@@ -6602,7 +6635,20 @@ def close_round_record(
             (now_text(), round_row["id"]),
         )
 
-        if round_row["type"] == "balance":
+        # 레지스트리에 정산 훅이 올라온 게임은 그쪽으로 보낸다. 아직 안 올라온 게임은
+        # 아래 기존 분기로 떨어진다 — 게임을 하나씩 옮기는 동안 둘이 공존한다.
+        settler = settler_for(round_game_key(round_row))
+        if settler is not None:
+            embed = settler(
+                SettleContext(
+                    conn=conn,
+                    round_row=round_row,
+                    extra=extra,
+                    votes=votes,
+                    guild=guild,
+                )
+            )
+        elif round_row["type"] == "balance":
             a_users = [row["user_id"] for row in votes if row["choice"] == "A"]
             b_users = [row["user_id"] for row in votes if row["choice"] == "B"]
 
@@ -6825,31 +6871,6 @@ def close_round_record(
                     ),
                     inline=False,
                 )
-        elif round_row["type"] == "grid" and extra.get("mode") == "baseball":
-            completed_pitches = {
-                int(value) for value in extra.get("baseball_settled_pitches", [])
-            }
-            standings = baseball_final_standings(conn, round_row, completed_pitches)
-            for standing in standings:
-                score = int(standing["score"])
-                if not score:
-                    continue
-                add_score(
-                    conn,
-                    str(standing["user_id"]),
-                    str(standing["display_name"]),
-                    score,
-                    (
-                        f"라운드 #{round_row['id']} 야구 3구 평균 "
-                        f"{float(standing['average_seconds']):.2f}초 "
-                        f"{standing['rank']}위"
-                    ),
-                    round_row["id"],
-                )
-            embed = build_baseball_final_result_embed(
-                str(round_row["title"]),
-                standings,
-            )
         elif round_row["type"] == "grid" and extra.get("mode") == "unique_number":
             grouped: dict[int, list[str]] = {}
             for row in votes:

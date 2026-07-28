@@ -32,9 +32,36 @@ shellcheck deploy/*.sh                                # CI가 도는 배포 스�
 
 ## 아키텍처
 
-전체 로직이 `bot.py` 한 파일에 있고, 구역 순서는 대략:
-상수/게임 설정 → 스키마·마이그레이션 → DB 헬퍼 → 게임별 상태 전이 함수 → `EventBot` 클래스 →
-embed/view 빌더 → `close_round_record`(정산) → 슬래시 명령어 → systemd 연동/엔트리포인트.
+**`bot.py` 한 파일을 `yumcbot/` 패키지로 쪼개는 중이다.** 지금은 과도기라 양쪽에 코드가 있다.
+
+| 모듈 | 담당 |
+| --- | --- |
+| `yumcbot/config.py` | 경로·환경변수·게임 튜닝 상수. 아무것도 import 하지 않는 최하단 |
+| `yumcbot/db.py` | 스키마·마이그레이션·연결(`db()`) |
+| `yumcbot/activity.py` | 활동 로그(`log_activity`), 규칙 스냅샷 |
+| `yumcbot/scoring.py` | 점수·잠수 코인·룰렛 연승 스택 |
+| `yumcbot/roulette.py` | 러시안룰렛 전체 |
+| `yumcbot/games/registry.py` | 게임 목록(`GameSpec`)과 정산 훅 디스패치 |
+| `bot.py` | 아직 옮기지 않은 나머지 + `EventBot` + 슬래시 명령어 + 엔트리포인트 |
+
+의존은 위에서 아래 한 방향이다. `bot.py`는 옮긴 이름을 재노출해서 기존 호출부와 테스트를 그대로
+살려두고 있는데, 재노출은 사본이라 원본과 갈라질 수 있다 — `tests/test_packaging.py`가 그걸 막는다.
+**경로 상수(`DB_PATH` 등)만은 재노출하지 않는다.** 사본이 있으면 테스트가 임시 DB로 갈아끼웠다고
+믿으면서 실제로는 운영 경로를 여는, 증상 없는 실패가 난다. 항상 `config.DB_PATH`를 조회한다.
+
+`bot.py`에 남은 구역 순서는 대략:
+게임별 상태 전이 함수 → `EventBot` 클래스 → embed/view 빌더 → `close_round_record`(정산) →
+슬래시 명령어 → systemd 연동/엔트리포인트.
+
+### 게임 하나를 어디에 등록하는가
+
+`yumcbot/games/registry.py`의 `GAMES`가 게임 목록의 권위다. `GameSpec` 한 줄이 게임 키·표시 이름·
+분류(메인/미니)·`rounds.type`·`extra_json.mode`를 **함께** 들고 있다. 저장하는 곳과 되읽는 곳이
+떨어져 있으면 한쪽만 고쳤을 때 라운드는 열리는데 정산에서 조용히 빠지므로, 그 쌍을 한 줄로 묶는다.
+
+정산은 `register_settler(key, fn)`로 훅을 올리면 `close_round_record`가 기존 if/elif보다 먼저
+그쪽으로 보낸다. 아직 훅을 올리지 않은 게임은 기존 분기로 떨어진다 — **둘이 공존하는 것이
+현재 의도된 상태다.** 게임을 하나씩 옮기는 동안 유지된다. 훅을 올린 게임은 야구뿐이다.
 
 ### 상태는 전부 SQLite에 있다 (재시작 안전성)
 
@@ -148,9 +175,15 @@ embed/view 빌더 → `close_round_record`(정산) → 슬래시 명령어 → s
 | 야구 | `grid` | `baseball` | `/준비` 후 비활성 3×3 판을 띄우고 3초 뒤 자동 활성화. 클릭 기록은 `baseball_swings`, 활성화 시각·조작판 메시지 ID·무작위 버튼 위치는 `extra_json`에 저장해 재시작 시 타이머 복구. 미입력은 7초로 계산하고 3구 평균 최종 순위로 한 번만 점수 지급 |
 | 가라앉는 배 | `sand` | `bail` | **모래성과 같은 타입을 쓴다.** 아래 주의 참고 |
 
-권위 있는 목록은 `MAIN_GAME_TYPES` / `MINI_GAME_TYPES` / `GAME_NAMES` 상수다. CHECK 제약이 아니다.
-이 상수들은 **게임 키 집합**이지 `rounds.type` 값 집합이 아니다 (`MAIN_GAME_TYPES`에 `bail`이 있지만
-그런 `type` 값은 DB에 없다). 게임을 갈라야 할 때는 `round_game_key(round_row)`를 쓴다.
+권위 있는 목록은 `yumcbot/games/registry.py`의 `GAMES`다. CHECK 제약이 아니다.
+`MAIN_GAME_TYPES` / `MINI_GAME_TYPES` / `GAME_NAMES`는 거기서 파생되며, **게임 키 집합**이지
+`rounds.type` 값 집합이 아니다 (`MAIN_GAME_TYPES`에 `bail`이 있지만 그런 `type` 값은 DB에 없다).
+게임을 갈라야 할 때는 `round_game_key(round_row)`를 쓴다.
+
+> 다만 호출부 몇 곳은 `round_row["type"] in MAIN_GAME_TYPES`처럼 **type으로도** 검사한다.
+> 메인게임의 저장 타입이 마침 전부 그 키 집합 안에 있어서(`bail`은 `sand`) 우연히 통과하는 것이다.
+> 새 메인게임을 다른 저장 타입으로 추가하면 그 검사만 조용히 False가 된다 —
+> `test_main_game_keys_double_as_round_types`가 지키고 있다.
 
 **`bail`은 `sand`와 타입이 겹치는 첫 사례다.** `type == "sand"`로 분기하는 코드는 모래성과 가라앉는 배를
 구분하지 못한다. 새 코드를 넣을 때 다음을 확인한다:
