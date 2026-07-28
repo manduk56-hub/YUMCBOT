@@ -188,8 +188,18 @@ BAIL_REWARD_POOL = 10  # 배가 뜨면 두 사람이 나눠 받는 구조 보상
 BAIL_REWARD_CHOICES = [str(index) for index in range(BAIL_REWARD_POOL + 1)]  # 0~10
 BAIL_FAILED_REWARD_POOL = 6  # 협상 결렬 시 감액된 보상금 (둘이 균등 분배)
 BAIL_REQUIRED_SCOOPS = 6  # 배가 뜨는 데 필요한 두 사람 합계 퍼내기 횟수
-BAIL_SCOOP_CHOICES = [str(index) for index in range(BAIL_REQUIRED_SCOOPS + 1)]  # 0~6
 BAIL_SCOOP_COST = 1  # 퍼내기 1회당 차감
+BAIL_PROGRESS_UPDATE_INTERVAL = 2  # 공동 진행 상황 메시지는 합계가 이 배수를 지날 때만 갱신
+# 문턱값 미만 구간은 직전 문턱의 이미지를 그대로 보여준다 (합계 0/2/4일 때만 갱신되고 홀수는 건너뜀).
+# 파일은 assets/에 있다 (bail_0.png · bail_2.png · bail_4.png · bail_6.png · bail_fail.png).
+BAIL_PROGRESS_STAGES: list[tuple[int, str]] = [
+    (0, "bail_0.png"),
+    (2, "bail_2.png"),
+    (4, "bail_4.png"),
+]
+BAIL_PROGRESS_SUCCESS_IMAGE = "bail_6.png"
+BAIL_PROGRESS_SUNK_IMAGE = "bail_fail.png"
+BAIL_PROGRESS_SUNK_CAPTION = "크아악!!💢💢"  # 침몰 이미지 아래에 큰 글씨로 한 줄 더 붙인다
 # 침몰 페널티는 보상 몫에 비례한다. 많이 받기로 한 쪽이 더 크게 잃어야
 # "협상에서 욕심낸 만큼 침몰 리스크를 진다"가 성립하고, 적게 받은 쪽에 배신 카드가 생긴다.
 BAIL_SINK_PENALTY_HIGH = 4  # 보상 몫이 많은 쪽
@@ -198,7 +208,6 @@ BAIL_SINK_PENALTY_EVEN = 3  # 몫이 같을 때 (결렬 포함)
 BAIL_NEGOTIATION_MAX_OFFERS = 3  # 교대 제안 최대 횟수
 BAIL_DEFAULT_NEGOTIATION_MINUTES = 5
 BAIL_DEFAULT_EXECUTION_MINUTES = 3
-BAIL_FALLBACK_SCOOPS = BAIL_REQUIRED_SCOOPS // 2  # 실행 단계 미제출 시의 자동 제출값
 BAIL_OUTCOME_LABELS = {
     "survived": "생존",
     "sunk": "침몰",
@@ -875,7 +884,7 @@ def game_settings_snapshot(game_key: str) -> dict[str, Any]:
         settings["sink_penalty_low"] = BAIL_SINK_PENALTY_LOW
         settings["sink_penalty_even"] = BAIL_SINK_PENALTY_EVEN
         settings["max_offers"] = BAIL_NEGOTIATION_MAX_OFFERS
-        settings["fallback_scoops"] = BAIL_FALLBACK_SCOOPS
+        settings["progress_update_interval"] = BAIL_PROGRESS_UPDATE_INTERVAL
         settings["match_history_rounds"] = MATCH_HISTORY_ROUNDS
     elif game_key == "unique_number":
         settings["number_choices"] = UNIQUE_NUMBER_CHOICES
@@ -3283,17 +3292,26 @@ async def handle_sand_action(
 # 가라앉는 배 (bail) — 협상 → 실행 2단계 메인게임
 #
 # 모래성과 같은 1:1 비공개 방 구조를 쓰지만 단계가 하나 더 있다.
-#   registration → negotiation(교대 제안) → execution(동시 비공개 제출) → scored
+#   registration → negotiation(교대 제안) → execution(실시간 클릭 퍼내기) → scored
 # 협상에서 맺은 합의는 기록만 되고 점수에 영향이 없다. 그게 이 게임의 핵심 규칙이라
-# 정산은 오직 execution 단계의 제출값만 본다.
+# 정산은 오직 execution 단계의 실제 퍼내기 횟수만 본다.
 #
-# execution 단계는 **조기 종료가 없다.** 협상은 모든 방이 끝나면 바로 넘어가지만, 퍼내기는
-# 두 사람이 다 제출해도 제한 시간을 끝까지 쓰고 마감 시점에 한꺼번에 정산한다. 제출 인원수를
-# 진행판에 세지 않는 것과 한 묶음이다 — 결과가 뜨는 시점이나 "1/2" 표시 중 하나라도 남으면
-# 상대가 제출했는지가 새고, 그러면 비공개 제출이 눈치싸움으로 바뀐다.
-# 대신 방 안에서 남은 시간을 알 수 없어지므로 마감 카운트다운을 방마다 띄운다.
-# 정산이 마감에만 일어나므로 제출은 그때까지 몇 번이든 덮어쓸 수 있다(`apply_bail_scoop`).
-# 번복해도 진행판이 변하지 않아 상대는 알아챌 수 없다 — 위 두 규칙이 무너지면 번복 허용도 못 쓴다.
+# execution 단계는 방(짝) 단위로 조기 정산된다. 협상은 모든 방이 끝나면 바로 넘어가고,
+# 퍼내기는 `🪣 퍼내기` 버튼을 누른 횟수가 그대로 두 사람의 누적치로 쌓이다가 합계가
+# `BAIL_REQUIRED_SCOOPS`에 도달하는 즉시 그 짝만 정산되어 결과가 공개된다 (`handle_bail_scoop`).
+# 다만 실제 점수 지급(`add_score`)은 지금도 라운드 마감(`close_round_record`) 시점에 다른
+# 방들과 함께 한 번에 일어난다 — 조기 정산은 '승패가 확정되고 그 방에 공개되는 시점'만
+# 앞당길 뿐이고, 점수 반영 경로를 둘로 나누면 이중 지급 위험이 생긴다. 아직 못 채운 방은
+# 예전처럼 제한 시간을 끝까지 쓰고 마감 시점에 확정된다. 다만 마지막 짝까지 정산되면
+# (`bail_executions_complete`) 라운드 전체도 마감을 기다리지 않고 즉시 끝난다
+# (`finish_bail_execution_round`) — 협상 단계의 방 전체 조기 전이와 같은 논리다.
+#
+# 둘이 합쳐 몇 번 퍼냈는지는 방 안의 공동 진행 상황 임베드(`build_bail_progress_embed`)로
+# 실시간 공개된다 — 다만 그 메시지는 합계가 2회 지날 때마다만 갱신된다
+# (`BAIL_PROGRESS_UPDATE_INTERVAL`). **누가 몇 번 퍼냈는지(개인별 분담)는 정산 전까지 여전히
+# 감춰진다** — 그게 새면 무임승차 여부가 미리 드러나 배신 유인이 무너진다. 두 사람이 거의
+# 동시에 눌러도 누적이 씹히지 않고, 정산·결과 공개·방 잠금이 겹쳐 쓰이지 않도록 클릭 처리
+# 전체를 `bot.sand_board_lock`으로 직렬화한다.
 # ---------------------------------------------------------------------------
 
 
@@ -3307,10 +3325,12 @@ def bail_rules_text() -> str:
         f"각각 **{BAIL_FAILED_REWARD_POOL // 2}점**씩 받습니다.\n"
         "\n"
         "**🪣 2차 결정 · 물 퍼내기**\n"
-        f"**1** ─ 배가 뜨려면 두 사람이 합쳐 **{BAIL_REQUIRED_SCOOPS}번**을 퍼내야 하며, 횟수를 서로 배분해야 합니다.\n"
-        "**2** ─ 이 선택은 **상대에게 보이지 않습니다.** 제출했는지 여부조차 표시되지 않습니다.\n"
-        "**3** ─ 마감 전까지 **몇 번이든 다시 고를 수 있고**, 마지막에 누른 값만 반영됩니다.\n"
-        "**4** ─ 결과는 실행 마감 시각에 두 방 모두 한꺼번에 공개됩니다.\n"
+        f"**1** ─ 배가 뜨려면 두 사람이 합쳐 **{BAIL_REQUIRED_SCOOPS}번**을 퍼내야 하며, "
+        "각자 방에 뜨는 **`🪣 퍼내기`** 버튼을 눌러 실시간으로 채웁니다.\n"
+        "**2** ─ 둘이 합쳐 몇 번 퍼냈는지는 공동 진행 상황 메시지로 보이지만, "
+        "**누가 몇 번 퍼냈는지는 끝나기 전까지 보이지 않습니다.**\n"
+        f"**3** ─ 필요한 횟수를 채우면 **그 즉시** 배가 뜨고 결과가 공개됩니다. "
+        "못 채운 채 실행 제한 시간이 끝나면 침몰합니다.\n"
         "\n"
         f"> 🪣 퍼내기 **1회당 -{BAIL_SCOOP_COST}점**입니다.\n"
         "> ⛵ 퍼내기를 성공하여 배가 뜨면 이전에 배분한 점수를 받습니다.\n"
@@ -3420,25 +3440,97 @@ def apply_bail_response(pair: dict[str, Any], user_id: str, accepted: bool) -> s
     return "거절했습니다. 이제 내가 제안할 차례입니다."
 
 
-def apply_bail_scoop(pair: dict[str, Any], user_id: str, scoops: int) -> int | None:
-    """실행 단계 제출을 적용하고 **직전 값**을 돌려준다 (첫 제출이면 None).
-
-    마감 전까지 몇 번이든 덮어쓸 수 있다. 진행판이 제출 여부를 세지 않고 정산도 마감에만
-    일어나므로, 번복을 허용해도 상대가 알아챌 경로가 없다.
+def apply_bail_scoop_click(pair: dict[str, Any], user_id: str) -> int:
+    """퍼내기 버튼 클릭 1회 = 그 사람의 누적 횟수 +1. 되돌릴 수 없는 실제 행동이라
+    번호를 선언하던 예전과 달리 덮어쓰기 개념이 없다. 갱신된 **본인 누적 횟수**를 돌려준다.
     """
     key = "scoop_a" if user_id == str(pair["user_a_id"]) else "scoop_b"
-    previous = pair.get(key)
-    pair[key] = scoops
-    return None if previous is None else int(previous)
+    pair[key] = int(pair.get(key) or 0) + 1
+    return pair[key]
+
+
+def bail_progress_stage_image(total: int) -> str:
+    """공동 진행 상황 이미지 파일명. 필요 횟수에 도달하면 성공 이미지를 돌려준다."""
+    if total >= BAIL_REQUIRED_SCOOPS:
+        return BAIL_PROGRESS_SUCCESS_IMAGE
+    image = BAIL_PROGRESS_STAGES[0][1]
+    for threshold, filename in BAIL_PROGRESS_STAGES:
+        if total >= threshold:
+            image = filename
+    return image
+
+
+def bail_progress_stage_index(total: int) -> int | None:
+    """지금 보이는 이미지가 `BAIL_PROGRESS_STAGES`의 몇 번째(1부터)인지. 필요 횟수에 도달해
+    성공 이미지로 바뀌었으면(더 이상 '단계'가 아니라 결과이므로) None을 돌려준다."""
+    if total >= BAIL_REQUIRED_SCOOPS:
+        return None
+    index = 1
+    for position, (threshold, _filename) in enumerate(BAIL_PROGRESS_STAGES, start=1):
+        if total >= threshold:
+            index = position
+    return index
+
+
+def bail_progress_image_filename(pair: dict[str, Any]) -> str:
+    """짝 하나의 공동 진행 상황 이미지 파일명. 정산된 뒤에는 최종 결과 이미지로 고정된다."""
+    if str(pair.get("phase")) == "resolved":
+        if str(pair.get("outcome")) == "survived":
+            return BAIL_PROGRESS_SUCCESS_IMAGE
+        return BAIL_PROGRESS_SUNK_IMAGE
+    total = int(pair.get("scoop_a") or 0) + int(pair.get("scoop_b") or 0)
+    return bail_progress_stage_image(total)
+
+
+def build_bail_progress_embed(pair: dict[str, Any]) -> discord.Embed:
+    """공동 진행 상황 메시지 임베드.
+
+    문구 대신 단계별 이미지(0/2/4/6/fail)를 크게 보여준다 — 물이 차오르는 급박함이 그림
+    한 장으로 한눈에 들어와야 한다. 단계(1/2/3)는 이미지가 아니라 참고용이라 각주로만 작게
+    붙인다. 이미지는 URL이 아니라 첨부파일이므로, 호출자가 `bail_progress_image_filename`으로
+    같은 파일명을 `discord.File`로 함께 보내야 실제로 뜬다(`write_bail_progress_message`).
+    """
+    embed = discord.Embed(color=BAIL_EMBED_COLOR)
+    embed.set_image(url=f"attachment://{bail_progress_image_filename(pair)}")
+    if str(pair.get("phase")) != "resolved":
+        total = int(pair.get("scoop_a") or 0) + int(pair.get("scoop_b") or 0)
+        stage_index = bail_progress_stage_index(total)
+        if stage_index is not None:
+            embed.set_footer(text=f"단계 {stage_index}/{len(BAIL_PROGRESS_STAGES)}")
+    return embed
+
+
+def build_bail_progress_embeds(pair: dict[str, Any]) -> list[discord.Embed]:
+    """공동 진행 상황 메시지에 실제로 붙일 임베드 목록.
+
+    침몰이면 사진 밑에 큰 문구를 한 줄 더 붙인다 — 임베드 하나로는 이미지 아래에 텍스트를
+    둘 수 없어서(설명은 이미지보다 위에 뜬다), 문구만 담은 두 번째 임베드를 이어 붙여
+    이미지 바로 아래에 오게 한다.
+    """
+    embeds = [build_bail_progress_embed(pair)]
+    if str(pair.get("phase")) == "resolved" and str(pair.get("outcome")) != "survived":
+        embeds.append(
+            discord.Embed(description=f"# {BAIL_PROGRESS_SUNK_CAPTION}", color=BAIL_EMBED_COLOR)
+        )
+    return embeds
 
 
 def bail_negotiations_complete(extra: dict[str, Any]) -> bool:
-    """조기 전이는 협상 단계에만 있다. 실행 단계는 제한 시간을 끝까지 쓰므로 짝(sand의
-    sand_games_complete 같은) '모두 끝났나' 판정을 두지 않는다."""
+    """모든 짝이 협상을 마쳤는가 — 협상 → 실행 조기 전이 판정에 쓴다."""
     pairs = extra.get("bail_pairs", [])
     return bool(pairs) and all(
         str(pair.get("phase")) in {"submitting", "resolved"} for pair in pairs
     )
+
+
+def bail_executions_complete(extra: dict[str, Any]) -> bool:
+    """모든 짝이 정산까지 끝났는가 — 실행 단계 조기 마감 판정에 쓴다.
+
+    협상과 달리 실행은 짝 단위로 조기 정산되므로(`handle_bail_scoop`), 이 판정은 라운드
+    전체를 마감할지를 결정한다 — 마지막 짝까지 끝나면 남은 시간을 기다리지 않는다.
+    """
+    pairs = extra.get("bail_pairs", [])
+    return bool(pairs) and all(str(pair.get("phase")) == "resolved" for pair in pairs)
 
 
 def resolve_bail_pair(pair: dict[str, Any]) -> None:
@@ -3479,15 +3571,16 @@ def resolve_bail_pair(pair: dict[str, Any]) -> None:
 
 
 def autocomplete_bail_pair(pair: dict[str, Any]) -> bool:
-    """마감 시점에 안 끝난 짝을 자동으로 확정한다. 실제로 자동으로 채운 게 있으면 True.
+    """마감 시점에 필요 횟수를 못 채우고 남은 짝을 자동으로 확정한다. 실제로 자동 처리한 게 있으면 True.
 
-    노동은 약속 대상이 아니라 기준으로 삼을 합의가 없다. 절반(BAIL_FALLBACK_SCOOPS)으로 채운다 —
-    0으로 박으면 잠수 한 명이 상대까지 침몰시키고, 랜덤은 침몰 확률이 지나치게 높다.
-    협상 중이었다면 결렬로 처리되어 감액된 보상금을 균등 분배받는다.
+    퍼내기는 이제 실시간 클릭이라 '미제출'이라는 상태가 없다 — 안 누르면 0일 뿐이고 이미
+    유효한 값이다. 그래서 예전처럼 절반으로 채우는 자동 제출은 하지 않는다. 여기서 자동 처리할
+    대상은 응답 없이 남은 협상뿐이다: 대기 중인 제안이나 끝나지 않은 협상은 결렬로 처리해
+    감액된 보상금을 균등 분배받는다.
 
-    실행 단계는 두 사람이 다 제출해도 마감까지 기다렸다가 여기서 정산한다. 그래서 **정상적으로
-    둘 다 제출한 짝도 이 함수를 거친다** — `auto_completed`를 무조건 세우면 모든 방이 '자동 제출'로
-    표시되므로, 빈칸을 실제로 메웠을 때만 세운다.
+    필요 횟수에 도달해 이미 조기 정산된 짝(`resolve_bail_pair`가 먼저 불린 경우)은 여기서 다시
+    건드리지 않는다 — `auto_completed`를 무조건 세우면 모든 방이 '자동 처리'로 표시되므로,
+    실제로 협상을 결렬 처리했을 때만 세운다.
     """
     if str(pair.get("phase")) == "resolved":
         return False
@@ -3497,8 +3590,7 @@ def autocomplete_bail_pair(pair: dict[str, Any]) -> bool:
     pair["offer"] = None
     for key in ("scoop_a", "scoop_b"):
         if pair.get(key) is None:
-            pair[key] = BAIL_FALLBACK_SCOOPS
-            auto_filled = True
+            pair[key] = 0
     if auto_filled:
         pair["auto_completed"] = True
     resolve_bail_pair(pair)
@@ -3514,20 +3606,25 @@ def bail_score_text(delta: int) -> str:
 
 
 def bail_pair_settlement_text(pair: dict[str, Any]) -> str:
-    """짝 하나의 정산 문구. 라운드 요약과 방별 결과 공개가 같은 문구를 쓴다."""
+    """짝 하나의 정산 문구. 라운드 요약과 방별 결과 공개가 같은 문구를 쓴다.
+
+    이 짝을 소개하는 줄(`<@user_a> ↔ <@user_b>`)이 항상 먼저 나오므로, 여기서는 멘션을
+    반복하지 않고 그 줄과 같은 좌/우 순서로 값만 "/"로 나열한다 — 이름을 매 줄 반복하면
+    짝이 여럿인 요약에서 가독성이 떨어진다.
+    """
     result = pair.get("result")
     if not result:
         return "점수 변동 없음"
     return (
-        f"<@{pair['user_a_id']}> {bail_score_text(int(result['score_a']))} · "
-        f"<@{pair['user_b_id']}> {bail_score_text(int(result['score_b']))}"
+        f"{bail_score_text(int(result['score_a']))} / {bail_score_text(int(result['score_b']))}"
     )
 
 
 def bail_split_text(pair: dict[str, Any]) -> str:
-    """보상 배분과 실제 퍼낸 횟수를 나란히 보여준다.
+    """보상 배분과 실제 퍼낸 횟수를 나란히 보여준다. `bail_pair_settlement_text`와 같은 이유로
+    멘션을 반복하지 않고 좌(user_a)/우(user_b) 값만 "/"로 나열한다.
 
-    돈은 많이 받고 일은 덜 한 사람에게 ⚠️를 붙인다. 무임승차가 공개 기록으로 남는 것이
+    돈은 많이 받고 일은 덜 한 사람의 값에 ⚠️를 붙인다. 무임승차가 공개 기록으로 남는 것이
     이벤트 전체에 걸친 평판 장치다.
     """
     split = pair.get("reward_split")
@@ -3537,22 +3634,16 @@ def bail_split_text(pair: dict[str, Any]) -> str:
     share_b = bail_reward_share(pair, "user_b")
 
     if split:
-        lines = [
-            f"보상 배분: <@{pair['user_a_id']}> {share_a}점 · <@{pair['user_b_id']}> {share_b}점"
-        ]
+        lines = [f"🤝 보상 배분 {share_a}점 / {share_b}점"]
     else:
-        lines = [f"보상 배분: **결렬** → 각자 {share_a}점"]
+        lines = [f"🤝 보상 배분 **결렬** → {share_a}점 / {share_b}점"]
 
     if scoop_a is not None and scoop_b is not None:
-        marks = []
-        for user_key, share, other_share, scoop, other_scoop in (
-            ("user_a_id", share_a, share_b, int(scoop_a), int(scoop_b)),
-            ("user_b_id", share_b, share_a, int(scoop_b), int(scoop_a)),
-        ):
-            # 보상은 더 받으면서 노동은 덜 한 쪽.
-            mark = " ⚠️" if share > other_share and scoop < other_scoop else ""
-            marks.append(f"<@{pair[user_key]}> {scoop}번{mark}")
-        lines.append(f"실제 퍼내기: {' · '.join(marks)}")
+        scoop_a, scoop_b = int(scoop_a), int(scoop_b)
+        # 보상은 더 받으면서 노동은 덜 한 쪽에만 표시한다.
+        mark_a = " ⚠️" if share_a > share_b and scoop_a < scoop_b else ""
+        mark_b = " ⚠️" if share_b > share_a and scoop_b < scoop_a else ""
+        lines.append(f"🪣 실제 퍼내기 {scoop_a}번{mark_a} / {scoop_b}번{mark_b}")
     return "\n".join(lines)
 
 
@@ -3683,6 +3774,9 @@ def start_bail_execution(round_id: int) -> dict[str, Any] | None:
             if str(pair.get("phase")) == "negotiating":
                 # 대기 중인 제안은 응답 없이 사라진다. 합의가 없는 채로 실행 단계로 간다.
                 pair.update({"offer": None, "phase": "submitting"})
+            # 퍼내기는 이제 실시간 클릭 누적이라 0부터 시작한다 (None은 "아직 실행 전"일 뿐이다).
+            pair["scoop_a"] = 0
+            pair["scoop_b"] = 0
 
         execution_seconds = int(
             extra.get("execution_seconds") or BAIL_DEFAULT_EXECUTION_MINUTES * 60
@@ -3718,7 +3812,8 @@ def bail_pair_intro(user_a_id: str, user_b_id: str) -> str:
         f"> **1** ─ 구조 보상금 {BAIL_REWARD_POOL}점을 **어떻게 나눌지** 협상하세요. "
         "수락하면 확정됩니다.\n"
         f"> **2** ─ 배가 뜨려면 둘이 합쳐 {BAIL_REQUIRED_SCOOPS}번 퍼내야 하는데, "
-        "**누가 몇 번 퍼낼지는 약속하지 않습니다** — 각자 비공개로 제출합니다."
+        "**누가 몇 번 퍼낼지는 약속하지 않습니다** — 각자 버튼을 눌러 실시간으로 채우고, "
+        "다 채우면 그 자리에서 바로 정산됩니다."
     )
 
 
@@ -3853,6 +3948,92 @@ async def refresh_bail_pair_board(interaction: discord.Interaction, round_id: in
     await redraw_bail_pair_board(round_id, channel, str(interaction.user.id))
 
 
+def save_bail_pair_progress_message_id(round_id: int, pair: dict[str, Any], message_id: str) -> None:
+    with db() as conn:
+        round_row = conn.execute("SELECT * FROM rounds WHERE id = ?", (round_id,)).fetchone()
+        if not round_row:
+            return
+        extra = round_extra(round_row)
+        target = find_bail_pair(extra, str(pair["user_a_id"]))
+        if not target:
+            return
+        target["progress_message_id"] = message_id
+        conn.execute(
+            "UPDATE rounds SET extra_json = ? WHERE id = ?",
+            (json.dumps(extra, ensure_ascii=False), round_id),
+        )
+
+
+async def write_bail_progress_message(
+    round_id: int,
+    thread: discord.Thread,
+    pair: dict[str, Any],
+) -> None:
+    """공동 진행 상황 메시지를 실제로 fetch/edit하거나 새로 보낸다.
+
+    호출자가 이미 `bot.sand_board_lock(thread.id)`를 잡고 있어야 한다 (락은 재진입이 안 되므로
+    여기서 다시 잡지 않는다) — `handle_bail_scoop`가 상태 변경과 같은 락 구간에서 바로 호출한다.
+    """
+    embeds = build_bail_progress_embeds(pair)
+    view = bail_progress_view(round_id, pair)
+    image_filename = bail_progress_image_filename(pair)
+    image_path = BASE_DIR / "assets" / image_filename
+
+    message_id = str(pair.get("progress_message_id") or "")
+    if message_id:
+        try:
+            message = await thread.fetch_message(int(message_id))
+            # attachments로 첨부 목록을 통째로 바꿔야 이전 단계 이미지가 새 이미지로 실제 교체된다.
+            # content=None으로 예전에 plain text로 보냈을 수도 있는 메시지의 잔여 텍스트도 지운다.
+            await message.edit(
+                content=None,
+                embeds=embeds,
+                view=view,
+                attachments=[discord.File(image_path, filename=image_filename)],
+            )
+            return
+        except (discord.NotFound, discord.HTTPException, ValueError):
+            pass
+
+    try:
+        new_message = await thread.send(
+            embeds=embeds,
+            view=view,
+            file=discord.File(image_path, filename=image_filename),
+        )
+    except discord.HTTPException:
+        return
+    save_bail_pair_progress_message_id(round_id, pair, str(new_message.id))
+
+
+async def redraw_bail_progress_board(
+    round_id: int,
+    thread: discord.Thread,
+    pair_user_id: str,
+) -> None:
+    """실행 단계 시작 시 짝별 공동 진행 상황 메시지를 만든다(이미 있으면 제자리에서 고쳐 쓴다).
+
+    두 사람이 동시에 클릭할 수 있으므로 락을 잡고 DB에서 현재 상태를 다시 읽는다.
+    (락 dict는 `redraw_bail_pair_board`/모래성과 공유한다 — 키가 thread_id라 서로 충돌하지 않는다.)
+    """
+    async with bot.sand_board_lock(thread.id):
+        with db() as conn:
+            round_row = conn.execute("SELECT * FROM rounds WHERE id = ?", (round_id,)).fetchone()
+        if not round_row:
+            return
+        extra = round_extra(round_row)
+        pair = find_bail_pair(extra, pair_user_id)
+        if not pair:
+            return
+        await write_bail_progress_message(round_id, thread, pair)
+
+
+async def refresh_all_bail_progress_boards(round_id: int) -> None:
+    """실행 단계로 전이할 때 모든 방에 공동 진행 상황 메시지를 새로 띄운다."""
+    for pair, thread in await bail_pair_threads(round_id):
+        await redraw_bail_progress_board(round_id, thread, str(pair["user_a_id"]))
+
+
 async def bail_pair_threads(round_id: int) -> list[tuple[dict[str, Any], discord.Thread]]:
     """짝별 비공개 방 스레드를 모아 온다. 진행판 일괄 갱신과 마감 카운트다운이 함께 쓴다."""
     with db() as conn:
@@ -3921,6 +4102,13 @@ async def publish_bail_pair_results(round_id: int) -> None:
             thread = bot.get_channel(int(thread_id)) or await bot.fetch_channel(int(thread_id))
             if not isinstance(thread, discord.Thread):
                 continue
+            # 필요 횟수를 채워 조기 정산된 방은 그 자리에서 이미 결과를 공개하고 잠갔다
+            # (handle_bail_scoop). 여기서 또 보내면 결과가 두 번 뜨므로 건너뛴다.
+            if pair.get("result_published"):
+                continue
+            # 마감까지 못 채운 방은 여기서 처음 확정되므로, 결과를 보내기 전에 공동 진행
+            # 상황 메시지를 최종 문구(성공/침몰, 버튼 제거)로 먼저 갱신한다.
+            await write_bail_progress_message(round_id, thread, pair)
             if thread.archived:
                 await thread.edit(archived=False, reason="가라앉는 배 결과 공개")
             await thread.send(embed=build_bail_pair_result_embed(title, pair))
@@ -3963,6 +4151,7 @@ async def advance_or_finish_bail_round(
         if transition:
             bot.schedule_auto_close(round_id, float(transition["close_at"]))
             await refresh_all_bail_pair_boards(round_id)
+            await refresh_all_bail_progress_boards(round_id)
             await refresh_main_bail_board(round_id)
             channel = await resolve_text_channel(channel_id)
             if channel is not None:
@@ -3975,11 +4164,42 @@ async def advance_or_finish_bail_round(
                     pass
             return
 
-    # 실행 단계는 조기 종료가 없다. 두 사람이 다 제출해도 마감 시각까지 기다렸다가
-    # auto_close_round(또는 /라운드마감)가 모든 방을 한꺼번에 정산한다 — 여기서 일찍 닫으면
-    # 결과가 뜨는 시점만으로 상대의 제출 여부가 드러나 비공개 제출이 깨진다.
+    # 아직 이 방(또는 다른 방)의 협상이 안 끝났다 — 진행판만 갱신하고 기다린다.
+    # (실행 단계의 퍼내기는 이 함수를 거치지 않는다. `handle_bail_scoop`가 따로 처리한다.)
     await refresh_bail_pair_board(interaction, round_id)
     await refresh_main_bail_board(round_id)
+
+
+async def finish_bail_execution_round(round_id: int, guild: discord.Guild | None) -> None:
+    """모든 짝이 정산을 마쳤으면 마감 시각을 기다리지 않고 라운드 전체를 즉시 마감한다.
+
+    `auto_close_round`가 자연 마감 때 하는 마무리 절차와 동일한 순서를 따른다. 예약된 자동
+    마감 타이머가 있으면 취소한다 — 취소하지 않아도 그 타이머는 나중에 상태가 이미
+    `closed`인 것을 보고 조용히 넘어가지만(`close_round_record`의 `status == 'open'` 확인),
+    불필요한 카운트다운을 막기 위해 여기서 먼저 정리한다.
+    """
+    task = bot.auto_close_tasks.pop(round_id, None)
+    if task:
+        task.cancel()
+
+    result = close_round_record(round_id, guild, closed_by="전원 완료")
+    if not result:
+        return
+
+    channel_id, embed = result
+    await publish_bail_pair_results(round_id)
+    with db() as conn:
+        row = conn.execute("SELECT * FROM rounds WHERE id = ?", (round_id,)).fetchone()
+    if not row:
+        return
+    await archive_round_discussion_thread(row, reason="라운드 종료 후 영구 보관")
+    channel = await resolve_text_channel(channel_id)
+    if channel is not None:
+        try:
+            await channel.send(embed=embed, view=planned_mini_game_view(round_id))
+        except discord.HTTPException:
+            pass
+    await publish_event_summary_if_complete(row["event_session_id"])
 
 
 def load_open_bail_pair(
@@ -4138,71 +4358,110 @@ async def handle_bail_response(
     )
 
 
-async def handle_bail_scoop(
-    interaction: discord.Interaction,
-    round_id: int,
-    scoops: int,
-) -> None:
+async def handle_bail_scoop(interaction: discord.Interaction, round_id: int) -> None:
+    """퍼내기 버튼 클릭 1회 = 이 사람의 누적 횟수 +1.
+
+    번호를 미리 선언하던 예전과 달리 실시간으로 쌓이고, 두 사람 합이 필요 횟수에 도달하면
+    **그 자리에서 바로** 이 짝을 정산해 방에 결과를 공개한다. 다만 실제 점수 지급(`add_score`)은
+    지금도 라운드 마감(`close_round_record`) 시점에 다른 짝들과 함께 한 번에 일어난다 — 조기
+    정산은 '이 짝의 승패가 확정되고 방에 공개되는 시점'만 앞당길 뿐이다. 점수 반영 경로를
+    둘로 나누면 이중 지급 위험이 생기므로, 여기서는 `resolve_bail_pair`로 결과만 확정하고
+    `result_published`만 남겨 `close_round_record`/`publish_bail_pair_results`가 그대로 이어받게 한다.
+
+    두 사람이 거의 동시에 눌러도 누적이 씹히지 않도록, 그리고 정산 직후의 진행 상황/결과
+    메시지가 겹쳐 쓰이지 않도록 클릭 처리부터 결과 공개까지를 `bot.sand_board_lock`으로 직렬화한다.
+    """
     user_id = str(interaction.user.id)
-    with db() as conn:
-        loaded = load_open_bail_pair(conn, round_id, user_id, interaction.channel_id)
-        if isinstance(loaded, str):
-            await interaction.response.send_message(loaded, ephemeral=True)
-            return
-        round_row, extra, pair = loaded
+    thread = interaction.channel
+    if not isinstance(thread, discord.Thread):
+        await interaction.response.send_message(
+            "자신에게 배정된 1:1 방에서만 진행할 수 있습니다.", ephemeral=True
+        )
+        return
 
-        if extra.get("bail_phase") != "execution":
-            await interaction.response.send_message(
-                "아직 실행 단계가 아닙니다. 협상이 모두 끝나면 제출할 수 있습니다.",
-                ephemeral=True,
+    async with bot.sand_board_lock(thread.id):
+        with db() as conn:
+            loaded = load_open_bail_pair(conn, round_id, user_id, interaction.channel_id)
+            if isinstance(loaded, str):
+                await interaction.response.send_message(loaded, ephemeral=True)
+                return
+            round_row, extra, pair = loaded
+
+            if extra.get("bail_phase") != "execution":
+                await interaction.response.send_message(
+                    "아직 실행 단계가 아닙니다. 협상이 모두 끝나면 퍼낼 수 있습니다.",
+                    ephemeral=True,
+                )
+                return
+            if str(pair.get("phase")) == "resolved":
+                await interaction.response.send_message("이 1:1 게임은 이미 끝났습니다.", ephemeral=True)
+                return
+
+            my_count = apply_bail_scoop_click(pair, user_id)
+            total = int(pair.get("scoop_a") or 0) + int(pair.get("scoop_b") or 0)
+            just_resolved = total >= BAIL_REQUIRED_SCOOPS
+
+            log_activity(
+                conn,
+                "bail",
+                "scoop_click",
+                event_session_id=round_row["event_session_id"],
+                round_id=round_id,
+                actor_user_id=user_id,
+                payload={
+                    "game_key": "bail",
+                    "my_total": my_count,
+                    "combined_total": total,
+                    "required": BAIL_REQUIRED_SCOOPS,
+                },
             )
-            return
-        if str(pair.get("phase")) == "resolved":
-            await interaction.response.send_message("이 1:1 게임은 이미 끝났습니다.", ephemeral=True)
-            return
+            if just_resolved:
+                resolve_bail_pair(pair)
+                pair["result_published"] = True
+                log_activity(
+                    conn,
+                    "bail",
+                    "pair_resolved_early",
+                    event_session_id=round_row["event_session_id"],
+                    round_id=round_id,
+                    payload={
+                        "game_key": "bail",
+                        "outcome": pair.get("outcome"),
+                        "total_scoops": total,
+                    },
+                )
+            conn.execute(
+                "UPDATE rounds SET extra_json = ? WHERE id = ?",
+                (json.dumps(extra, ensure_ascii=False), round_id),
+            )
+            title = str(round_row["title"])
 
-        # 둘 다 제출해도 여기서 정산하지 않는다. 실행 단계는 제한 시간을 끝까지 쓰고
-        # 마감 시점의 close_round_record가 한꺼번에 확정한다 — 조기 정산을 하면 결과 공개
-        # 타이밍만으로 "상대가 이미 제출했다"가 드러나 제출 여부 비공개가 깨진다.
-        # 정산이 마감에만 일어나는 덕에 그때까지 몇 번이든 다시 고를 수 있다.
-        previous = apply_bail_scoop(pair, user_id, scoops)
-        # extra_json은 통째로 교체되므로 덮어쓴 값은 여기 남기지 않으면 사라진다.
-        log_activity(
-            conn,
-            "bail",
-            "scoop_submitted",
-            event_session_id=round_row["event_session_id"],
-            round_id=round_id,
-            actor_user_id=user_id,
-            payload={
-                "game_key": "bail",
-                "scoops": scoops,
-                "previous_scoops": previous,
-                "reward_share": bail_reward_share(pair, bail_side_key(pair, user_id)),
-                "negotiation_failed": not pair.get("reward_split"),
-            },
-        )
-        conn.execute(
-            "UPDATE rounds SET extra_json = ? WHERE id = ?",
-            (json.dumps(extra, ensure_ascii=False), round_id),
+        # 몇 번째 퍼내기인지는 본인에게만 안내한다 — 상대는 합계 진행 상황판으로만 짐작할 수 있다.
+        await interaction.response.send_message(
+            f"**{my_count}번째** 퍼내기입니다.", ephemeral=True
         )
 
-    # 상대가 제출했는지는 본인에게도 알리지 않는다. 알려주면 남은 시간 동안 눈치싸움의
-    # 재료가 되고, 두 사람이 서로에게 말해버리면 비공개 제출이 무의미해진다.
-    # 내가 지금 몇 번으로 걸어뒀는지는 진행판이 아니라 이 ephemeral로만 확인한다.
-    headline = (
-        f"**{scoops}번** 퍼내기로 제출했습니다."
-        if previous is None
-        else f"**{previous}번 → {scoops}번**으로 바꿨습니다."
-    )
-    await advance_or_finish_bail_round(
-        interaction,
-        round_id,
-        private_message=(
-            f"{headline} 마감 전까지 다시 고를 수 있고, **마지막에 누른 값**만 반영됩니다.\n"
-            "> 결과는 **실행 마감 시각**에 두 방 모두 한꺼번에 공개됩니다."
-        ),
-    )
+        # 공동 진행 상황 메시지는 합계가 갱신 주기를 지날 때만 고쳐 쓴다.
+        # 다만 정산된 순간만은 지체 없이 바로 최종 문구로 반영한다.
+        if just_resolved or total % BAIL_PROGRESS_UPDATE_INTERVAL == 0:
+            await write_bail_progress_message(round_id, thread, pair)
+
+        if just_resolved:
+            try:
+                await thread.send(embed=build_bail_pair_result_embed(title, pair))
+                # 이 방의 게임이 끝나 버튼이 필요 없어졌으니 여기서 바로 잠근다.
+                await thread.edit(archived=True, locked=True, reason="가라앉는 배 결과 공개 완료")
+            except (discord.Forbidden, discord.HTTPException):
+                pass
+            # 규칙까지 포함한 방 진행판은 이 시점엔 더 볼 이유가 없다 — 결과는 위 임베드로,
+            # 최종 집계는 어차피 메인 채널 요약으로 확인하므로 여기서 다시 그리지 않는다.
+
+    if just_resolved:
+        if bail_executions_complete(extra):
+            # 모든 짝이 정산을 마쳤다 — 남은 시간을 기다리지 않고 라운드 전체를 즉시 마감한다.
+            await finish_bail_execution_round(round_id, interaction.guild)
+        else:
+            await refresh_main_bail_board(round_id)
 
 
 def expire_stale_roulette_games(conn: sqlite3.Connection, now: float | None = None) -> None:
@@ -6526,19 +6785,22 @@ class EventBot(discord.Client):
                     return
             guild = getattr(channel, "guild", None)
 
-            # 가라앉는 배 실행 단계는 참가자가 전부 비공개 방에 들어가 있어서 메인 채널
-            # 카운트다운이 보이지 않는다. 같은 모듈을 방마다 하나씩 더 돌려 남은 시간을 알린다.
-            countdown_targets: list[tuple[Any, str]] = [(channel, auto_close_action_label(row))]
             if round_game_key(row) == "bail" and round_extra(row).get("bail_phase") == "execution":
-                countdown_targets.extend(
-                    (thread, "퍼내기 마감") for _, thread in await bail_pair_threads(round_id)
+                # 참가자가 전부 비공개 방에 들어가 있어서 메인 채널 카운트다운은 의미가 없다.
+                # 이미 조기 정산된 방은 기다리기만 하면 되므로 아직 안 끝난 방에만 띄운다.
+                unresolved_threads = [
+                    thread
+                    for pair, thread in await bail_pair_threads(round_id)
+                    if str(pair.get("phase")) != "resolved"
+                ]
+                await asyncio.gather(
+                    *(
+                        publish_auto_close_countdown(thread, "퍼내기 마감", close_at)
+                        for thread in unresolved_threads
+                    )
                 )
-            await asyncio.gather(
-                *(
-                    publish_auto_close_countdown(target, label, close_at)
-                    for target, label in countdown_targets
-                )
-            )
+            else:
+                await publish_auto_close_countdown(channel, auto_close_action_label(row), close_at)
 
             # 카운트다운 도중 수동 마감이나 긴급 연장으로 상태가 바뀔 수 있다.
             # 취소 신호가 늦게 도착해도 오래된 마감 시각으로 정산하지 않도록 다시 확인한다.
@@ -6594,6 +6856,7 @@ class EventBot(discord.Client):
                     if not transition:
                         return
                     await refresh_all_bail_pair_boards(round_id)
+                    await refresh_all_bail_progress_boards(round_id)
                     await refresh_main_bail_board(round_id)
                     self.schedule_auto_close(round_id, float(transition["close_at"]))
                     if hasattr(channel, "send"):
@@ -6750,24 +7013,29 @@ class EventBot(discord.Client):
             await handle_sand_action(interaction, round_id, parts[3])
             return
 
-        # 협상은 보상금(0~8)을, 실행은 퍼낼 횟수(0~6)를 고르므로 허용 범위가 다르다.
-        if action in {"bailoffer", "bailscoop"}:
-            choices = BAIL_REWARD_CHOICES if action == "bailoffer" else BAIL_SCOOP_CHOICES
-            if len(parts) != 4 or parts[3] not in choices:
-                await interaction.response.send_message(
-                    "잘못된 보상금 제안입니다." if action == "bailoffer" else "잘못된 퍼내기 횟수입니다.",
-                    ephemeral=True,
-                )
+        if action == "bailoffer":
+            if len(parts) != 4 or parts[3] not in BAIL_REWARD_CHOICES:
+                await interaction.response.send_message("잘못된 보상금 제안입니다.", ephemeral=True)
                 return
             try:
                 round_id = int(parts[2])
             except ValueError:
                 await interaction.response.send_message("잘못된 라운드 번호입니다.", ephemeral=True)
                 return
-            if action == "bailoffer":
-                await handle_bail_offer(interaction, round_id, int(parts[3]))
-            else:
-                await handle_bail_scoop(interaction, round_id, int(parts[3]))
+            await handle_bail_offer(interaction, round_id, int(parts[3]))
+            return
+
+        if action == "bailscoop":
+            # 퍼내기는 선택값 없이 누른 횟수만큼 누적되는 버튼이라 round_id만 온다.
+            if len(parts) != 3:
+                await interaction.response.send_message("잘못된 퍼내기 요청입니다.", ephemeral=True)
+                return
+            try:
+                round_id = int(parts[2])
+            except ValueError:
+                await interaction.response.send_message("잘못된 라운드 번호입니다.", ephemeral=True)
+                return
+            await handle_bail_scoop(interaction, round_id)
             return
 
         if action == "bailrespond":
@@ -7830,7 +8098,7 @@ def build_bail_registration_embed(round_id: int, title: str, registration_minute
 
 
 def bail_pair_status_text(pair: dict[str, Any], extra: dict[str, Any]) -> str:
-    """짝 하나의 진행 상황. 상대의 제출 내용은 절대 드러내지 않는다."""
+    """짝 하나의 진행 상황. 누가 몇 번 퍼냈는지(개인별 분담)는 정산 전까지 드러내지 않는다."""
     phase = str(pair.get("phase"))
     if phase == "resolved":
         outcome = BAIL_OUTCOME_LABELS.get(str(pair.get("outcome")), "종료")
@@ -7854,9 +8122,9 @@ def bail_pair_status_text(pair: dict[str, Any], extra: dict[str, Any]) -> str:
         if pair.get("reward_split"):
             return "배분 확정 · 다른 방의 협상을 기다립니다"
         return "협상 결렬 · 다른 방의 협상을 기다립니다"
-    # 제출 인원수(0/2·1/2)는 그 자체가 정보다. 방 안에서는 상대의 제출 여부가 되고,
-    # 메인 채널에서는 다른 방의 진행 속도가 새어 나간다. 마감 전까지는 아무것도 세지 않는다.
-    return "퍼낼 횟수 제출 중 (제출 여부 비공개)"
+    # 둘이 합쳐 몇 번 퍼냈는지는 방 안 공동 진행 상황 메시지로 이미 보이므로 여기서 감출 필요는
+    # 없지만, 개인별로 몫을 얼마나 채웠는지는 정산 전까지 감춘다 — 무임승차 여부가 새면 안 된다.
+    return "물 퍼내는 중 · 아래 진행 상황 메시지에서 진행도를 확인하세요"
 
 
 def build_bail_pair_embed(title: str, pair: dict[str, Any], extra: dict[str, Any]) -> discord.Embed:
@@ -7904,12 +8172,12 @@ def build_bail_pair_embed(title: str, pair: dict[str, Any], extra: dict[str, Any
         embed.add_field(
             name="🪣 실행",
             value=(
-                "실제로 퍼낼 횟수를 고르세요. 선택은 상대에게 공개되지 않습니다.\n"
-                "> **마감 전까지 몇 번이든 바꿀 수 있고, 마지막에 누른 값만 반영됩니다.** "
-                "지금 내가 걸어둔 값은 버튼을 누를 때 나오는 안내로만 확인됩니다.\n"
-                "> **누가 제출했는지도 표시되지 않습니다.** 결과는 실행 마감 시각에 한꺼번에 공개됩니다.\n"
-                f"> 두 사람 합이 {BAIL_REQUIRED_SCOOPS}번 이상이면 배가 뜨고, "
-                "내 점수는 **보상 몫 − 내가 퍼낸 횟수**입니다."
+                "아래 **별도로 올라오는 공동 진행 상황 메시지**의 `🪣 퍼내기` 버튼을 눌러 물을 퍼내세요.\n"
+                f"> 버튼을 누른 횟수가 그대로 쌓이고, 두 사람 합이 {BAIL_REQUIRED_SCOOPS}번에 도달하면 "
+                "**그 즉시 정산**되어 결과가 공개됩니다.\n"
+                "> 지금까지 내가 몇 번 퍼냈는지는 버튼을 누를 때 나오는 안내로만 확인됩니다 — "
+                "**누가 몇 번 퍼냈는지는 끝나기 전까지 상대에게 보이지 않습니다.**\n"
+                "> 내 점수는 **보상 몫 − 내가 퍼낸 횟수**입니다."
             ),
             inline=False,
         )
@@ -7923,8 +8191,8 @@ def build_bail_pair_embed(title: str, pair: dict[str, Any], extra: dict[str, Any
         )
         label = "실행 마감" if round_phase == "execution" else "협상 마감"
         note = (
-            f"> 제한 시간은 **끝까지 씁니다.** 미제출은 {BAIL_FALLBACK_SCOOPS}번으로 자동 제출되고, "
-            "마감 시각에 모든 방이 함께 정산됩니다."
+            "> 필요한 만큼 채우면 **그 즉시 정산**되어 결과가 뜨고, 다 못 채운 채 제한 시간이 끝나면 "
+            "**침몰**합니다."
             if round_phase == "execution"
             else "> 협상을 못 끝내면 결렬됩니다. 모든 방이 협상을 마치면 남은 시간을 기다리지 않고 넘어갑니다."
         )
@@ -7981,8 +8249,9 @@ def build_bail_play_embed(round_row: sqlite3.Row, extra: dict[str, Any]) -> disc
     embed.add_field(
         name="🧭 현재 단계",
         value=(
-            "**2단계 · 실행** — 각자 실제로 퍼낼 횟수를 비공개 제출\n"
-            "> 제출 여부는 공개되지 않으며, 제한 시간이 끝나야 모든 방이 함께 정산됩니다."
+            "**2단계 · 실행** — 각자 방의 버튼으로 실시간 퍼내기\n"
+            "> 두 사람 합이 필요 횟수에 도달한 방은 그 즉시 정산되고, 그렇지 않으면 "
+            "제한 시간에 함께 마감됩니다."
             if round_phase == "execution"
             else "**1단계 · 협상** — 구조 보상금의 배분을 교대로 제안"
         ),
@@ -8032,10 +8301,12 @@ def bail_pair_view(
     pair: dict[str, Any],
     extra: dict[str, Any],
 ) -> discord.ui.View:
-    """방 안 진행판에 붙는 버튼. 단계마다 버튼 구성이 완전히 달라서 phase로 갈라 만든다.
+    """방 안 진행판(규칙 안내)에 붙는 버튼. 단계마다 버튼 구성이 완전히 달라서 phase로 갈라 만든다.
 
     버튼은 한 줄에 5개, 뷰 하나에 5줄이 상한이다. 그래서 한 줄에 4개씩 끊는다 —
-    협상은 0~10 열한 개(4+4+3)에 수락/거절 줄까지 4줄, 실행은 0~6 일곱 개(4+3)로 2줄이다.
+    협상은 0~10 열한 개(4+4+3)에 수락/거절 줄까지 4줄이다.
+    실행 단계의 `🪣 퍼내기` 버튼은 여기가 아니라 별도의 공동 진행 상황 메시지
+    (`bail_progress_view`)에 있다 — 이 진행판은 그 단계에서 버튼 없이 규칙만 보여준다.
     """
     view = discord.ui.View(timeout=None)
     round_phase = str(extra.get("bail_phase") or "")
@@ -8079,19 +8350,21 @@ def bail_pair_view(
         )
         return view
 
-    if round_phase == "execution":
-        for index, value in enumerate(BAIL_SCOOP_CHOICES):
-            view.add_item(
-                discord.ui.Button(
-                    label=f"{value}번 퍼내기",
-                    style=discord.ButtonStyle.primary,
-                    custom_id=f"eventbot:bailscoop:{round_id}:{value}",
-                    row=index // 4,
-                )
-            )
-        return view
+    # 실행 단계(퍼내기)든, 협상은 끝났지만 아직 실행 전인 대기 상태든 이 진행판에는 버튼이 없다.
+    return view
 
-    # 협상은 끝났지만 아직 실행 단계가 아닌 대기 상태. 누를 버튼이 없다.
+
+def bail_progress_view(round_id: int, pair: dict[str, Any]) -> discord.ui.View:
+    """공동 진행 상황 메시지에 붙는 단일 버튼. 정산되면 버튼이 사라진다."""
+    view = discord.ui.View(timeout=None)
+    if str(pair.get("phase")) != "resolved":
+        view.add_item(
+            discord.ui.Button(
+                label="🪣 퍼내기",
+                style=discord.ButtonStyle.primary,
+                custom_id=f"eventbot:bailscoop:{round_id}",
+            )
+        )
     return view
 
 
@@ -8949,12 +9222,17 @@ def close_round_record(
                         round_row["id"],
                     )
                 auto_mark = " · 자동 제출" if pair.get("auto_completed") else ""
+                # 아래 상세 줄들은 이름을 반복하지 않는다 — 첫 줄의 좌(user_a)/우(user_b)
+                # 순서를 그대로 따르는 "/" 표기라, 짝이 여럿이어도 한눈에 읽힌다.
+                detail_lines = "\n".join(
+                    f"　{line}" for line in bail_split_text(pair).splitlines()
+                )
                 bail_lines.append(
                     f"**{len(bail_lines) + 1}.** <@{user_a_id}> ↔ <@{user_b_id}>\n"
-                    f"　└ **{BAIL_OUTCOME_LABELS.get(outcome, '미완료')}** "
+                    f"　⚓ **{BAIL_OUTCOME_LABELS.get(outcome, '미완료')}** "
                     f"(합계 {int(pair_result['total_scoops'])}/{BAIL_REQUIRED_SCOOPS}번) · "
-                    f"{bail_pair_settlement_text(pair)}{auto_mark}\n"
-                    f"　└ {bail_split_text(pair)}"
+                    f"💰 정산 {bail_pair_settlement_text(pair)}{auto_mark}\n"
+                    f"{detail_lines}"
                 )
 
             extra.update({"bail_phase": "scored", "bail_scored_at": now_text()})
@@ -10288,6 +10566,7 @@ async def close_round(interaction: discord.Interaction) -> None:
             )
         else:
             await refresh_all_bail_pair_boards(round_id)
+            await refresh_all_bail_progress_boards(round_id)
             await refresh_main_bail_board(round_id)
             await interaction.followup.send("협상을 마감하고 실행 단계를 시작했습니다.", ephemeral=True)
         bot.schedule_auto_close(round_id, float(transition["close_at"]))
