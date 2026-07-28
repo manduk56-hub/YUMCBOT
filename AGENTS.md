@@ -99,16 +99,32 @@ embed/view 빌더 → `close_round_record`(정산) → 슬래시 명령어 → s
 번복이 불가능한 실제 행동이다 — 예전처럼 번호를 선언했다가 마감 전까지 덮어쓰는 개념 자체가 없다.
 두 사람 누적치의 합이 `BAIL_REQUIRED_SCOOPS`에 도달하면 **그 즉시 그 짝만 조기 정산되어** 방에
 결과가 공개되고 방이 잠긴다(`handle_bail_scoop`) — 협상 단계의 방 전체 조기 전이와 달리, 여기서는
-짝(방) 단위로만 조기에 끝난다. 못 채운 방은 예전처럼 제한 시간을 끝까지 쓰고 마감 시점의
-`close_round_record`/`autocomplete_bail_pair()`가 확정한다. 대신 방 안에서 남은 시간을 알 수 없어지므로
-`auto_close_round`가 **메인 채널과 각 비공개 방에 `publish_auto_close_countdown`을 동시에 돌린다.**
-정상적으로 다 채운 방도 이미 조기 정산을 거쳤으므로 `autocomplete_bail_pair()`는 손대지 않고
-(`phase == "resolved"`면 바로 반환), 협상만 못 끝낸 채 마감된 방만 결렬 처리하며 `auto_completed`를
-세운다(무조건 세우면 전부 "자동 처리"로 표시된다).
+기본적으로 짝(방) 단위로 끝난다. 결과 공개는 그 방의 "1:1 결과" 임베드 하나로 충분하므로, 조기
+정산 직후 규칙까지 포함된 방 진행판(`redraw_bail_pair_board`)은 다시 그리지 않는다 — 안 그래도
+한 번 더 뜨는 임베드가 중복으로 느껴진다. 못 채운 방은 예전처럼 제한 시간을 끝까지 쓰고 마감
+시점의 `close_round_record`/`autocomplete_bail_pair()`가 확정한다. 정상적으로 다 채운 방도 이미
+조기 정산을 거쳤으므로 `autocomplete_bail_pair()`는 손대지 않고(`phase == "resolved"`면 바로 반환),
+협상만 못 끝낸 채 마감된 방만 결렬 처리하며 `auto_completed`를 세운다(무조건 세우면 전부
+"자동 처리"로 표시된다).
+
+**짝이 하나둘 조기 정산되다가 마지막 짝까지 끝나면, 라운드 전체도 마감 시각을 기다리지 않는다**
+(`bail_executions_complete` / `finish_bail_execution_round`). 협상 단계의 방 전체 조기 전이와
+같은 논리를 실행 단계에도 적용한 것이다 — 참가자가 적어 짝이 하나뿐인 이벤트에서 특히
+중요하다: 그 한 짝만 끝나도 남은 실행 시간을 그대로 흘려보내면 안 된다. `finish_bail_execution_round`는
+`auto_close_round`가 자연 마감 때 밟는 절차(`close_round_record` → `publish_bail_pair_results` →
+토론 스레드 보관 → 메인 채널에 결과+다음 미니게임 안내 → 이벤트 요약)를 그대로 따르고, 예약된
+자동 마감 타이머도 먼저 취소한다. 아직 안 끝난 짝이 있으면 대신 `refresh_main_bail_board`로
+메인 진행판만 갱신한다. 실행 단계의 마감 카운트다운은 **메인 채널이 아니라 아직 안 끝난
+방에만** 띄운다(`auto_close_round`) — 참가자가 전부 비공개 방에 들어가 있어 메인 채널
+카운트다운은 볼 사람이 없고, 이미 조기 정산된 방은 기다리기만 하면 되므로 굳이 다시 알릴
+필요가 없다.
 
 **둘이 합쳐 몇 번 퍼냈는지는 실시간으로 공개되지만, 누가 몇 번 퍼냈는지는 정산 전까지 감춘다.**
-공동 진행 상황 메시지(`bail_progress_view`/`bail_progress_message_text`)는 합계가 문턱값(0/2/4)을
-지날 때만 갱신되고, 필요치에 도달하면 곧장 성공 문구로 바뀐다 — **매 클릭마다 갱신하지 않는다.**
+공동 진행 상황 메시지는 이제 plain text가 아니라 임베드다(`build_bail_progress_embed`) — 본문은
+`bail_progress_message_text`, 진행 중일 때만 각주에 지금 보이는 문구가 몇 번째 단계인지
+(`bail_progress_stage_index`, 1/2/3)를 붙인다. **이 단계 번호는 퍼내기 횟수가 아니라 문구의
+순서다** — 합계 0/2/4에서만 문구가 바뀌므로(`BAIL_PROGRESS_UPDATE_INTERVAL`) 단계도 그때만
+바뀌고, 필요치에 도달하면 단계 번호 없이 곧장 성공 문구로 바뀐다 — **매 클릭마다 갱신하지 않는다.**
 지금까지 내가 몇 번 퍼냈는지는 진행판이 아니라 버튼을 누를 때 나오는 ephemeral로만 보인다.
 개인별 분담이 새면 무임승차 여부가 정산 전에 드러나 배신 유인이 무너지므로, 이 부분은 예전의
 "제출 여부 비공개" 규칙과 같은 이유로 여전히 지킨다. 두 사람이 거의 동시에 눌러도 누적이 씹히지
@@ -119,8 +135,16 @@ embed/view 빌더 → `close_round_record`(정산) → 슬래시 명령어 → s
 라운드 마감에 한 번에 일어난다.** `handle_bail_scoop`는 필요치에 도달하면 `resolve_bail_pair`로
 결과(`pair["result"]`)를 확정하고 `result_published`만 남길 뿐 `add_score`를 호출하지 않는다 —
 점수 반영 경로를 둘로 나누면 이중 지급 위험이 생기기 때문이다. 실제 지급은 지금까지와 동일하게
-`close_round_record`가 모든 짝(조기 정산분 포함)을 훑으며 한 번에 처리한다. `result_published`는
-오직 `publish_bail_pair_results`가 이미 공개한 결과를 마감 때 또 보내지 않게 막는 용도다.
+`close_round_record`가 모든 짝(조기 정산분 포함)을 훑으며 한 번에 처리한다 — 마지막 짝의 조기
+정산이 곧 `finish_bail_execution_round`를 통해 그 `close_round_record` 호출을 앞당기는 것일
+뿐이다. `result_published`는 오직 `publish_bail_pair_results`가 이미 공개한 결과를 마감 때 또
+보내지 않게 막는 용도다.
+
+**요약 임베드는 짝을 소개하는 줄(`<@user_a> ↔ <@user_b>`) 하나에서만 멘션을 쓰고, 그 아래 정산·
+배분·실제 퍼내기 줄은 그 줄과 같은 좌(user_a)/우(user_b) 순서로 값만 "/"로 나열한다**
+(`bail_pair_settlement_text` / `bail_split_text`). 짝마다 이름을 서너 번씩 반복하면 짝이 여럿인
+라운드 요약에서 가독성이 급격히 떨어지기 때문이다 — 좌우 순서가 고정되어 있으니 값만 봐도
+누구 것인지 알 수 있다.
 
 **협상하는 것은 보상금 배분이고, 노동은 협상 대상이 아니다.** 이 분리가 게임의 전부다:
 

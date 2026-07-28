@@ -3300,14 +3300,16 @@ async def handle_sand_action(
 # 다만 실제 점수 지급(`add_score`)은 지금도 라운드 마감(`close_round_record`) 시점에 다른
 # 방들과 함께 한 번에 일어난다 — 조기 정산은 '승패가 확정되고 그 방에 공개되는 시점'만
 # 앞당길 뿐이고, 점수 반영 경로를 둘로 나누면 이중 지급 위험이 생긴다. 아직 못 채운 방은
-# 예전처럼 제한 시간을 끝까지 쓰고 마감 시점에 확정된다.
+# 예전처럼 제한 시간을 끝까지 쓰고 마감 시점에 확정된다. 다만 마지막 짝까지 정산되면
+# (`bail_executions_complete`) 라운드 전체도 마감을 기다리지 않고 즉시 끝난다
+# (`finish_bail_execution_round`) — 협상 단계의 방 전체 조기 전이와 같은 논리다.
 #
-# 둘이 합쳐 몇 번 퍼냈는지는 방 안의 공동 진행 상황 메시지(`bail_progress_view`)로 실시간
-# 공개된다 — 다만 그 메시지는 합계가 2회 지날 때마다만 갱신된다(`BAIL_PROGRESS_UPDATE_INTERVAL`).
-# **누가 몇 번 퍼냈는지(개인별 분담)는 정산 전까지 여전히 감춰진다** — 그게 새면 무임승차
-# 여부가 미리 드러나 배신 유인이 무너진다. 두 사람이 거의 동시에 눌러도 누적이 씹히지 않고,
-# 정산·결과 공개·방 잠금이 겹쳐 쓰이지 않도록 클릭 처리 전체를 `bot.sand_board_lock`으로
-# 직렬화한다.
+# 둘이 합쳐 몇 번 퍼냈는지는 방 안의 공동 진행 상황 임베드(`build_bail_progress_embed`)로
+# 실시간 공개된다 — 다만 그 메시지는 합계가 2회 지날 때마다만 갱신된다
+# (`BAIL_PROGRESS_UPDATE_INTERVAL`). **누가 몇 번 퍼냈는지(개인별 분담)는 정산 전까지 여전히
+# 감춰진다** — 그게 새면 무임승차 여부가 미리 드러나 배신 유인이 무너진다. 두 사람이 거의
+# 동시에 눌러도 누적이 씹히지 않고, 정산·결과 공개·방 잠금이 겹쳐 쓰이지 않도록 클릭 처리
+# 전체를 `bot.sand_board_lock`으로 직렬화한다.
 # ---------------------------------------------------------------------------
 
 
@@ -3456,6 +3458,18 @@ def bail_progress_stage_text(total: int) -> str:
     return stage_text
 
 
+def bail_progress_stage_index(total: int) -> int | None:
+    """지금 보이는 문구가 `BAIL_PROGRESS_STAGES`의 몇 번째(1부터)인지. 필요 횟수에 도달해
+    성공 문구로 바뀌었으면(더 이상 '단계'가 아니라 결과이므로) None을 돌려준다."""
+    if total >= BAIL_REQUIRED_SCOOPS:
+        return None
+    index = 1
+    for position, (threshold, _text) in enumerate(BAIL_PROGRESS_STAGES, start=1):
+        if total >= threshold:
+            index = position
+    return index
+
+
 def bail_progress_message_text(pair: dict[str, Any]) -> str:
     """짝 하나의 공동 진행 상황 메시지 본문. 정산된 뒤에는 최종 결과 문구로 고정된다."""
     if str(pair.get("phase")) == "resolved":
@@ -3466,13 +3480,39 @@ def bail_progress_message_text(pair: dict[str, Any]) -> str:
     return bail_progress_stage_text(total)
 
 
+def build_bail_progress_embed(pair: dict[str, Any]) -> discord.Embed:
+    """공동 진행 상황 메시지 임베드.
+
+    진행 문구는 마크다운 헤더(`#`)로 크게 표시한다 — 물이 차오르는 급박함이 한눈에 들어와야
+    한다. 단계(1/2/3)는 진행 문구가 아니라 참고용이라 각주로만 작게 붙인다.
+    """
+    embed = discord.Embed(
+        description=f"# {bail_progress_message_text(pair)}", color=BAIL_EMBED_COLOR
+    )
+    if str(pair.get("phase")) != "resolved":
+        total = int(pair.get("scoop_a") or 0) + int(pair.get("scoop_b") or 0)
+        stage_index = bail_progress_stage_index(total)
+        if stage_index is not None:
+            embed.set_footer(text=f"단계 {stage_index}/{len(BAIL_PROGRESS_STAGES)}")
+    return embed
+
+
 def bail_negotiations_complete(extra: dict[str, Any]) -> bool:
-    """조기 전이는 협상 단계에만 있다. 실행 단계는 제한 시간을 끝까지 쓰므로 짝(sand의
-    sand_games_complete 같은) '모두 끝났나' 판정을 두지 않는다."""
+    """모든 짝이 협상을 마쳤는가 — 협상 → 실행 조기 전이 판정에 쓴다."""
     pairs = extra.get("bail_pairs", [])
     return bool(pairs) and all(
         str(pair.get("phase")) in {"submitting", "resolved"} for pair in pairs
     )
+
+
+def bail_executions_complete(extra: dict[str, Any]) -> bool:
+    """모든 짝이 정산까지 끝났는가 — 실행 단계 조기 마감 판정에 쓴다.
+
+    협상과 달리 실행은 짝 단위로 조기 정산되므로(`handle_bail_scoop`), 이 판정은 라운드
+    전체를 마감할지를 결정한다 — 마지막 짝까지 끝나면 남은 시간을 기다리지 않는다.
+    """
+    pairs = extra.get("bail_pairs", [])
+    return bool(pairs) and all(str(pair.get("phase")) == "resolved" for pair in pairs)
 
 
 def resolve_bail_pair(pair: dict[str, Any]) -> None:
@@ -3548,20 +3588,25 @@ def bail_score_text(delta: int) -> str:
 
 
 def bail_pair_settlement_text(pair: dict[str, Any]) -> str:
-    """짝 하나의 정산 문구. 라운드 요약과 방별 결과 공개가 같은 문구를 쓴다."""
+    """짝 하나의 정산 문구. 라운드 요약과 방별 결과 공개가 같은 문구를 쓴다.
+
+    이 짝을 소개하는 줄(`<@user_a> ↔ <@user_b>`)이 항상 먼저 나오므로, 여기서는 멘션을
+    반복하지 않고 그 줄과 같은 좌/우 순서로 값만 "/"로 나열한다 — 이름을 매 줄 반복하면
+    짝이 여럿인 요약에서 가독성이 떨어진다.
+    """
     result = pair.get("result")
     if not result:
         return "점수 변동 없음"
     return (
-        f"<@{pair['user_a_id']}> {bail_score_text(int(result['score_a']))} · "
-        f"<@{pair['user_b_id']}> {bail_score_text(int(result['score_b']))}"
+        f"{bail_score_text(int(result['score_a']))} / {bail_score_text(int(result['score_b']))}"
     )
 
 
 def bail_split_text(pair: dict[str, Any]) -> str:
-    """보상 배분과 실제 퍼낸 횟수를 나란히 보여준다.
+    """보상 배분과 실제 퍼낸 횟수를 나란히 보여준다. `bail_pair_settlement_text`와 같은 이유로
+    멘션을 반복하지 않고 좌(user_a)/우(user_b) 값만 "/"로 나열한다.
 
-    돈은 많이 받고 일은 덜 한 사람에게 ⚠️를 붙인다. 무임승차가 공개 기록으로 남는 것이
+    돈은 많이 받고 일은 덜 한 사람의 값에 ⚠️를 붙인다. 무임승차가 공개 기록으로 남는 것이
     이벤트 전체에 걸친 평판 장치다.
     """
     split = pair.get("reward_split")
@@ -3571,22 +3616,16 @@ def bail_split_text(pair: dict[str, Any]) -> str:
     share_b = bail_reward_share(pair, "user_b")
 
     if split:
-        lines = [
-            f"보상 배분: <@{pair['user_a_id']}> {share_a}점 · <@{pair['user_b_id']}> {share_b}점"
-        ]
+        lines = [f"🤝 보상 배분 {share_a}점 / {share_b}점"]
     else:
-        lines = [f"보상 배분: **결렬** → 각자 {share_a}점"]
+        lines = [f"🤝 보상 배분 **결렬** → {share_a}점 / {share_b}점"]
 
     if scoop_a is not None and scoop_b is not None:
-        marks = []
-        for user_key, share, other_share, scoop, other_scoop in (
-            ("user_a_id", share_a, share_b, int(scoop_a), int(scoop_b)),
-            ("user_b_id", share_b, share_a, int(scoop_b), int(scoop_a)),
-        ):
-            # 보상은 더 받으면서 노동은 덜 한 쪽.
-            mark = " ⚠️" if share > other_share and scoop < other_scoop else ""
-            marks.append(f"<@{pair[user_key]}> {scoop}번{mark}")
-        lines.append(f"실제 퍼내기: {' · '.join(marks)}")
+        scoop_a, scoop_b = int(scoop_a), int(scoop_b)
+        # 보상은 더 받으면서 노동은 덜 한 쪽에만 표시한다.
+        mark_a = " ⚠️" if share_a > share_b and scoop_a < scoop_b else ""
+        mark_b = " ⚠️" if share_b > share_a and scoop_b < scoop_a else ""
+        lines.append(f"🪣 실제 퍼내기 {scoop_a}번{mark_a} / {scoop_b}번{mark_b}")
     return "\n".join(lines)
 
 
@@ -3917,20 +3956,21 @@ async def write_bail_progress_message(
     호출자가 이미 `bot.sand_board_lock(thread.id)`를 잡고 있어야 한다 (락은 재진입이 안 되므로
     여기서 다시 잡지 않는다) — `handle_bail_scoop`가 상태 변경과 같은 락 구간에서 바로 호출한다.
     """
-    content = bail_progress_message_text(pair)
+    embed = build_bail_progress_embed(pair)
     view = bail_progress_view(round_id, pair)
 
     message_id = str(pair.get("progress_message_id") or "")
     if message_id:
         try:
             message = await thread.fetch_message(int(message_id))
-            await message.edit(content=content, view=view)
+            # content=None으로 예전에 plain text로 보냈을 수도 있는 메시지의 잔여 텍스트도 지운다.
+            await message.edit(content=None, embed=embed, view=view)
             return
         except (discord.NotFound, discord.HTTPException, ValueError):
             pass
 
     try:
-        new_message = await thread.send(content=content, view=view)
+        new_message = await thread.send(embed=embed, view=view)
     except discord.HTTPException:
         return
     save_bail_pair_progress_message_id(round_id, pair, str(new_message.id))
@@ -4094,11 +4134,42 @@ async def advance_or_finish_bail_round(
                     pass
             return
 
-    # 실행 단계는 조기 종료가 없다. 두 사람이 다 제출해도 마감 시각까지 기다렸다가
-    # auto_close_round(또는 /라운드마감)가 모든 방을 한꺼번에 정산한다 — 여기서 일찍 닫으면
-    # 결과가 뜨는 시점만으로 상대의 제출 여부가 드러나 비공개 제출이 깨진다.
+    # 아직 이 방(또는 다른 방)의 협상이 안 끝났다 — 진행판만 갱신하고 기다린다.
+    # (실행 단계의 퍼내기는 이 함수를 거치지 않는다. `handle_bail_scoop`가 따로 처리한다.)
     await refresh_bail_pair_board(interaction, round_id)
     await refresh_main_bail_board(round_id)
+
+
+async def finish_bail_execution_round(round_id: int, guild: discord.Guild | None) -> None:
+    """모든 짝이 정산을 마쳤으면 마감 시각을 기다리지 않고 라운드 전체를 즉시 마감한다.
+
+    `auto_close_round`가 자연 마감 때 하는 마무리 절차와 동일한 순서를 따른다. 예약된 자동
+    마감 타이머가 있으면 취소한다 — 취소하지 않아도 그 타이머는 나중에 상태가 이미
+    `closed`인 것을 보고 조용히 넘어가지만(`close_round_record`의 `status == 'open'` 확인),
+    불필요한 카운트다운을 막기 위해 여기서 먼저 정리한다.
+    """
+    task = bot.auto_close_tasks.pop(round_id, None)
+    if task:
+        task.cancel()
+
+    result = close_round_record(round_id, guild, closed_by="전원 완료")
+    if not result:
+        return
+
+    channel_id, embed = result
+    await publish_bail_pair_results(round_id)
+    with db() as conn:
+        row = conn.execute("SELECT * FROM rounds WHERE id = ?", (round_id,)).fetchone()
+    if not row:
+        return
+    await archive_round_discussion_thread(row, reason="라운드 종료 후 영구 보관")
+    channel = await resolve_text_channel(channel_id)
+    if channel is not None:
+        try:
+            await channel.send(embed=embed, view=planned_mini_game_view(round_id))
+        except discord.HTTPException:
+            pass
+    await publish_event_summary_if_complete(row["event_session_id"])
 
 
 def load_open_bail_pair(
@@ -4352,10 +4423,15 @@ async def handle_bail_scoop(interaction: discord.Interaction, round_id: int) -> 
                 await thread.edit(archived=True, locked=True, reason="가라앉는 배 결과 공개 완료")
             except (discord.Forbidden, discord.HTTPException):
                 pass
+            # 규칙까지 포함한 방 진행판은 이 시점엔 더 볼 이유가 없다 — 결과는 위 임베드로,
+            # 최종 집계는 어차피 메인 채널 요약으로 확인하므로 여기서 다시 그리지 않는다.
 
     if just_resolved:
-        await redraw_bail_pair_board(round_id, thread, user_id)
-        await refresh_main_bail_board(round_id)
+        if bail_executions_complete(extra):
+            # 모든 짝이 정산을 마쳤다 — 남은 시간을 기다리지 않고 라운드 전체를 즉시 마감한다.
+            await finish_bail_execution_round(round_id, interaction.guild)
+        else:
+            await refresh_main_bail_board(round_id)
 
 
 def expire_stale_roulette_games(conn: sqlite3.Connection, now: float | None = None) -> None:
@@ -6679,19 +6755,22 @@ class EventBot(discord.Client):
                     return
             guild = getattr(channel, "guild", None)
 
-            # 가라앉는 배 실행 단계는 참가자가 전부 비공개 방에 들어가 있어서 메인 채널
-            # 카운트다운이 보이지 않는다. 같은 모듈을 방마다 하나씩 더 돌려 남은 시간을 알린다.
-            countdown_targets: list[tuple[Any, str]] = [(channel, auto_close_action_label(row))]
             if round_game_key(row) == "bail" and round_extra(row).get("bail_phase") == "execution":
-                countdown_targets.extend(
-                    (thread, "퍼내기 마감") for _, thread in await bail_pair_threads(round_id)
+                # 참가자가 전부 비공개 방에 들어가 있어서 메인 채널 카운트다운은 의미가 없다.
+                # 이미 조기 정산된 방은 기다리기만 하면 되므로 아직 안 끝난 방에만 띄운다.
+                unresolved_threads = [
+                    thread
+                    for pair, thread in await bail_pair_threads(round_id)
+                    if str(pair.get("phase")) != "resolved"
+                ]
+                await asyncio.gather(
+                    *(
+                        publish_auto_close_countdown(thread, "퍼내기 마감", close_at)
+                        for thread in unresolved_threads
+                    )
                 )
-            await asyncio.gather(
-                *(
-                    publish_auto_close_countdown(target, label, close_at)
-                    for target, label in countdown_targets
-                )
-            )
+            else:
+                await publish_auto_close_countdown(channel, auto_close_action_label(row), close_at)
 
             # 카운트다운 도중 수동 마감이나 긴급 연장으로 상태가 바뀔 수 있다.
             # 취소 신호가 늦게 도착해도 오래된 마감 시각으로 정산하지 않도록 다시 확인한다.
@@ -9113,12 +9192,17 @@ def close_round_record(
                         round_row["id"],
                     )
                 auto_mark = " · 자동 제출" if pair.get("auto_completed") else ""
+                # 아래 상세 줄들은 이름을 반복하지 않는다 — 첫 줄의 좌(user_a)/우(user_b)
+                # 순서를 그대로 따르는 "/" 표기라, 짝이 여럿이어도 한눈에 읽힌다.
+                detail_lines = "\n".join(
+                    f"　{line}" for line in bail_split_text(pair).splitlines()
+                )
                 bail_lines.append(
                     f"**{len(bail_lines) + 1}.** <@{user_a_id}> ↔ <@{user_b_id}>\n"
-                    f"　└ **{BAIL_OUTCOME_LABELS.get(outcome, '미완료')}** "
+                    f"　⚓ **{BAIL_OUTCOME_LABELS.get(outcome, '미완료')}** "
                     f"(합계 {int(pair_result['total_scoops'])}/{BAIL_REQUIRED_SCOOPS}번) · "
-                    f"{bail_pair_settlement_text(pair)}{auto_mark}\n"
-                    f"　└ {bail_split_text(pair)}"
+                    f"💰 정산 {bail_pair_settlement_text(pair)}{auto_mark}\n"
+                    f"{detail_lines}"
                 )
 
             extra.update({"bail_phase": "scored", "bail_scored_at": now_text()})

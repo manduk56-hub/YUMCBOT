@@ -2006,6 +2006,25 @@ class BotRegressionTests(unittest.TestCase):
         # 짝이 없으면 완료가 아니다 (라운드가 조기 전이되지 않게).
         self.assertFalse(bot.bail_negotiations_complete({"bail_pairs": []}))
 
+    def test_bail_executions_complete_flag(self) -> None:
+        """전부 정산됐을 때만 True — 라운드 전체 조기 마감 판정에 쓴다."""
+        one_pending = {
+            "bail_pairs": [
+                self.bail_submitted_pair(3, 3, reward_split=self.bail_even_split()),
+                self.bail_pair(phase="submitting", scoop_a=1, scoop_b=0),
+            ]
+        }
+        all_resolved = {
+            "bail_pairs": [
+                self.bail_submitted_pair(3, 3, reward_split=self.bail_even_split()),
+                self.bail_submitted_pair(1, 1, reward_split=self.bail_even_split()),
+            ]
+        }
+
+        self.assertFalse(bot.bail_executions_complete(one_pending))
+        self.assertTrue(bot.bail_executions_complete(all_resolved))
+        self.assertFalse(bot.bail_executions_complete({"bail_pairs": []}))
+
     def test_bail_scoop_click_accumulates_per_person(self) -> None:
         """퍼내기는 번호를 선언하던 예전과 달리 실제 클릭이 그대로 쌓이는 되돌릴 수 없는 행동이다."""
         pair = self.bail_pair(phase="submitting", scoop_a=0, scoop_b=0)
@@ -2188,6 +2207,15 @@ class BotRegressionTests(unittest.TestCase):
         self.assertIn("결렬", rendered)
         self.assertNotIn("⚠️", rendered)
 
+    def test_bail_settlement_and_split_text_do_not_repeat_mentions(self) -> None:
+        """짝을 소개하는 줄에서 이미 멘션이 나오므로, 상세 줄은 좌/우 값만 나열한다."""
+        pair = self.bail_submitted_pair(2, 4, reward_split={"user_a": 7, "user_b": 3})
+
+        self.assertNotIn("<@", bot.bail_pair_settlement_text(pair))
+        self.assertNotIn("<@", bot.bail_split_text(pair))
+        self.assertIn("/", bot.bail_pair_settlement_text(pair))
+        self.assertIn("/", bot.bail_split_text(pair))
+
     def test_bail_emergency_join_starts_a_new_negotiation(self) -> None:
         extra = {"bail_phase": "negotiation", "unmatched_user_id": "3", "auto_close_at": 100.0}
 
@@ -2278,6 +2306,28 @@ class BotRegressionTests(unittest.TestCase):
 
         self.assertEqual(bot.bail_progress_message_text(survived), bot.BAIL_PROGRESS_SUCCESS_TEXT)
         self.assertEqual(bot.bail_progress_message_text(sunk), bot.BAIL_PROGRESS_SUNK_TEXT)
+
+    def test_bail_progress_stage_index_counts_up_then_disappears_on_success(self) -> None:
+        """단계 번호는 퍼내기 횟수가 아니라 지금 보이는 문구가 몇 번째인지를 가리킨다."""
+        self.assertEqual(bot.bail_progress_stage_index(0), 1)
+        self.assertEqual(bot.bail_progress_stage_index(1), 1)
+        self.assertEqual(bot.bail_progress_stage_index(2), 2)
+        self.assertEqual(bot.bail_progress_stage_index(4), 3)
+        self.assertIsNone(bot.bail_progress_stage_index(bot.BAIL_REQUIRED_SCOOPS))
+
+    def test_bail_progress_embed_shows_stage_only_while_in_progress(self) -> None:
+        pending = self.bail_pair(phase="submitting", scoop_a=2, scoop_b=0)
+        resolved = self.bail_submitted_pair(3, 3, reward_split=self.bail_even_split())
+
+        pending_embed = bot.build_bail_progress_embed(pending)
+        resolved_embed = bot.build_bail_progress_embed(resolved)
+
+        # 진행 문구는 마크다운 헤더(#)로 크게 표시한다.
+        self.assertEqual(pending_embed.description, f"# {bot.BAIL_PROGRESS_STAGES[1][1]}")
+        self.assertIn("2/3", pending_embed.footer.text)
+        self.assertEqual(resolved_embed.description, f"# {bot.BAIL_PROGRESS_SUCCESS_TEXT}")
+        # 정산된 뒤에는 더 이상 '단계'가 아니므로 각주를 붙이지 않는다.
+        self.assertFalse(resolved_embed.footer.text)
 
     def test_bail_progress_view_has_no_button_once_resolved(self) -> None:
         pending = self.bail_pair(phase="submitting", scoop_a=0, scoop_b=0)
