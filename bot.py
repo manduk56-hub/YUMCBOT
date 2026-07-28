@@ -19,7 +19,7 @@ import discord
 from discord import app_commands
 
 
-from yumcbot import config
+from yumcbot import config, runtime
 
 # 경로·상수는 yumcbot.config로, 스키마·연결은 yumcbot.db로 옮겼다.
 # 여기서 다시 노출하는 이유: bot.py의 함수들이 아직 이 이름들을 모듈 전역으로 읽고,
@@ -113,6 +113,14 @@ from yumcbot.games.registry import (
     SettleContext,
     register_settler,
     settler_for,
+)
+from yumcbot.rounds import (
+    can_join_round,
+    get_open_round,
+    is_event_participant,
+    main_game_phase,
+    round_extra,
+    round_game_key,
 )
 from yumcbot.scoring import (
     add_score,
@@ -221,12 +229,6 @@ def build_anonymous_message_embed(anon_number: int, content: str) -> discord.Emb
 #     "SELECT created_at, category, action, actor_user_id, payload_json
 #      FROM activity_logs WHERE event_session_id = 12 ORDER BY created_at"
 # 필요해지면 /로그 슬래시 명령이나 CSV 내보내기를 붙인다.
-
-
-def get_open_round(conn: sqlite3.Connection) -> sqlite3.Row | None:
-    return conn.execute(
-        "SELECT * FROM rounds WHERE status = 'open' ORDER BY id DESC LIMIT 1"
-    ).fetchone()
 
 
 def get_current_event(conn: sqlite3.Connection) -> sqlite3.Row | None:
@@ -431,41 +433,13 @@ async def publish_event_summary_if_complete(event_session_id: int | None) -> Non
     if not summary:
         return
     channel_id, embed = summary
-    channel = await resolve_text_channel(channel_id)
+    channel = await runtime.resolve_text_channel(channel_id)
     if channel is None:
         return
     try:
         await channel.send(embed=embed)
     except discord.HTTPException:
         pass
-
-
-def is_event_participant(
-    conn: sqlite3.Connection,
-    event_session_id: int,
-    user_id: str,
-) -> bool:
-    return conn.execute(
-        """
-        SELECT 1 FROM event_participants
-        WHERE event_session_id = ? AND user_id = ?
-        """,
-        (event_session_id, user_id),
-    ).fetchone() is not None
-
-
-def can_join_round(conn: sqlite3.Connection, round_id: int, user_id: str) -> bool:
-    round_row = conn.execute(
-        "SELECT event_session_id FROM rounds WHERE id = ?",
-        (round_id,),
-    ).fetchone()
-    if not round_row:
-        return False
-    event_session_id = round_row["event_session_id"]
-    # 기존 DB에서 기능 추가 전에 생성된 라운드는 종전 동작을 유지합니다.
-    if event_session_id is None:
-        return True
-    return is_event_participant(conn, int(event_session_id), user_id)
 
 
 def mention_list(user_ids: list[str], limit: int = 40, sep: str = ", ") -> str:
@@ -637,25 +611,6 @@ def anonymous_discussion_view(round_id: int) -> discord.ui.View:
         )
     )
     return view
-
-
-def round_game_key(round_row: sqlite3.Row) -> str:
-    """코드상 게임 이름. 3선 폭탄 게임은 레거시 키 defuse4, DB type bomb을 유지한다."""
-    return str(round_extra(round_row).get("mode") or round_row["type"])
-
-
-def main_game_phase(round_row: sqlite3.Row | dict[str, Any]) -> str | None:
-    """메인게임의 진행 단계. 게임마다 extra_json 키가 달라서 한 곳에 모아둔다.
-
-    세 게임 모두 마지막 단계 이름은 'scored', 취소는 'cancelled'로 맞춘다.
-    """
-    extra = round_extra(round_row)  # type: ignore[arg-type]
-    game_key = round_game_key(round_row)  # type: ignore[arg-type]
-    if game_key == "trust":
-        return extra.get("trust_phase")
-    if game_key == "bail":
-        return extra.get("bail_phase")
-    return extra.get("sand_phase")
 
 
 def thread_discussion_view(round_id: int, game_key: str) -> discord.ui.View:
@@ -1284,16 +1239,6 @@ async def update_trust_main_message(transition: dict[str, Any]) -> None:
         return
 
 
-async def resolve_text_channel(channel_id: str) -> discord.TextChannel | None:
-    channel = bot.get_channel(int(channel_id))
-    if channel is None:
-        try:
-            channel = await bot.fetch_channel(int(channel_id))
-        except (discord.HTTPException, ValueError):
-            return None
-    return channel if isinstance(channel, discord.TextChannel) else None
-
-
 async def archive_round_discussion_thread(
     round_row: sqlite3.Row,
     *,
@@ -1318,7 +1263,7 @@ async def delete_baseball_control_message(round_row: sqlite3.Row | dict[str, Any
     channel_id = str(round_row["channel_id"] or "")
     if not control_message_id or not channel_id:
         return
-    channel = await resolve_text_channel(channel_id)
+    channel = await runtime.resolve_text_channel(channel_id)
     if channel is None:
         return
     try:
@@ -1413,7 +1358,7 @@ async def create_trust_pair_threads(transition: dict[str, Any]) -> None:
     if transition.get("state") != "decision":
         return
 
-    channel = await resolve_text_channel(str(transition["channel_id"]))
+    channel = await runtime.resolve_text_channel(str(transition["channel_id"]))
     if channel is None:
         return
 
@@ -1772,7 +1717,7 @@ async def create_sand_pair_threads(transition: dict[str, Any]) -> None:
     if transition.get("state") != "playing":
         return
 
-    channel = await resolve_text_channel(str(transition["channel_id"]))
+    channel = await runtime.resolve_text_channel(str(transition["channel_id"]))
     if channel is None:
         return
 
@@ -1972,7 +1917,7 @@ async def refresh_main_trust_board(round_id: int) -> None:
         ).fetchall()
 
     extra = round_extra(round_row)
-    channel = await resolve_text_channel(str(round_row["channel_id"]))
+    channel = await runtime.resolve_text_channel(str(round_row["channel_id"]))
     if channel is None:
         return
 
@@ -2089,7 +2034,7 @@ async def handle_emergency_join(interaction: discord.Interaction, round_id: int)
     close_at = float(applied["close_at"])
     bot.schedule_auto_close(round_id, close_at)
 
-    channel = await resolve_text_channel(channel_id)
+    channel = await runtime.resolve_text_channel(channel_id)
     if channel is None:
         await interaction.followup.send("긴급 투입했지만 채널을 찾지 못해 방을 열지 못했습니다.", ephemeral=True)
         return
@@ -2339,7 +2284,7 @@ async def refresh_main_sand_board(round_id: int) -> None:
         return
 
     extra = round_extra(round_row)
-    channel = await resolve_text_channel(str(round_row["channel_id"]))
+    channel = await runtime.resolve_text_channel(str(round_row["channel_id"]))
     if channel is None:
         return
     try:
@@ -2464,7 +2409,7 @@ async def refresh_or_finish_sand_round(
 
     # followup은 버튼을 누른 비공개 방으로 들어간다. 라운드 결과는 메인 채널에 알려야 한다.
     _, result_embed = result
-    channel = await resolve_text_channel(channel_id)
+    channel = await runtime.resolve_text_channel(channel_id)
     if channel is not None:
         try:
             await channel.send(embed=result_embed, view=planned_mini_game_view(round_id))
@@ -3028,7 +2973,7 @@ async def create_bail_pair_threads(transition: dict[str, Any]) -> None:
     if transition.get("state") != "negotiation":
         return
 
-    channel = await resolve_text_channel(str(transition["channel_id"]))
+    channel = await runtime.resolve_text_channel(str(transition["channel_id"]))
     if channel is None:
         return
 
@@ -3189,7 +3134,7 @@ async def refresh_main_bail_board(round_id: int) -> None:
         return
 
     extra = round_extra(round_row)
-    channel = await resolve_text_channel(str(round_row["channel_id"]))
+    channel = await runtime.resolve_text_channel(str(round_row["channel_id"]))
     if channel is None:
         return
     try:
@@ -3265,7 +3210,7 @@ async def advance_or_finish_bail_round(
             bot.schedule_auto_close(round_id, float(transition["close_at"]))
             await refresh_all_bail_pair_boards(round_id)
             await refresh_main_bail_board(round_id)
-            channel = await resolve_text_channel(channel_id)
+            channel = await runtime.resolve_text_channel(channel_id)
             if channel is not None:
                 try:
                     await channel.send(
@@ -4189,7 +4134,7 @@ async def activate_baseball_pitch(
         prepared_by = str(extra.get("baseball_prepared_by") or "system")
         title = str(round_row["title"])
 
-    channel = await resolve_text_channel(channel_id)
+    channel = await runtime.resolve_text_channel(channel_id)
     if channel is None or not control_message_id:
         reset_baseball_prepare(round_id, pitch_number)
         return False
@@ -4262,7 +4207,7 @@ async def publish_baseball_pitch_result(round_id: int, pitch_number: int) -> boo
     result = settle_baseball_pitch(round_id, pitch_number)
     if not result:
         return False
-    channel = await resolve_text_channel(str(result["channel_id"]))
+    channel = await runtime.resolve_text_channel(str(result["channel_id"]))
     if channel is None:
         return False
 
@@ -5172,6 +5117,8 @@ class EventBot(discord.Client):
 
 
 bot = EventBot()
+# 게임 모듈이 타이머 콜백에서 채널을 열 때 쓴다 (bot.py를 import 하면 순환이 된다).
+runtime.set_client(bot)
 
 
 def build_balance_embed(round_id: int, question: str, option_a: str, option_b: str) -> discord.Embed:
@@ -5293,7 +5240,7 @@ async def publish_minority_balance_revote(transition: dict[str, Any]) -> bool:
     """재선택 안내를 메인 채널에 게시하고 토론방의 고정 버튼도 새 마감으로 갱신한다."""
     round_id = int(transition["round_id"])
     close_at = float(transition["close_at"])
-    channel = await resolve_text_channel(str(transition["channel_id"]))
+    channel = await runtime.resolve_text_channel(str(transition["channel_id"]))
     if channel is None:
         return False
 
@@ -6417,14 +6364,6 @@ async def publish_auto_close_countdown(
             except discord.HTTPException:
                 pass
         raise
-
-
-def round_extra(row: sqlite3.Row) -> dict[str, Any]:
-    try:
-        data = json.loads(row["extra_json"])
-    except json.JSONDecodeError:
-        return {}
-    return data if isinstance(data, dict) else {}
 
 
 def cutting_progress_bar(current_level: int, max_level: int) -> str:
@@ -7664,7 +7603,7 @@ async def baseball_prepare(interaction: discord.Interaction) -> None:
             round_extra(round_row).get("baseball_control_message_id") or ""
         )
 
-    channel = await resolve_text_channel(channel_id)
+    channel = await runtime.resolve_text_channel(channel_id)
     if channel is None:
         await interaction.followup.send("야구 채널을 찾을 수 없습니다.", ephemeral=True)
         return
@@ -7789,7 +7728,7 @@ async def create_round_from_setup(
         return
 
     main_channel_id = str(initial_event_row["channel_id"])
-    main_channel = await resolve_text_channel(main_channel_id)
+    main_channel = await runtime.resolve_text_channel(main_channel_id)
     if main_channel is None:
         await interaction.followup.send(
             "이벤트를 시작한 메인 텍스트 채널을 찾을 수 없습니다.",
@@ -8512,7 +8451,7 @@ async def close_round(interaction: discord.Interaction) -> None:
             await publish_sand_pair_results(int(round_row["id"]))
     await archive_round_discussion_thread(round_row, reason="라운드 종료 후 영구 보관")
 
-    channel = await resolve_text_channel(channel_id)
+    channel = await runtime.resolve_text_channel(channel_id)
     if channel is None:
         await interaction.followup.send(
             "라운드는 마감했지만 이벤트 메인 채널을 찾지 못해 결과를 게시하지 못했습니다.",
@@ -8641,7 +8580,7 @@ async def force_end_event(interaction: discord.Interaction) -> None:
 
     if force_summary:
         channel_id, summary_embed = force_summary
-        channel = await resolve_text_channel(channel_id)
+        channel = await runtime.resolve_text_channel(channel_id)
         if channel is not None:
             try:
                 await channel.send(embed=summary_embed)
@@ -8695,7 +8634,7 @@ async def run_cutting(interaction: discord.Interaction) -> None:
 
     embed = build_cutting_progress_embed(round_row, extra)
     channel_id = str(round_row["channel_id"])
-    channel = await resolve_text_channel(channel_id)
+    channel = await runtime.resolve_text_channel(channel_id)
     if channel is None:
         await interaction.followup.send("이벤트 메인 채널을 찾을 수 없습니다.", ephemeral=True)
         return

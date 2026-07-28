@@ -17,12 +17,12 @@ from pathlib import Path
 from unittest.mock import patch
 
 import bot
-from yumcbot import activity, config, roulette, scoring
+from yumcbot import activity, config, rounds, roulette, runtime, scoring
 from yumcbot import db as schema
 from yumcbot.games import registry
 
 # bot.py가 재노출하는 모듈들. 새로 추출할 때마다 여기에 추가한다.
-EXTRACTED = (config, schema, activity, scoring, roulette, registry)
+EXTRACTED = (config, schema, activity, scoring, roulette, registry, rounds)
 
 
 def public_names(module: types.ModuleType) -> set[str]:
@@ -64,6 +64,27 @@ class ReexportWiringTest(unittest.TestCase):
                 hasattr(bot, name),
                 f"bot.{name}이 다시 생겼습니다. config.{name}을 직접 조회하세요.",
             )
+
+    def test_bot_does_not_shadow_resolve_text_channel(self) -> None:
+        """채널 조회도 사본을 두지 않는다 — DB_PATH와 같은 계열의 함정이다.
+
+        테스트는 `patch.object(runtime, "resolve_text_channel")`로 가짜 채널을 넣는다.
+        bot이나 게임 모듈이 이름을 복사해 가지고 있으면 그 사본은 갈아끼워지지 않아,
+        가짜를 넣었다고 믿는 테스트가 실제 클라이언트를 부른다. 항상 모듈을 거쳐 부른다.
+        """
+        self.assertFalse(
+            hasattr(bot, "resolve_text_channel"),
+            "bot.resolve_text_channel 사본이 생겼습니다. "
+            "runtime.resolve_text_channel(...)처럼 모듈을 거쳐 부르세요.",
+        )
+
+    def test_client_is_registered_for_game_modules(self) -> None:
+        """게임 모듈은 타이머 콜백에서 이 클라이언트로 채널을 연다.
+
+        등록이 빠지면 사용자 클릭이 없는 경로(자동 마감, 야구 투구 타이머)만 조용히
+        죽는다 — 버튼으로 하는 조작은 멀쩡해서 알아채기 어렵다.
+        """
+        self.assertIs(runtime.get_client(), bot.bot)
 
     def test_db_connection_follows_patched_config_path(self) -> None:
         """config.DB_PATH를 갈아끼우면 bot 경유로 부른 db()도 그 경로를 열어야 한다."""

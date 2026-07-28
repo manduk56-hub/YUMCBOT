@@ -10,7 +10,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 import bot
-from yumcbot import config
+from yumcbot import config, runtime
 
 
 class BotRegressionTests(unittest.TestCase):
@@ -2936,7 +2936,7 @@ class BotRegressionTests(unittest.TestCase):
         channel = SimpleNamespace(fetch_message=AsyncMock(side_effect=fetch_message))
         with (
             patch.object(
-                bot,
+                runtime,
                 "resolve_text_channel",
                 AsyncMock(return_value=channel),
             ),
@@ -2989,7 +2989,7 @@ class BotRegressionTests(unittest.TestCase):
         )
         with (
             patch.object(
-                bot,
+                runtime,
                 "resolve_text_channel",
                 AsyncMock(return_value=channel),
             ),
@@ -3070,7 +3070,7 @@ class BotRegressionTests(unittest.TestCase):
             send=AsyncMock(side_effect=[result_message, next_control]),
         )
         with patch.object(
-            bot,
+            runtime,
             "resolve_text_channel",
             AsyncMock(return_value=channel),
         ):
@@ -3136,7 +3136,7 @@ class BotRegressionTests(unittest.TestCase):
         )
         with (
             patch.object(
-                bot,
+                runtime,
                 "resolve_text_channel",
                 AsyncMock(return_value=channel),
             ),
