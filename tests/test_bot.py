@@ -2287,28 +2287,28 @@ class BotRegressionTests(unittest.TestCase):
 
         self.assertEqual(view.children, [])
 
-    def test_bail_progress_stage_text_thresholds(self) -> None:
-        """공동 진행 상황 문구는 합계 0/2/4에서만 바뀌고, 필요치에 도달하면 성공 문구가 된다."""
-        self.assertEqual(bot.bail_progress_stage_text(0), bot.BAIL_PROGRESS_STAGES[0][1])
-        self.assertEqual(bot.bail_progress_stage_text(1), bot.BAIL_PROGRESS_STAGES[0][1])
-        self.assertEqual(bot.bail_progress_stage_text(2), bot.BAIL_PROGRESS_STAGES[1][1])
-        self.assertEqual(bot.bail_progress_stage_text(3), bot.BAIL_PROGRESS_STAGES[1][1])
-        self.assertEqual(bot.bail_progress_stage_text(4), bot.BAIL_PROGRESS_STAGES[2][1])
-        self.assertEqual(bot.bail_progress_stage_text(5), bot.BAIL_PROGRESS_STAGES[2][1])
+    def test_bail_progress_stage_image_thresholds(self) -> None:
+        """공동 진행 상황 이미지는 합계 0/2/4에서만 바뀌고, 필요치에 도달하면 성공 이미지가 된다."""
+        self.assertEqual(bot.bail_progress_stage_image(0), bot.BAIL_PROGRESS_STAGES[0][1])
+        self.assertEqual(bot.bail_progress_stage_image(1), bot.BAIL_PROGRESS_STAGES[0][1])
+        self.assertEqual(bot.bail_progress_stage_image(2), bot.BAIL_PROGRESS_STAGES[1][1])
+        self.assertEqual(bot.bail_progress_stage_image(3), bot.BAIL_PROGRESS_STAGES[1][1])
+        self.assertEqual(bot.bail_progress_stage_image(4), bot.BAIL_PROGRESS_STAGES[2][1])
+        self.assertEqual(bot.bail_progress_stage_image(5), bot.BAIL_PROGRESS_STAGES[2][1])
         self.assertEqual(
-            bot.bail_progress_stage_text(bot.BAIL_REQUIRED_SCOOPS),
-            bot.BAIL_PROGRESS_SUCCESS_TEXT,
+            bot.bail_progress_stage_image(bot.BAIL_REQUIRED_SCOOPS),
+            bot.BAIL_PROGRESS_SUCCESS_IMAGE,
         )
 
-    def test_bail_progress_message_text_reflects_resolved_outcome(self) -> None:
+    def test_bail_progress_image_filename_reflects_resolved_outcome(self) -> None:
         survived = self.bail_submitted_pair(3, 3, reward_split=self.bail_even_split())
         sunk = self.bail_submitted_pair(1, 1, reward_split=self.bail_even_split())
 
-        self.assertEqual(bot.bail_progress_message_text(survived), bot.BAIL_PROGRESS_SUCCESS_TEXT)
-        self.assertEqual(bot.bail_progress_message_text(sunk), bot.BAIL_PROGRESS_SUNK_TEXT)
+        self.assertEqual(bot.bail_progress_image_filename(survived), bot.BAIL_PROGRESS_SUCCESS_IMAGE)
+        self.assertEqual(bot.bail_progress_image_filename(sunk), bot.BAIL_PROGRESS_SUNK_IMAGE)
 
     def test_bail_progress_stage_index_counts_up_then_disappears_on_success(self) -> None:
-        """단계 번호는 퍼내기 횟수가 아니라 지금 보이는 문구가 몇 번째인지를 가리킨다."""
+        """단계 번호는 퍼내기 횟수가 아니라 지금 보이는 이미지가 몇 번째인지를 가리킨다."""
         self.assertEqual(bot.bail_progress_stage_index(0), 1)
         self.assertEqual(bot.bail_progress_stage_index(1), 1)
         self.assertEqual(bot.bail_progress_stage_index(2), 2)
@@ -2322,12 +2322,29 @@ class BotRegressionTests(unittest.TestCase):
         pending_embed = bot.build_bail_progress_embed(pending)
         resolved_embed = bot.build_bail_progress_embed(resolved)
 
-        # 진행 문구는 마크다운 헤더(#)로 크게 표시한다.
-        self.assertEqual(pending_embed.description, f"# {bot.BAIL_PROGRESS_STAGES[1][1]}")
+        # 문구 대신 단계별 이미지를 첨부파일 URL로 보여준다.
+        self.assertEqual(
+            pending_embed.image.url, f"attachment://{bot.BAIL_PROGRESS_STAGES[1][1]}"
+        )
         self.assertIn("2/3", pending_embed.footer.text)
-        self.assertEqual(resolved_embed.description, f"# {bot.BAIL_PROGRESS_SUCCESS_TEXT}")
+        self.assertEqual(
+            resolved_embed.image.url, f"attachment://{bot.BAIL_PROGRESS_SUCCESS_IMAGE}"
+        )
         # 정산된 뒤에는 더 이상 '단계'가 아니므로 각주를 붙이지 않는다.
         self.assertFalse(resolved_embed.footer.text)
+
+    def test_bail_progress_embeds_add_caption_only_when_sunk(self) -> None:
+        """침몰이면 사진 밑에 큰 문구를 한 줄 더 붙인다 — 생존/진행 중에는 이미지 하나뿐이다."""
+        pending = self.bail_pair(phase="submitting", scoop_a=2, scoop_b=0)
+        survived = self.bail_submitted_pair(3, 3, reward_split=self.bail_even_split())
+        sunk = self.bail_submitted_pair(1, 1, reward_split=self.bail_even_split())
+
+        self.assertEqual(len(bot.build_bail_progress_embeds(pending)), 1)
+        self.assertEqual(len(bot.build_bail_progress_embeds(survived)), 1)
+
+        sunk_embeds = bot.build_bail_progress_embeds(sunk)
+        self.assertEqual(len(sunk_embeds), 2)
+        self.assertEqual(sunk_embeds[1].description, f"# {bot.BAIL_PROGRESS_SUNK_CAPTION}")
 
     def test_bail_progress_view_has_no_button_once_resolved(self) -> None:
         pending = self.bail_pair(phase="submitting", scoop_a=0, scoop_b=0)

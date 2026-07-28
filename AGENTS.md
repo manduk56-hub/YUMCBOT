@@ -120,11 +120,15 @@ embed/view 빌더 → `close_round_record`(정산) → 슬래시 명령어 → s
 필요가 없다.
 
 **둘이 합쳐 몇 번 퍼냈는지는 실시간으로 공개되지만, 누가 몇 번 퍼냈는지는 정산 전까지 감춘다.**
-공동 진행 상황 메시지는 이제 plain text가 아니라 임베드다(`build_bail_progress_embed`) — 본문은
-`bail_progress_message_text`, 진행 중일 때만 각주에 지금 보이는 문구가 몇 번째 단계인지
-(`bail_progress_stage_index`, 1/2/3)를 붙인다. **이 단계 번호는 퍼내기 횟수가 아니라 문구의
-순서다** — 합계 0/2/4에서만 문구가 바뀌므로(`BAIL_PROGRESS_UPDATE_INTERVAL`) 단계도 그때만
-바뀌고, 필요치에 도달하면 단계 번호 없이 곧장 성공 문구로 바뀐다 — **매 클릭마다 갱신하지 않는다.**
+공동 진행 상황 메시지는 문구가 아니라 단계별 이미지를 보여주는 임베드다(`build_bail_progress_embed`).
+이미지는 `assets/bail_0.png` · `bail_2.png` · `bail_4.png` · `bail_6.png`(성공) · `bail_fail.png`(침몰)
+다섯 장이고, 어느 걸 보여줄지는 `bail_progress_image_filename`이 고른다. 임베드의 `image`는 URL이
+아니라 `attachment://<파일명>`을 가리키므로, 메시지를 보내거나 고쳐 쓸 때마다 같은 파일명의
+`discord.File`을 함께 전달해야 한다(`write_bail_progress_message`) — 안 그러면 그림이 깨진다.
+진행 중일 때만 각주에 지금 보이는 이미지가 몇 번째 단계인지(`bail_progress_stage_index`, 1/2/3)를
+붙인다. **이 단계 번호는 퍼내기 횟수가 아니라 이미지의 순서다** — 합계 0/2/4에서만 이미지가
+바뀌므로(`BAIL_PROGRESS_UPDATE_INTERVAL`) 단계도 그때만 바뀌고, 필요치에 도달하면 단계 번호
+없이 곧장 성공 이미지로 바뀐다 — **매 클릭마다 갱신하지 않는다.**
 지금까지 내가 몇 번 퍼냈는지는 진행판이 아니라 버튼을 누를 때 나오는 ephemeral로만 보인다.
 개인별 분담이 새면 무임승차 여부가 정산 전에 드러나 배신 유인이 무너지므로, 이 부분은 예전의
 "제출 여부 비공개" 규칙과 같은 이유로 여전히 지킨다. 두 사람이 거의 동시에 눌러도 누적이 씹히지

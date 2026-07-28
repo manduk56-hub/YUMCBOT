@@ -190,14 +190,16 @@ BAIL_FAILED_REWARD_POOL = 6  # 협상 결렬 시 감액된 보상금 (둘이 균
 BAIL_REQUIRED_SCOOPS = 6  # 배가 뜨는 데 필요한 두 사람 합계 퍼내기 횟수
 BAIL_SCOOP_COST = 1  # 퍼내기 1회당 차감
 BAIL_PROGRESS_UPDATE_INTERVAL = 2  # 공동 진행 상황 메시지는 합계가 이 배수를 지날 때만 갱신
-# 문턱값 미만 구간은 직전 문턱의 문구를 그대로 보여준다 (합계 0/2/4일 때만 갱신되고 홀수는 건너뜀).
+# 문턱값 미만 구간은 직전 문턱의 이미지를 그대로 보여준다 (합계 0/2/4일 때만 갱신되고 홀수는 건너뜀).
+# 파일은 assets/에 있다 (bail_0.png · bail_2.png · bail_4.png · bail_6.png · bail_fail.png).
 BAIL_PROGRESS_STAGES: list[tuple[int, str]] = [
-    (0, "🌊 보트에 물이 차고 있어! 어서 퍼내야해!"),
-    (2, "🌊 아직도 많이 차고 있어! 좀 더! 얼른!"),
-    (4, "🌊 이제 거의 다 퍼냈어. 조금만 더 노력해!!"),
+    (0, "bail_0.png"),
+    (2, "bail_2.png"),
+    (4, "bail_4.png"),
 ]
-BAIL_PROGRESS_SUCCESS_TEXT = "⛵ 무사히 도달했어! 만세!!"
-BAIL_PROGRESS_SUNK_TEXT = "🌊 침몰... 크아아악"
+BAIL_PROGRESS_SUCCESS_IMAGE = "bail_6.png"
+BAIL_PROGRESS_SUNK_IMAGE = "bail_fail.png"
+BAIL_PROGRESS_SUNK_CAPTION = "크아악!!💢💢"  # 침몰 이미지 아래에 큰 글씨로 한 줄 더 붙인다
 # 침몰 페널티는 보상 몫에 비례한다. 많이 받기로 한 쪽이 더 크게 잃어야
 # "협상에서 욕심낸 만큼 침몰 리스크를 진다"가 성립하고, 적게 받은 쪽에 배신 카드가 생긴다.
 BAIL_SINK_PENALTY_HIGH = 4  # 보상 몫이 많은 쪽
@@ -3447,54 +3449,70 @@ def apply_bail_scoop_click(pair: dict[str, Any], user_id: str) -> int:
     return pair[key]
 
 
-def bail_progress_stage_text(total: int) -> str:
-    """공동 진행 상황 문구. 필요 횟수에 도달하면 성공 문구를 돌려준다."""
+def bail_progress_stage_image(total: int) -> str:
+    """공동 진행 상황 이미지 파일명. 필요 횟수에 도달하면 성공 이미지를 돌려준다."""
     if total >= BAIL_REQUIRED_SCOOPS:
-        return BAIL_PROGRESS_SUCCESS_TEXT
-    stage_text = BAIL_PROGRESS_STAGES[0][1]
-    for threshold, text in BAIL_PROGRESS_STAGES:
+        return BAIL_PROGRESS_SUCCESS_IMAGE
+    image = BAIL_PROGRESS_STAGES[0][1]
+    for threshold, filename in BAIL_PROGRESS_STAGES:
         if total >= threshold:
-            stage_text = text
-    return stage_text
+            image = filename
+    return image
 
 
 def bail_progress_stage_index(total: int) -> int | None:
-    """지금 보이는 문구가 `BAIL_PROGRESS_STAGES`의 몇 번째(1부터)인지. 필요 횟수에 도달해
-    성공 문구로 바뀌었으면(더 이상 '단계'가 아니라 결과이므로) None을 돌려준다."""
+    """지금 보이는 이미지가 `BAIL_PROGRESS_STAGES`의 몇 번째(1부터)인지. 필요 횟수에 도달해
+    성공 이미지로 바뀌었으면(더 이상 '단계'가 아니라 결과이므로) None을 돌려준다."""
     if total >= BAIL_REQUIRED_SCOOPS:
         return None
     index = 1
-    for position, (threshold, _text) in enumerate(BAIL_PROGRESS_STAGES, start=1):
+    for position, (threshold, _filename) in enumerate(BAIL_PROGRESS_STAGES, start=1):
         if total >= threshold:
             index = position
     return index
 
 
-def bail_progress_message_text(pair: dict[str, Any]) -> str:
-    """짝 하나의 공동 진행 상황 메시지 본문. 정산된 뒤에는 최종 결과 문구로 고정된다."""
+def bail_progress_image_filename(pair: dict[str, Any]) -> str:
+    """짝 하나의 공동 진행 상황 이미지 파일명. 정산된 뒤에는 최종 결과 이미지로 고정된다."""
     if str(pair.get("phase")) == "resolved":
         if str(pair.get("outcome")) == "survived":
-            return BAIL_PROGRESS_SUCCESS_TEXT
-        return BAIL_PROGRESS_SUNK_TEXT
+            return BAIL_PROGRESS_SUCCESS_IMAGE
+        return BAIL_PROGRESS_SUNK_IMAGE
     total = int(pair.get("scoop_a") or 0) + int(pair.get("scoop_b") or 0)
-    return bail_progress_stage_text(total)
+    return bail_progress_stage_image(total)
 
 
 def build_bail_progress_embed(pair: dict[str, Any]) -> discord.Embed:
     """공동 진행 상황 메시지 임베드.
 
-    진행 문구는 마크다운 헤더(`#`)로 크게 표시한다 — 물이 차오르는 급박함이 한눈에 들어와야
-    한다. 단계(1/2/3)는 진행 문구가 아니라 참고용이라 각주로만 작게 붙인다.
+    문구 대신 단계별 이미지(0/2/4/6/fail)를 크게 보여준다 — 물이 차오르는 급박함이 그림
+    한 장으로 한눈에 들어와야 한다. 단계(1/2/3)는 이미지가 아니라 참고용이라 각주로만 작게
+    붙인다. 이미지는 URL이 아니라 첨부파일이므로, 호출자가 `bail_progress_image_filename`으로
+    같은 파일명을 `discord.File`로 함께 보내야 실제로 뜬다(`write_bail_progress_message`).
     """
-    embed = discord.Embed(
-        description=f"# {bail_progress_message_text(pair)}", color=BAIL_EMBED_COLOR
-    )
+    embed = discord.Embed(color=BAIL_EMBED_COLOR)
+    embed.set_image(url=f"attachment://{bail_progress_image_filename(pair)}")
     if str(pair.get("phase")) != "resolved":
         total = int(pair.get("scoop_a") or 0) + int(pair.get("scoop_b") or 0)
         stage_index = bail_progress_stage_index(total)
         if stage_index is not None:
             embed.set_footer(text=f"단계 {stage_index}/{len(BAIL_PROGRESS_STAGES)}")
     return embed
+
+
+def build_bail_progress_embeds(pair: dict[str, Any]) -> list[discord.Embed]:
+    """공동 진행 상황 메시지에 실제로 붙일 임베드 목록.
+
+    침몰이면 사진 밑에 큰 문구를 한 줄 더 붙인다 — 임베드 하나로는 이미지 아래에 텍스트를
+    둘 수 없어서(설명은 이미지보다 위에 뜬다), 문구만 담은 두 번째 임베드를 이어 붙여
+    이미지 바로 아래에 오게 한다.
+    """
+    embeds = [build_bail_progress_embed(pair)]
+    if str(pair.get("phase")) == "resolved" and str(pair.get("outcome")) != "survived":
+        embeds.append(
+            discord.Embed(description=f"# {BAIL_PROGRESS_SUNK_CAPTION}", color=BAIL_EMBED_COLOR)
+        )
+    return embeds
 
 
 def bail_negotiations_complete(extra: dict[str, Any]) -> bool:
@@ -3956,21 +3974,33 @@ async def write_bail_progress_message(
     호출자가 이미 `bot.sand_board_lock(thread.id)`를 잡고 있어야 한다 (락은 재진입이 안 되므로
     여기서 다시 잡지 않는다) — `handle_bail_scoop`가 상태 변경과 같은 락 구간에서 바로 호출한다.
     """
-    embed = build_bail_progress_embed(pair)
+    embeds = build_bail_progress_embeds(pair)
     view = bail_progress_view(round_id, pair)
+    image_filename = bail_progress_image_filename(pair)
+    image_path = BASE_DIR / "assets" / image_filename
 
     message_id = str(pair.get("progress_message_id") or "")
     if message_id:
         try:
             message = await thread.fetch_message(int(message_id))
+            # attachments로 첨부 목록을 통째로 바꿔야 이전 단계 이미지가 새 이미지로 실제 교체된다.
             # content=None으로 예전에 plain text로 보냈을 수도 있는 메시지의 잔여 텍스트도 지운다.
-            await message.edit(content=None, embed=embed, view=view)
+            await message.edit(
+                content=None,
+                embeds=embeds,
+                view=view,
+                attachments=[discord.File(image_path, filename=image_filename)],
+            )
             return
         except (discord.NotFound, discord.HTTPException, ValueError):
             pass
 
     try:
-        new_message = await thread.send(embed=embed, view=view)
+        new_message = await thread.send(
+            embeds=embeds,
+            view=view,
+            file=discord.File(image_path, filename=image_filename),
+        )
     except discord.HTTPException:
         return
     save_bail_pair_progress_message_id(round_id, pair, str(new_message.id))
