@@ -14,9 +14,14 @@
 
 from __future__ import annotations
 
+from typing import Any, Awaitable, Callable
+
 import discord
 
 _client: discord.Client | None = None
+
+RoundFinisher = Callable[[int, Any, str], Awaitable[None]]
+_round_finisher: RoundFinisher | None = None
 
 
 def set_client(client: discord.Client) -> None:
@@ -32,6 +37,26 @@ def get_client() -> discord.Client:
             "봇 인스턴스를 만든 뒤 runtime.set_client()를 부르세요."
         )
     return _client
+
+
+def set_round_finisher(finisher: RoundFinisher) -> None:
+    """라운드를 정산하고 결과를 발행하는 함수를 등록한다. 부팅 시 한 번 부른다."""
+    global _round_finisher
+    _round_finisher = finisher
+
+
+async def finish_round(round_id: int, channel: Any, closed_by: str) -> None:
+    """라운드를 닫고 결과 임베드와 다음 미니게임 버튼을 채널에 발행한다.
+
+    게임 모듈이 스스로 라운드를 끝내는 경우(야구 3구 완료처럼 제한 시간이 아니라
+    진행 상황으로 끝나는 게임)에 부른다. 실제 구현은 bot.py에 있다 — 정산은 모든
+    게임의 분기를 아는 `close_round_record`가 하고, 게임 모듈은 그걸 알 필요가 없다.
+    """
+    if _round_finisher is None:
+        raise RuntimeError(
+            "라운드 마감 함수가 등록되지 않았습니다. runtime.set_round_finisher()를 부르세요."
+        )
+    await _round_finisher(round_id, channel, closed_by)
 
 
 async def resolve_text_channel(channel_id: str) -> discord.TextChannel | None:

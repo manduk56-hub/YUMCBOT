@@ -40,14 +40,35 @@ shellcheck deploy/*.sh                                # CI가 도는 배포 스�
 | `yumcbot/db.py` | 스키마·마이그레이션·연결(`db()`) |
 | `yumcbot/activity.py` | 활동 로그(`log_activity`), 규칙 스냅샷 |
 | `yumcbot/scoring.py` | 점수·잠수 코인·룰렛 연승 스택 |
+| `yumcbot/rounds.py` | 라운드 행 조회(`round_extra`·`round_game_key`·`can_join_round` 등). 순수 조회만 |
+| `yumcbot/runtime.py` | 게임 모듈이 bot.py 쪽 기능을 부르는 통로 (아래 참고) |
 | `yumcbot/roulette.py` | 러시안룰렛 전체 |
 | `yumcbot/games/registry.py` | 게임 목록(`GameSpec`)과 정산 훅 디스패치 |
-| `bot.py` | 아직 옮기지 않은 나머지 + `EventBot` + 슬래시 명령어 + 엔트리포인트 |
+| `yumcbot/games/baseball.py` | 야구 전체 (`/준비` 껍데기만 bot.py) |
+| `bot.py` | 아직 옮기지 않은 게임들 + `EventBot` + 슬래시 명령어 + 엔트리포인트 |
 
 의존은 위에서 아래 한 방향이다. `bot.py`는 옮긴 이름을 재노출해서 기존 호출부와 테스트를 그대로
 살려두고 있는데, 재노출은 사본이라 원본과 갈라질 수 있다 — `tests/test_packaging.py`가 그걸 막는다.
-**경로 상수(`DB_PATH` 등)만은 재노출하지 않는다.** 사본이 있으면 테스트가 임시 DB로 갈아끼웠다고
-믿으면서 실제로는 운영 경로를 여는, 증상 없는 실패가 난다. 항상 `config.DB_PATH`를 조회한다.
+**경로 상수(`DB_PATH` 등)와 `resolve_text_channel`은 재노출하지 않는다.** 사본이 있으면 테스트가
+임시 DB나 가짜 채널로 갈아끼웠다고 믿으면서 실제 경로를 여는, 증상 없는 실패가 난다.
+`config.DB_PATH` / `runtime.resolve_text_channel(...)`처럼 **모듈을 거쳐** 조회한다.
+
+### 게임 모듈이 위쪽을 부를 때는 `runtime.py`를 거친다
+
+게임 모듈은 bot.py를 import 할 수 없다 — bot.py가 게임 모듈을 부르므로 곧바로 순환이 된다.
+그런데 게임은 **인터랙션이 없는 자리에서도** 위쪽 기능이 필요하다(타이머 콜백에서 채널 열기,
+스스로 라운드 끝내기). 그래서 부팅 시 bot.py가 `runtime`에 등록해두고 게임 모듈이 꺼내 쓴다.
+
+| 등록 | 쓰는 곳 | 빠뜨리면 |
+| --- | --- | --- |
+| `runtime.set_client(bot)` | `resolve_text_channel`, 타이머 스케줄 | 클릭으로 하는 조작은 멀쩡하고 타이머 경로만 죽는다 |
+| `runtime.set_round_finisher(...)` | 게임이 스스로 라운드를 끝낼 때(야구 3구 완료) | 마지막 결과만 뜨고 정산이 안 된다 |
+
+`EventBot`의 메서드가 필요할 때는 구체 타입 대신 `runtime_checkable` 프로토콜로 확인한다
+(`roulette.RouletteTimerClient`, `games.baseball.BaseballTimerClient`). **타이머 태스크 자체는
+`EventBot`이 들고 있고**(재시작 복구도 거기서 한다) 게임 모듈은 스케줄을 요청만 한다.
+프로토콜은 메서드 이름만 보므로 `EventBot` 쪽 이름이 바뀌면 `isinstance`가 조용히 False가 된다 —
+`tests/test_packaging.py`가 양쪽을 붙잡아 둔다.
 
 `bot.py`에 남은 구역 순서는 대략:
 게임별 상태 전이 함수 → `EventBot` 클래스 → embed/view 빌더 → `close_round_record`(정산) →

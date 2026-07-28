@@ -19,10 +19,10 @@ from unittest.mock import patch
 import bot
 from yumcbot import activity, config, rounds, roulette, runtime, scoring
 from yumcbot import db as schema
-from yumcbot.games import registry
+from yumcbot.games import baseball, registry
 
 # bot.py가 재노출하는 모듈들. 새로 추출할 때마다 여기에 추가한다.
-EXTRACTED = (config, schema, activity, scoring, roulette, registry, rounds)
+EXTRACTED = (config, schema, activity, scoring, roulette, registry, rounds, baseball)
 
 
 def public_names(module: types.ModuleType) -> set[str]:
@@ -124,6 +124,37 @@ class RouletteTimerProtocolTest(unittest.TestCase):
         self.assertIn(
             "restore_roulette_turn_tasks", bot.EventBot.on_ready.__code__.co_names
         )
+
+
+class BaseballWiringTest(unittest.TestCase):
+    """야구는 게임 모듈로 옮긴 첫 게임이라 bot.py와 이어지는 지점이 여럿이다.
+
+    어느 하나가 끊겨도 예외는 나지 않고 해당 경로만 조용히 죽는다.
+    """
+
+    def test_timer_protocol_is_satisfied_by_event_bot(self) -> None:
+        """끊기면 투구 타이머가 안 걸려 와인드업에서 멈춘다."""
+        self.assertIsInstance(bot.bot, baseball.BaseballTimerClient)
+
+    def test_protocol_rejects_unrelated_objects(self) -> None:
+        class Unrelated:
+            pass
+
+        self.assertNotIsInstance(Unrelated(), baseball.BaseballTimerClient)
+
+    def test_round_finisher_is_registered(self) -> None:
+        """3구를 다 던진 뒤 라운드를 닫는 통로. 빠지면 3구째 결과만 뜨고 정산이 없다."""
+        self.assertIs(runtime._round_finisher, bot.finish_round_and_publish)
+
+    def test_pitch_timer_restore_is_registered_on_ready(self) -> None:
+        """재시작 시 진행 중이던 구의 타이머를 되살린다 (라운드 타이머와 별개다)."""
+        self.assertIn(
+            "restore_baseball_pitch_tasks", bot.EventBot.on_ready.__code__.co_names
+        )
+
+    def test_prepare_command_is_registered_as_slash_command(self) -> None:
+        """`/준비`가 야구를 진행시키는 유일한 입구다."""
+        self.assertIsNotNone(bot.bot.tree.get_command("준비"))
 
 
 class EntrypointTest(unittest.TestCase):
