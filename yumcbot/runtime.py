@@ -14,14 +14,37 @@
 
 from __future__ import annotations
 
-from typing import Any, Awaitable, Callable
+from typing import Any, Protocol, runtime_checkable
 
 import discord
 
 _client: discord.Client | None = None
 
-RoundFinisher = Callable[[int, Any, str], Awaitable[None]]
-_round_finisher: RoundFinisher | None = None
+
+@runtime_checkable
+class RoundServices(Protocol):
+    """게임 모듈이 라운드를 끝낼 때 필요한 bot.py 쪽 기능들.
+
+    게임이 스스로 라운드를 끝내는 경우가 있다 — 야구는 3구를 다 던지면, 모래성은
+    모든 짝이 게임을 마치면 제한 시간과 무관하게 끝난다. 그때 정산과 결과 발행이
+    필요한데, 정산은 **모든 게임의 분기를 아는** `close_round_record`가 해야 하므로
+    게임 모듈이 직접 부를 수 없다(그쪽이 레지스트리를 거쳐 다시 게임 모듈을 부른다).
+
+    묶어서 두는 이유는 셋이 늘 같이 쓰이면서도 **순서와 조건이 게임마다 다르기**
+    때문이다. 야구는 정산 결과가 없어도 이벤트 요약을 시도하고, 모래성은 그 자리에서
+    멈춘다. 한 번에 다 해주는 함수로 감싸면 그 차이를 표현할 수 없다.
+    """
+
+    def close_round(
+        self, round_id: int, guild: Any, closed_by: str
+    ) -> tuple[str, discord.Embed] | None: ...
+
+    def next_mini_game_view(self, round_id: int) -> discord.ui.View | None: ...
+
+    async def publish_event_summary(self, event_session_id: int | None) -> None: ...
+
+
+_round_services: RoundServices | None = None
 
 
 def set_client(client: discord.Client) -> None:
@@ -39,24 +62,18 @@ def get_client() -> discord.Client:
     return _client
 
 
-def set_round_finisher(finisher: RoundFinisher) -> None:
-    """라운드를 정산하고 결과를 발행하는 함수를 등록한다. 부팅 시 한 번 부른다."""
-    global _round_finisher
-    _round_finisher = finisher
+def set_round_services(services: RoundServices) -> None:
+    """라운드 마감 서비스를 등록한다. 부팅 시 한 번 부른다."""
+    global _round_services
+    _round_services = services
 
 
-async def finish_round(round_id: int, channel: Any, closed_by: str) -> None:
-    """라운드를 닫고 결과 임베드와 다음 미니게임 버튼을 채널에 발행한다.
-
-    게임 모듈이 스스로 라운드를 끝내는 경우(야구 3구 완료처럼 제한 시간이 아니라
-    진행 상황으로 끝나는 게임)에 부른다. 실제 구현은 bot.py에 있다 — 정산은 모든
-    게임의 분기를 아는 `close_round_record`가 하고, 게임 모듈은 그걸 알 필요가 없다.
-    """
-    if _round_finisher is None:
+def round_services() -> RoundServices:
+    if _round_services is None:
         raise RuntimeError(
-            "라운드 마감 함수가 등록되지 않았습니다. runtime.set_round_finisher()를 부르세요."
+            "라운드 마감 서비스가 등록되지 않았습니다. runtime.set_round_services()를 부르세요."
         )
-    await _round_finisher(round_id, channel, closed_by)
+    return _round_services
 
 
 async def resolve_text_channel(channel_id: str) -> discord.TextChannel | None:

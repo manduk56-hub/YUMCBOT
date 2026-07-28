@@ -20,7 +20,7 @@ from __future__ import annotations
 import asyncio
 import random
 import sqlite3
-from typing import Protocol, runtime_checkable
+from typing import Any, Protocol, runtime_checkable
 
 import discord
 
@@ -31,6 +31,7 @@ from ..config import (
 from ..db import (
     db,
 )
+from .registry import GAME_NAMES
 
 
 @runtime_checkable
@@ -44,6 +45,8 @@ class PairBoardClient(Protocol):
     """
 
     def schedule_auto_close(self, round_id: int, close_at: float) -> None: ...
+
+    def cancel_auto_close(self, round_id: int) -> None: ...
 
     def sand_board_lock(self, thread_id: int) -> asyncio.Lock: ...
 
@@ -228,3 +231,24 @@ def emergency_join_view(round_id: int) -> discord.ui.View:
 
 def emergency_join_notice(emergency_user_id: str) -> str:
     return f"<@{emergency_user_id}>님이 긴급 투입되어 전체 진행 시간이 1분 연장되었습니다."
+
+
+async def update_trust_main_message(transition: dict[str, Any]) -> None:
+    """단계 전이 후 메인 채널의 안내 메시지를 갈아끼운다.
+
+    이름만 trust일 뿐 메인게임 셋이 모두 쓴다(딜레마의 섬에서 먼저 만들어졌다).
+    메시지가 없으면 새로 보낸다 — 재시작 등으로 원본을 잃은 경우다.
+    """
+    try:
+        client = runtime.get_client()
+        channel = client.get_channel(int(transition["channel_id"]))
+        if channel is None:
+            channel = await client.fetch_channel(int(transition["channel_id"]))
+        message_id = transition.get("message_id")
+        if message_id:
+            message = await channel.fetch_message(int(message_id))
+            await message.edit(embed=transition["embed"], view=transition.get("view"))
+        elif hasattr(channel, "send"):
+            await channel.send(embed=transition["embed"], view=transition.get("view"))
+    except discord.HTTPException:
+        return

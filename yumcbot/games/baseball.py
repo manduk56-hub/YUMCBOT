@@ -919,6 +919,7 @@ async def publish_baseball_pitch_result(round_id: int, pitch_number: int) -> boo
         except discord.HTTPException:
             pass
 
+    round_row = advanced["round"]
     extra = advanced["extra"]
     if result["message_id"]:
         try:
@@ -936,7 +937,11 @@ async def publish_baseball_pitch_result(round_id: int, pitch_number: int) -> boo
             pass
 
     if advanced["complete"]:
-        await runtime.finish_round(round_id, channel, "3구 완료")
+        services = runtime.round_services()
+        final = services.close_round(round_id, getattr(channel, "guild", None), "3구 완료")
+        if final:
+            await channel.send(embed=final[1], view=services.next_mini_game_view(round_id))
+        await services.publish_event_summary(round_row["event_session_id"])
     return True
 
 

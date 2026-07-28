@@ -47,7 +47,7 @@ shellcheck deploy/*.sh                                # CI가 도는 배포 스�
 | `yumcbot/games/registry.py` | 게임 목록(`GameSpec`)과 정산 훅 디스패치 |
 | `yumcbot/games/pairing.py` | 메인게임 셋이 공유하는 1:1 짝 매칭·비공개 방 |
 | `yumcbot/games/baseball.py` | 야구 전체 (`/준비` 껍데기만 bot.py) |
-| `yumcbot/games/bail.py` | 가라앉는 배 전체 |
+| `yumcbot/games/bail.py` · `sand.py` · `trust.py` | 메인게임 셋 |
 | `bot.py` | 아직 옮기지 않은 게임들 + `EventBot` + 슬래시 명령어 + 엔트리포인트 |
 
 의존은 위에서 아래 한 방향이다. `bot.py`는 옮긴 이름을 재노출해서 기존 호출부와 테스트를 그대로
@@ -65,7 +65,11 @@ shellcheck deploy/*.sh                                # CI가 도는 배포 스�
 | 등록 | 쓰는 곳 | 빠뜨리면 |
 | --- | --- | --- |
 | `runtime.set_client(bot)` | `resolve_text_channel`·`resolve_thread`, 타이머 스케줄 | 클릭으로 하는 조작은 멀쩡하고 타이머 경로만 죽는다 |
-| `runtime.set_round_finisher(...)` | 게임이 스스로 라운드를 끝낼 때(야구 3구 완료) | 마지막 결과만 뜨고 정산이 안 된다 |
+| `runtime.set_round_services(...)` | 게임이 스스로 라운드를 끝낼 때(야구 3구 완료, 모래성 전원 종료) | 마지막 결과만 뜨고 정산이 안 된다 |
+
+`RoundServices`는 정산·다음 미니게임 뷰·이벤트 요약 **셋을 따로** 노출한다. 한 번에 다 해주는
+함수로 감싸지 않는 이유는 순서와 조건이 게임마다 다르기 때문이다 — 야구는 정산 결과가 없어도
+이벤트 요약을 시도하고, 모래성은 그 자리에서 멈춘다.
 
 `EventBot`의 메서드가 필요할 때는 구체 타입 대신 `runtime_checkable` 프로토콜로 확인한다
 (`roulette.RouletteTimerClient`, `games.baseball.BaseballTimerClient`, `games.pairing.PairBoardClient`).
@@ -75,6 +79,10 @@ False가 된다 — `tests/test_packaging.py`가 양쪽을 붙잡아 둔다.
 
 **게임 모듈의 상수를 테스트에서 갈아끼울 때는 그 모듈을 patch한다.** `patch.object(bot, "BAIL_...")`은
 bot.py의 재노출 사본만 바꾸므로 게임 모듈에 닿지 않는다 — `patch.object(bail, "BAIL_...")`이 맞다.
+
+**모듈을 옮길 때 import를 빠뜨려도 아무 증상이 없다.** 파일은 정상으로 import 되고 테스트도 통과하며,
+그 함수가 실제로 불릴 때에야 `NameError`로 터진다. `tests/test_packaging.py`의
+`ImportCompletenessTest`가 모든 모듈을 AST로 훑어 이걸 잡는다.
 
 `bot.py`에 남은 구역 순서는 대략:
 게임별 상태 전이 함수 → `EventBot` 클래스 → embed/view 빌더 → `close_round_record`(정산) →

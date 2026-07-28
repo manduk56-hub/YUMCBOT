@@ -10,6 +10,8 @@ bot.py는 아직 yumcbot.config / yumcbot.db의 이름을 재노출한다. 재�
 
 from __future__ import annotations
 
+import ast
+import builtins
 import tempfile
 import types
 import unittest
@@ -19,12 +21,12 @@ from unittest.mock import patch
 import bot
 from yumcbot import activity, config, rounds, roulette, runtime, scoring, ui
 from yumcbot import db as schema
-from yumcbot.games import bail, baseball, pairing, registry
+from yumcbot.games import bail, baseball, pairing, registry, sand, trust
 
 # bot.py가 재노출하는 모듈들. 새로 추출할 때마다 여기에 추가한다.
 EXTRACTED = (
     config, schema, activity, scoring, roulette, registry, rounds, baseball, ui,
-    pairing, bail,
+    pairing, bail, sand, trust,
 )
 
 
@@ -145,9 +147,9 @@ class BaseballWiringTest(unittest.TestCase):
 
         self.assertNotIsInstance(Unrelated(), baseball.BaseballTimerClient)
 
-    def test_round_finisher_is_registered(self) -> None:
+    def test_round_services_are_registered(self) -> None:
         """3구를 다 던진 뒤 라운드를 닫는 통로. 빠지면 3구째 결과만 뜨고 정산이 없다."""
-        self.assertIs(runtime._round_finisher, bot.finish_round_and_publish)
+        self.assertIsInstance(runtime.round_services(), runtime.RoundServices)
 
     def test_pitch_timer_restore_is_registered_on_ready(self) -> None:
         """재시작 시 진행 중이던 구의 타이머를 되살린다 (라운드 타이머와 별개다)."""
@@ -177,8 +179,68 @@ class PairGameWiringTest(unittest.TestCase):
 
         self.assertNotIsInstance(Unrelated(), pairing.PairBoardClient)
 
-    def test_bail_settles_through_the_registry(self) -> None:
-        self.assertIs(registry.settler_for("bail"), bail.settle_bail)
+    def test_main_games_settle_through_the_registry(self) -> None:
+        for key, expected in (
+            ("bail", bail.settle_bail),
+            ("sand", sand.settle_sand),
+            ("trust", trust.settle_trust),
+        ):
+            with self.subTest(game=key):
+                self.assertIs(registry.settler_for(key), expected)
+
+
+def unresolved_names(path: Path) -> list[str]:
+    """모듈이 정의하지도 import 하지도 않은 채 읽는 이름을 모은다."""
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    defined = set(dir(builtins)) | {"__name__", "__file__", "__doc__"}
+    for node in ast.walk(tree):
+        if isinstance(
+            node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)
+        ):
+            if not isinstance(node, ast.Lambda):
+                defined.add(node.name)
+            args = getattr(node, "args", None)
+            if args:
+                defined |= {
+                    a.arg for a in args.args + args.kwonlyargs + args.posonlyargs
+                }
+                if args.vararg:
+                    defined.add(args.vararg.arg)
+                if args.kwarg:
+                    defined.add(args.kwarg.arg)
+        elif isinstance(node, (ast.Import, ast.ImportFrom)):
+            for alias in node.names:
+                defined.add(alias.asname or alias.name.split(".")[0])
+        elif isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store):
+            defined.add(node.id)
+        elif isinstance(node, ast.ExceptHandler) and node.name:
+            defined.add(node.name)
+        elif isinstance(node, ast.Global):
+            defined |= set(node.names)
+    used = {
+        node.id
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load)
+    }
+    return sorted(used - defined)
+
+
+class ImportCompletenessTest(unittest.TestCase):
+    """모듈을 옮기다 import를 빠뜨리면 그 함수가 불릴 때까지 아무 일도 없다.
+
+    파일은 정상으로 import 되고 테스트도 통과한다. 실제로는 이벤트 진행 중
+    NameError로 터진다 — 실제로 `pairing.GAME_NAMES`가 이렇게 빠져서, `/start`로
+    메인게임을 시작하는 경로만 죽어 있었다.
+    """
+
+    def test_no_module_reads_an_undefined_name(self) -> None:
+        root = Path(bot.__file__).resolve().parent
+        offenders = {}
+        for path in sorted(root.glob("yumcbot/**/*.py")) + [root / "bot.py"]:
+            missing = unresolved_names(path)
+            if missing:
+                offenders[path.relative_to(root).as_posix()] = missing
+        self.assertEqual(offenders, {}, "import 되지 않은 이름을 읽는 모듈이 있습니다.")
 
 
 class EntrypointTest(unittest.TestCase):
