@@ -43,7 +43,9 @@ shellcheck deploy/*.sh                                # CI가 도는 배포 스�
 | `yumcbot/rounds.py` | 라운드 행 조회(`round_extra`·`round_game_key`·`can_join_round` 등). 순수 조회만 |
 | `yumcbot/runtime.py` | 게임 모듈이 bot.py 쪽 기능을 부르는 통로 (아래 참고) |
 | `yumcbot/roulette.py` | 러시안룰렛 전체 |
+| `yumcbot/ui.py` | 임베드 표시 유틸(`field_text`·`close_time_text` 등). 전부 순수 함수 |
 | `yumcbot/games/registry.py` | 게임 목록(`GameSpec`)과 정산 훅 디스패치 |
+| `yumcbot/games/pairing.py` | 메인게임 셋이 공유하는 1:1 짝 매칭·비공개 방 |
 | `yumcbot/games/baseball.py` | 야구 전체 (`/준비` 껍데기만 bot.py) |
 | `bot.py` | 아직 옮기지 않은 게임들 + `EventBot` + 슬래시 명령어 + 엔트리포인트 |
 

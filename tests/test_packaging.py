@@ -17,12 +17,14 @@ from pathlib import Path
 from unittest.mock import patch
 
 import bot
-from yumcbot import activity, config, rounds, roulette, runtime, scoring
+from yumcbot import activity, config, rounds, roulette, runtime, scoring, ui
 from yumcbot import db as schema
-from yumcbot.games import baseball, registry
+from yumcbot.games import baseball, pairing, registry
 
 # bot.py가 재노출하는 모듈들. 새로 추출할 때마다 여기에 추가한다.
-EXTRACTED = (config, schema, activity, scoring, roulette, registry, rounds, baseball)
+EXTRACTED = (
+    config, schema, activity, scoring, roulette, registry, rounds, baseball, ui, pairing,
+)
 
 
 def public_names(module: types.ModuleType) -> set[str]:

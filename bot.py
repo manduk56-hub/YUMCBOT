@@ -114,6 +114,24 @@ from yumcbot.games.registry import (
     register_settler,
     settler_for,
 )
+from yumcbot.ui import (
+    add_field_divider,
+    choice_display,
+    close_time_text,
+    field_text,
+    member_name,
+    mention_list,
+)
+from yumcbot.games.pairing import (
+    build_random_trust_pairs,
+    create_pair_thread,
+    emergency_join_notice,
+    emergency_join_view,
+    ensure_pair_thread_permissions,
+    recent_match_pairs,
+    save_pair_thread_id,
+    warn_failed_pair_threads,
+)
 from yumcbot.games import baseball
 from yumcbot.games.baseball import (
     _baseball_pitch_result,
@@ -466,23 +484,6 @@ async def publish_event_summary_if_complete(event_session_id: int | None) -> Non
         pass
 
 
-def mention_list(user_ids: list[str], limit: int = 40, sep: str = ", ") -> str:
-    if not user_ids:
-        return "없음"
-    mentions = [f"<@{user_id}>" for user_id in user_ids[:limit]]
-    suffix = f"\n외 {len(user_ids) - limit}명" if len(user_ids) > limit else ""
-    return sep.join(mentions) + suffix
-
-
-def add_field_divider(embed: discord.Embed) -> None:
-    """임베드 필드 사이에 가로 구분선을 넣어 섹션 경계를 분명히 한다.
-
-    임베드는 필드 사이에 굵은 가로줄을 못 넣으므로, 이름이 빈(폭 0 공백) 전체폭 필드에
-    선 문자를 채워 대신한다.
-    """
-    embed.add_field(name="​", value="━" * 15, inline=False)
-
-
 def format_my_score_message(third_score: int | None, my_score: int) -> str:
     """3등 점수와 내 점수만 알려준다. 이름은 넣지 않는다.
 
@@ -561,38 +562,6 @@ async def current_guild_member(guild: discord.Guild, user_id: str) -> discord.Me
         return await guild.fetch_member(int(user_id))
     except discord.NotFound:
         return None
-
-
-def field_text(lines: list[str], empty: str = "없음", limit: int = 1024) -> str:
-    text = "\n".join(lines) if lines else empty
-    return text if len(text) <= limit else text[: limit - 3] + "..."
-
-
-def member_name(guild: discord.Guild | None, user_id: str) -> str | None:
-    """멤버 캐시에서 표시 이름을 읽는다. 미스면 None.
-
-    반환값은 add_score()의 display_name 인자로만 흘러가며, None이면 upsert가
-    기존 이름을 보존한다. 예전엔 미스 시 'User <id>' 플레이스홀더를 반환해 그게
-    DB에 그대로 덮여쓰였다 (issue #19). 결과는 embed 멘션으로 표시되므로 표시용
-    플레이스홀더는 따로 필요 없다."""
-    if guild:
-        member = guild.get_member(int(user_id))
-        if member:
-            return member.display_name
-    return None
-
-
-def choice_display(choice: str, game_key: str | None = None) -> str:
-    if game_key == "unique_number" and choice in UNIQUE_NUMBER_CHOICES:
-        return f"{choice}번"
-    if choice in DEFUSE_COLOR_BY_ID:
-        color = DEFUSE_COLOR_BY_ID[choice]
-        return f"{color['emoji']} {color['name']}"
-    if choice == TOP3_NONE_CHOICE:
-        return "선택하지 않는다"
-    if choice in CUTTING_LEVEL_CHOICES:
-        return f"{choice}강화"
-    return choice
 
 
 def operator_role_ids() -> set[int]:
@@ -1085,63 +1054,6 @@ class AnonymousDiscussionModal(discord.ui.Modal):
             pass
 
 
-def recent_match_pairs(
-    conn: sqlite3.Connection,
-    round_id: int,
-    round_type: str,
-    history_rounds: int = MATCH_HISTORY_ROUNDS,
-) -> set[tuple[str, str]]:
-    """직전 `history_rounds`개 같은 타입 라운드에서 성사된 1:1 짝을 정규화해 모은다.
-
-    trust·sand 모두 `trust_pairings`에 짝을 남기므로 `round_type`으로 갈라 조회한다.
-    """
-    history_rows = conn.execute(
-        """
-        SELECT id FROM rounds
-        WHERE type = ? AND id < ?
-        ORDER BY id DESC
-        LIMIT ?
-        """,
-        (round_type, round_id, history_rounds),
-    ).fetchall()
-    history_ids = [int(row["id"]) for row in history_rows]
-    if not history_ids:
-        return set()
-    placeholders = ", ".join("?" for _ in history_ids)
-    history_pairs = conn.execute(
-        f"SELECT user_a_id, user_b_id FROM trust_pairings WHERE round_id IN ({placeholders})",
-        tuple(history_ids),
-    ).fetchall()
-    return {
-        tuple(sorted((str(row["user_a_id"]), str(row["user_b_id"]))))
-        for row in history_pairs
-    }
-
-
-def build_random_trust_pairs(
-    user_ids: list[str],
-    recent_pairs: set[tuple[str, str]],
-) -> tuple[list[tuple[str, str]], str | None]:
-    participants = list(user_ids)
-    unmatched_user_id = None
-    if len(participants) % 2:
-        unmatched_user_id = random.choice(participants)
-        participants.remove(unmatched_user_id)
-
-    best_pairs: list[tuple[str, str]] = []
-    best_penalty: int | None = None
-    for _ in range(200):
-        shuffled = random.sample(participants, len(participants))
-        pairs = [(shuffled[index], shuffled[index + 1]) for index in range(0, len(shuffled), 2)]
-        penalty = sum(tuple(sorted(pair)) in recent_pairs for pair in pairs)
-        if best_penalty is None or penalty < best_penalty:
-            best_pairs = pairs
-            best_penalty = penalty
-        if penalty == 0:
-            break
-    return best_pairs, unmatched_user_id
-
-
 def start_trust_decision(round_id: int) -> dict[str, Any] | None:
     with db() as conn:
         round_row = conn.execute(
@@ -1277,71 +1189,6 @@ async def archive_round_discussion_thread(
         if isinstance(thread, discord.Thread):
             await thread.edit(archived=True, locked=True, reason=reason)
     except (discord.HTTPException, ValueError):
-        pass
-
-
-async def create_pair_thread(
-    channel: discord.TextChannel,
-    thread_name: str,
-    member_ids: list[str],
-    reason: str,
-    view: discord.ui.View,
-    content: str | None = None,
-    embed: discord.Embed | None = None,
-) -> tuple[discord.Thread, discord.Message] | None:
-    """짝 하나를 위한 비공개 스레드를 열고 첫 메시지를 올린다. 실패하면 None.
-
-    딜레마의 섬 · 모래성 · 긴급투입이 모두 이 헬퍼를 쓴다.
-    보관되면 `스레드 관리` 권한이 없는 유저의 버튼 클릭이 막히므로 보관 시간을 넉넉히 잡는다.
-
-    초대는 짝 두 사람뿐이다. 운영자도 게임에 참여할 수 있으므로 참관용으로 방에 넣지 않는다.
-    운영자는 `스레드 관리` 권한으로 스레드 목록에서 필요한 방만 골라 보면 된다.
-    """
-    try:
-        thread = await channel.create_thread(
-            name=thread_name[:100],
-            type=discord.ChannelType.private_thread,
-            invitable=False,
-            auto_archive_duration=1440,
-            reason=reason,
-        )
-    except (discord.Forbidden, discord.HTTPException):
-        return None
-
-    for user_id in member_ids:
-        try:
-            await thread.add_user(discord.Object(id=int(user_id)))
-        except (discord.HTTPException, ValueError):
-            pass
-
-    try:
-        message = await thread.send(content=content, embed=embed, view=view)
-    except discord.HTTPException:
-        return None
-    return thread, message
-
-
-def save_pair_thread_id(round_id: int, user_a_id: str, user_b_id: str, thread_id: str) -> None:
-    with db() as conn:
-        conn.execute(
-            """
-            UPDATE trust_pairings
-            SET discussion_thread_id = ?
-            WHERE round_id = ? AND user_a_id = ? AND user_b_id = ?
-            """,
-            (thread_id, round_id, user_a_id, user_b_id),
-        )
-
-
-async def warn_failed_pair_threads(channel: discord.TextChannel, round_id: int, failed: int) -> None:
-    if not failed:
-        return
-    try:
-        await channel.send(
-            f"라운드 #{round_id}의 비공개 방 {failed}개를 만들지 못했습니다. "
-            "봇의 비공개 스레드 생성·관리 권한을 확인해주세요."
-        )
-    except discord.HTTPException:
         pass
 
 
@@ -4622,24 +4469,6 @@ def trust_registration_view(round_id: int) -> discord.ui.View:
     return view
 
 
-def emergency_join_view(round_id: int) -> discord.ui.View:
-    """참가자가 홀수라 짝이 없는 사람이 생겼을 때만 메인 메시지에 붙는다."""
-    view = discord.ui.View(timeout=None)
-    view.add_item(
-        discord.ui.Button(
-            label="긴급 투입하기",
-            emoji="🚨",
-            style=discord.ButtonStyle.danger,
-            custom_id=f"eventbot:emergency:{round_id}",
-        )
-    )
-    return view
-
-
-def emergency_join_notice(emergency_user_id: str) -> str:
-    return f"<@{emergency_user_id}>님이 긴급 투입되어 전체 진행 시간이 1분 연장되었습니다."
-
-
 def build_trust_decision_embed(
     round_id: int,
     title: str,
@@ -5240,13 +5069,6 @@ def cutting_action_view(round_id: int, disabled: bool = False) -> discord.ui.Vie
         )
     )
     return view
-
-
-def close_time_text(close_at: float | None) -> str:
-    if not close_at:
-        return "수동 마감"
-    timestamp = int(float(close_at))
-    return f"<t:{timestamp}:F>"
 
 
 def auto_close_action_label(round_row: sqlite3.Row | dict[str, Any]) -> str:
@@ -6292,39 +6114,6 @@ def parse_duration_minutes(value: str) -> int:
     if minutes < 1 or minutes > 1440:
         raise ValueError("진행 시간은 1분부터 1440분 사이로 입력해주세요.")
     return minutes
-
-
-async def ensure_pair_thread_permissions(
-    interaction: discord.Interaction,
-    게임: str,
-    channel: discord.TextChannel,
-) -> bool:
-    """딜레마의 섬·모래성은 짝마다 비공개 스레드를 연다. 시작 전에 권한을 확인한다."""
-    game_name = GAME_NAMES[게임]
-    guild = interaction.guild
-    if guild is None:
-        await interaction.followup.send("서버에서 봇 권한을 확인하지 못했습니다.", ephemeral=True)
-        return False
-
-    bot_member = guild.me
-    if bot_member is None:
-        await interaction.followup.send("서버에서 봇 권한을 확인하지 못했습니다.", ephemeral=True)
-        return False
-
-    permissions = channel.permissions_for(bot_member)
-    if (
-        permissions.create_private_threads
-        and permissions.send_messages_in_threads
-        and permissions.manage_threads
-    ):
-        return True
-
-    await interaction.followup.send(
-        f"{game_name}에는 봇의 `비공개 스레드 만들기`, `스레드에서 메시지 보내기`, "
-        "`스레드 관리` 권한이 필요합니다.",
-        ephemeral=True,
-    )
-    return False
 
 
 class StartSetupModal(discord.ui.Modal):

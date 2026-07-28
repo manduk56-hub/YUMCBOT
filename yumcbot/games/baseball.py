@@ -103,6 +103,7 @@ async def delete_baseball_control_message(round_row: sqlite3.Row | dict[str, Any
     except (discord.HTTPException, ValueError):
         pass
 
+
 def prepare_baseball_pitch(
     round_id: int,
     actor_user_id: str,
@@ -157,6 +158,7 @@ def prepare_baseball_pitch(
         )
         return {"round": dict(round_row), "extra": extra, "pitch_number": pitch_number}
 
+
 def set_baseball_activation_at(
     round_id: int,
     pitch_number: int,
@@ -197,6 +199,7 @@ def set_baseball_activation_at(
             (json.dumps(extra, ensure_ascii=False), round_id),
         )
 
+
 def reset_baseball_prepare(round_id: int, pitch_number: int) -> None:
     """와인드업 판 게시나 활성화에 실패하면 관리자가 /준비를 다시 실행할 수 있게 한다."""
     with db() as conn:
@@ -232,6 +235,7 @@ def reset_baseball_prepare(round_id: int, pitch_number: int) -> None:
             "UPDATE rounds SET extra_json = ? WHERE id = ?",
             (json.dumps(extra, ensure_ascii=False), round_id),
         )
+
 
 def begin_baseball_pitch(
     round_id: int,
@@ -288,6 +292,7 @@ def begin_baseball_pitch(
             "result_at": result_at,
         }
 
+
 def set_baseball_pitch_visible_at(
     round_id: int,
     pitch_number: int,
@@ -341,6 +346,7 @@ def set_baseball_pitch_visible_at(
             (json.dumps(extra, ensure_ascii=False), round_id),
         )
     return {"started_at": visible_at, "result_at": result_at}
+
 
 def record_baseball_swing(
     round_id: int,
@@ -448,6 +454,7 @@ def record_baseball_swing(
             "score": 0,
         }
 
+
 def _baseball_pitch_result(
     conn: sqlite3.Connection,
     round_row: sqlite3.Row,
@@ -496,6 +503,7 @@ def _baseball_pitch_result(
         "participants": participants,
         "swings": swings,
     }
+
 
 def baseball_final_standings(
     conn: sqlite3.Connection,
@@ -572,6 +580,7 @@ def baseball_final_standings(
         standing["score"] = BASEBALL_RANK_POINTS.get(rank, 0)
     return standings
 
+
 def settle_baseball_pitch(round_id: int, pitch_number: int) -> dict[str, Any] | None:
     """한 투구의 순위만 확정한다. 점수는 3구 평균 최종 순위에서 한 번 지급한다."""
     with db() as conn:
@@ -639,6 +648,7 @@ def settle_baseball_pitch(round_id: int, pitch_number: int) -> dict[str, Any] | 
         )
         return _baseball_pitch_result(conn, round_row, pitch_number)
 
+
 def advance_baseball_pitch(
     round_id: int,
     pitch_number: int,
@@ -694,6 +704,7 @@ def advance_baseball_pitch(
         )
         return {"round": dict(round_row), "extra": extra, "complete": next_phase == "complete"}
 
+
 async def handle_baseball_swing(
     interaction: discord.Interaction,
     round_id: int,
@@ -734,6 +745,7 @@ async def handle_baseball_swing(
     else:
         message = f"⚾ 스윙 기록 완료! **{elapsed:.2f}초** · 결과는 7초 후 공개됩니다."
     await interaction.response.send_message(message, ephemeral=True)
+
 
 async def activate_baseball_pitch(
     round_id: int,
@@ -836,6 +848,7 @@ async def activate_baseball_pitch(
     )
     return True
 
+
 async def publish_baseball_pitch_result(round_id: int, pitch_number: int) -> bool:
     result = settle_baseball_pitch(round_id, pitch_number)
     if not result:
@@ -926,6 +939,7 @@ async def publish_baseball_pitch_result(round_id: int, pitch_number: int) -> boo
         await runtime.finish_round(round_id, channel, "3구 완료")
     return True
 
+
 def settle_baseball(ctx: SettleContext) -> discord.Embed:
     """3구 평균 순위로 한 번만 지급한다. 구별 순위(baseball_swings.score)는 표시용이다."""
     completed_pitches = {
@@ -949,6 +963,7 @@ def settle_baseball(ctx: SettleContext) -> discord.Embed:
             ctx.round_row["id"],
         )
     return build_baseball_final_result_embed(str(ctx.round_row["title"]), standings)
+
 
 def build_baseball_embed(
     round_id: int,
@@ -994,6 +1009,7 @@ def build_baseball_embed(
     embed.set_footer(text=f"라운드 #{round_id} · 치기 버튼이 열린 뒤 7초 후 결과 공개")
     return embed
 
+
 def baseball_control_content(pitch_number: int, phase: str) -> str:
     pitch_number = max(1, min(BASEBALL_TOTAL_PITCHES, int(pitch_number)))
     guide_by_phase = {
@@ -1012,6 +1028,7 @@ def baseball_control_content(pitch_number: int, phase: str) -> str:
     if phase == "winding_up":
         return title
     return f"{title}\n{guide}" if guide else title
+
 
 def baseball_swing_view(
     round_id: int,
@@ -1046,6 +1063,7 @@ def baseball_swing_view(
             )
         )
     return view
+
 
 def baseball_result_lines(
     participants: list[dict[str, Any]],
@@ -1083,6 +1101,7 @@ def baseball_result_lines(
             )
     return lines
 
+
 def build_baseball_pitch_result_embed(result: dict[str, Any]) -> discord.Embed:
     lines = baseball_result_lines(result["participants"], result["swings"])
     embed = discord.Embed(
@@ -1097,6 +1116,7 @@ def build_baseball_pitch_result_embed(result: dict[str, Any]) -> discord.Embed:
         )
     )
     return embed
+
 
 def build_baseball_final_result_embed(
     title: str,
@@ -1131,6 +1151,7 @@ def build_baseball_final_result_embed(
         color=discord.Color.gold(),
     )
     return embed
+
 
 async def prepare_command(interaction: discord.Interaction) -> None:
     """`/준비` 본체. 슬래시 등록 껍데기는 bot.py에 있다 (6단계에서 commands/로 간다)."""
