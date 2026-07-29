@@ -49,9 +49,18 @@ from .pairing import (
     emergency_join_view,
     recent_match_pairs,
     save_pair_thread_id,
+    update_trust_main_message,
     warn_failed_pair_threads,
 )
-from .registry import SettleContext, register_settler
+from .registry import (
+    AutoCloseContext,
+    CreateContext,
+    CreateResult,
+    SettleContext,
+    register_auto_close_handler,
+    register_creator,
+    register_settler,
+)
 
 
 def start_trust_decision(round_id: int) -> dict[str, Any] | None:
@@ -158,6 +167,33 @@ def start_trust_decision(round_id: int) -> dict[str, Any] | None:
             "view": emergency_join_view(round_id) if unmatched_user_id else None,
             "close_at": decision_close_at,
         }
+
+
+async def advance_trust_registration(round_id: int) -> dict[str, Any] | None:
+    """참여자 모집을 마감하고 매칭·결정 단계 시작까지 한 번에 진행한다.
+
+    자동 마감 타이머와 `/라운드마감` 양쪽에서 똑같이 필요한 3단 시퀀스라 여기 모아둔다.
+    실패(모집 마감 실패)면 `None`.
+    """
+    transition = start_trust_decision(round_id)
+    if not transition:
+        return None
+    await create_trust_pair_threads(transition)
+    await update_trust_main_message(transition)
+    return transition
+
+
+async def handle_trust_auto_close(ctx: AutoCloseContext) -> bool:
+    """등록 단계 마감 타이머가 울렸을 때만 처리한다. 그 외 단계는 정산으로 넘긴다."""
+    if round_extra(ctx.row).get("trust_phase") != "registration":
+        return False
+    transition = await advance_trust_registration(ctx.round_id)
+    if transition and transition["state"] == "decision":
+        pairing.board_client().schedule_auto_close(ctx.round_id, float(transition["close_at"]))
+    return True
+
+
+register_auto_close_handler("trust", handle_trust_auto_close)
 
 
 def trust_pair_intro(
@@ -461,6 +497,39 @@ def build_trust_registration_embed(round_id: int, title: str, registration_minut
         inline=False,
     )
     return embed
+
+
+def create_trust_round(ctx: CreateContext) -> CreateResult:
+    ctx.extra.update(
+        {
+            "trust_phase": "registration",
+            "registration_minutes": ctx.duration_minutes,
+            "registration_close_at": ctx.close_at,
+        }
+    )
+    cursor = ctx.conn.execute(
+        """
+        INSERT INTO rounds
+            (type, title, question, status, channel_id, extra_json, created_at)
+        VALUES ('trust', ?, ?, 'open', ?, ?, ?)
+        """,
+        (
+            ctx.title,
+            ctx.title,
+            ctx.channel_id,
+            json.dumps(ctx.extra, ensure_ascii=False),
+            now_text(),
+        ),
+    )
+    round_id = int(cursor.lastrowid)
+    return CreateResult(
+        round_id=round_id,
+        embed=build_trust_registration_embed(round_id, ctx.title, ctx.duration_minutes),
+        view=discord.utils.MISSING,
+    )
+
+
+register_creator("trust", create_trust_round)
 
 
 def trust_registration_view(round_id: int) -> discord.ui.View:

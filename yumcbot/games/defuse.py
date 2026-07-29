@@ -6,10 +6,15 @@ DB 호환을 위해 내부 키는 `defuse4`(4선 시절)를 유지하지만 현�
 
 from __future__ import annotations
 
+import json
+
 import discord
 
 from ..config import (
     DEFUSE_COLORS,
+)
+from ..db import (
+    now_text,
 )
 from ..scoring import (
     add_score,
@@ -19,7 +24,13 @@ from ..ui import (
     member_name,
     mention_list,
 )
-from .registry import SettleContext, register_settler
+from .registry import (
+    CreateContext,
+    CreateResult,
+    SettleContext,
+    register_creator,
+    register_settler,
+)
 
 
 def build_defuse_embed(round_id: int, title: str) -> discord.Embed:
@@ -57,6 +68,40 @@ def defuse_vote_view(round_id: int) -> discord.ui.View:
             )
         )
     return view
+
+
+def create_defuse_round(ctx: CreateContext) -> CreateResult:
+    wire_map = {color["id"]: f"{color['emoji']} {color['name']}" for color in DEFUSE_COLORS}
+    ctx.extra.update(
+        {
+            "mode": "defuse4",
+            "wires": wire_map,
+            "settlement_rule": "top_vote_penalty",
+        }
+    )
+    cursor = ctx.conn.execute(
+        """
+        INSERT INTO rounds
+            (type, title, question, status, channel_id, extra_json, created_at)
+        VALUES ('bomb', ?, ?, 'open', ?, ?, ?)
+        """,
+        (
+            ctx.title,
+            ctx.title,
+            ctx.channel_id,
+            json.dumps(ctx.extra, ensure_ascii=False),
+            now_text(),
+        ),
+    )
+    round_id = int(cursor.lastrowid)
+    return CreateResult(
+        round_id=round_id,
+        embed=build_defuse_embed(round_id, ctx.title),
+        view=defuse_vote_view(round_id),
+    )
+
+
+register_creator("defuse4", create_defuse_round)
 
 
 def settle_defuse(ctx: SettleContext) -> discord.Embed:

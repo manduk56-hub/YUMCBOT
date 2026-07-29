@@ -44,6 +44,28 @@ class RoundServices(Protocol):
     async def publish_event_summary(self, event_session_id: int | None) -> None: ...
 
 
+@runtime_checkable
+class AutoCloseScheduler(Protocol):
+    """자동 마감 타이머를 다시 거는 데 필요한 최소 기능. 실체는 EventBot이다.
+
+    1:1 방을 쓰지 않는 게임(예: 소수파 밸런스의 1차→재선택 전이)도 다음 마감을
+    다시 걸어야 하는데, 그 게임엔 `games.pairing.PairBoardClient`가 요구하는
+    스레드 락 기능이 없다. 그 두 게임에만 있는 것을 억지로 요구하지 않도록
+    스케줄링만 따로 뗀다.
+    """
+
+    def schedule_auto_close(self, round_id: int, close_at: float) -> None: ...
+
+    def cancel_auto_close(self, round_id: int) -> None: ...
+
+
+def auto_close_scheduler() -> AutoCloseScheduler:
+    client = get_client()
+    if not isinstance(client, AutoCloseScheduler):
+        raise RuntimeError("자동 마감 타이머를 걸 수 없는 클라이언트입니다.")
+    return client
+
+
 _round_services: RoundServices | None = None
 
 

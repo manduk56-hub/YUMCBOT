@@ -41,7 +41,16 @@ from ..discussion import (
 from ..scoring import (
     add_score,
 )
-from .registry import SettleContext, register_settler
+from .registry import (
+    AutoCloseContext,
+    CreateContext,
+    CreateResult,
+    RoundCreationError,
+    SettleContext,
+    register_auto_close_handler,
+    register_creator,
+    register_settler,
+)
 
 
 def build_balance_embed(round_id: int, question: str, option_a: str, option_b: str) -> discord.Embed:
@@ -64,6 +73,46 @@ def build_balance_embed(round_id: int, question: str, option_a: str, option_b: s
         inline=False,
     )
     return embed
+
+
+def create_balance_round(ctx: CreateContext) -> CreateResult:
+    """일반/소수파 두 모드를 한 곳에서 만든다 — `extra_json.mode`로 갈린다.
+
+    참가자에게는 1차 집계가 끝날 때까지 일반 밸런스 게임으로 보여야 하므로,
+    소수파일 때만 `mode`/`balance_phase`를 얹는다.
+    """
+    if not ctx.option_a or not ctx.option_b:
+        raise RoundCreationError("밸런스 게임은 `선택_a`와 `선택_b`가 필요합니다.")
+
+    if ctx.game_key == "minority_balance":
+        ctx.extra.update({"mode": "minority_balance", "balance_phase": "initial"})
+
+    cursor = ctx.conn.execute(
+        """
+        INSERT INTO rounds
+            (type, title, question, option_a, option_b, status, channel_id, extra_json, created_at)
+        VALUES ('balance', ?, ?, ?, ?, 'open', ?, ?, ?)
+        """,
+        (
+            "밸런스 게임 라운드",
+            ctx.title,
+            ctx.option_a,
+            ctx.option_b,
+            ctx.channel_id,
+            json.dumps(ctx.extra, ensure_ascii=False),
+            now_text(),
+        ),
+    )
+    round_id = int(cursor.lastrowid)
+    return CreateResult(
+        round_id=round_id,
+        embed=build_balance_embed(round_id, ctx.title, ctx.option_a, ctx.option_b),
+        view=vote_view(round_id, BALANCE_VOTE_CHOICES),
+    )
+
+
+register_creator("balance", create_balance_round)
+register_creator("minority_balance", create_balance_round)
 
 
 def build_minority_balance_revote_embed(
@@ -220,6 +269,32 @@ async def publish_minority_balance_revote(transition: dict[str, Any]) -> bool:
                 (json.dumps(extra, ensure_ascii=False), round_id),
             )
     return True
+
+
+async def advance_minority_balance_initial(round_id: int) -> dict[str, Any] | None:
+    """1차 집계를 마감하고 재선택 안내 게시까지 한 번에 진행한다.
+
+    자동 마감 타이머와 `/라운드마감` 양쪽에서 똑같이 필요한 시퀀스라 여기 모아둔다.
+    실패(1차 집계 마감 실패)면 `None`. 결과 dict에 `published`(안내 게시 성공 여부)를 얹는다.
+    """
+    transition = start_minority_balance_revote(round_id)
+    if not transition:
+        return None
+    transition["published"] = await publish_minority_balance_revote(transition)
+    return transition
+
+
+async def handle_minority_balance_auto_close(ctx: AutoCloseContext) -> bool:
+    """1차 집계 단계 마감 타이머가 울렸을 때만 처리한다. 재선택 단계는 정산으로 넘긴다."""
+    if round_extra(ctx.row).get("balance_phase") != "initial":
+        return False
+    transition = await advance_minority_balance_initial(ctx.round_id)
+    if transition:
+        runtime.auto_close_scheduler().schedule_auto_close(ctx.round_id, float(transition["close_at"]))
+    return True
+
+
+register_auto_close_handler("minority_balance", handle_minority_balance_auto_close)
 
 
 def settle_balance(ctx: SettleContext) -> discord.Embed:

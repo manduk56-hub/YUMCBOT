@@ -5,10 +5,15 @@
 
 from __future__ import annotations
 
+import json
+
 import discord
 
 from ..config import (
     UNIQUE_NUMBER_CHOICES,
+)
+from ..db import (
+    now_text,
 )
 from ..scoring import (
     add_score,
@@ -19,7 +24,13 @@ from ..ui import (
     member_name,
     mention_list,
 )
-from .registry import SettleContext, register_settler
+from .registry import (
+    CreateContext,
+    CreateResult,
+    SettleContext,
+    register_creator,
+    register_settler,
+)
 
 
 def unique_number_reward(number: int) -> int:
@@ -72,6 +83,34 @@ def unique_number_vote_view(round_id: int) -> discord.ui.View:
             )
         )
     return view
+
+
+def create_unique_number_round(ctx: CreateContext) -> CreateResult:
+    """`rounds.type`에 남아 있는 제거된 게임 `grid` 슬롯을 재사용하고 `mode`로 구분한다."""
+    ctx.extra.update({"mode": "unique_number"})
+    cursor = ctx.conn.execute(
+        """
+        INSERT INTO rounds
+            (type, title, question, status, channel_id, extra_json, created_at)
+        VALUES ('grid', ?, ?, 'open', ?, ?, ?)
+        """,
+        (
+            ctx.title,
+            ctx.title,
+            ctx.channel_id,
+            json.dumps(ctx.extra, ensure_ascii=False),
+            now_text(),
+        ),
+    )
+    round_id = int(cursor.lastrowid)
+    return CreateResult(
+        round_id=round_id,
+        embed=build_unique_number_embed(round_id, ctx.title),
+        view=unique_number_vote_view(round_id),
+    )
+
+
+register_creator("unique_number", create_unique_number_round)
 
 
 def settle_unique_number(ctx: SettleContext) -> discord.Embed:

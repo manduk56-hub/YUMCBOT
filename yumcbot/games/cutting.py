@@ -35,7 +35,13 @@ from ..ui import (
 from ..permissions import (
     is_operator_user,
 )
-from .registry import SettleContext, register_settler
+from .registry import (
+    CreateContext,
+    CreateResult,
+    SettleContext,
+    register_creator,
+    register_settler,
+)
 
 
 def cutting_success_rate(current_level: int) -> float:
@@ -109,6 +115,33 @@ def build_cutting_embed(round_id: int, title: str) -> discord.Embed:
         inline=True,
     )
     return embed
+
+
+def create_cutting_round(ctx: CreateContext) -> CreateResult:
+    ctx.extra.update({"max_level": 6})
+    cursor = ctx.conn.execute(
+        """
+        INSERT INTO rounds
+            (type, title, question, status, channel_id, extra_json, created_at)
+        VALUES ('cutting', ?, ?, 'open', ?, ?, ?)
+        """,
+        (
+            ctx.title,
+            ctx.title,
+            ctx.channel_id,
+            json.dumps(ctx.extra, ensure_ascii=False),
+            now_text(),
+        ),
+    )
+    round_id = int(cursor.lastrowid)
+    return CreateResult(
+        round_id=round_id,
+        embed=build_cutting_embed(round_id, ctx.title),
+        view=cutting_vote_view(round_id),
+    )
+
+
+register_creator("cutting", create_cutting_round)
 
 
 def cutting_vote_view(round_id: int) -> discord.ui.View:

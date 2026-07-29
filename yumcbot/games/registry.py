@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import sqlite3
 from dataclasses import dataclass
-from typing import Any, Callable
+from typing import Any, Awaitable, Callable
 
 import discord
 
@@ -124,3 +124,90 @@ def settler_for(game_key: str) -> Settler | None:
 
 def spec_for(game_key: str) -> GameSpec | None:
     return GAMES.get(game_key)
+
+
+@dataclass(frozen=True)
+class AutoCloseContext:
+    """자동 마감 타이머가 발화했을 때 전이 훅이 받는 것.
+
+    `close_round_record`처럼 이미 정산이 끝난 뒤가 아니라, **정산 여부를 아직 정하지
+    못한** 시점이다. 훅은 자기 게임의 현재 단계가 아직 다음 단계로 넘어가야 하는지만
+    보고, 넘어갈 단계가 없으면(예: 실행 중이거나 이미 최종 단계라면) `False`를 돌려줘
+    호출자가 `close_round_record`로 정산하게 둔다.
+    """
+
+    round_id: int
+    row: sqlite3.Row
+    channel: Any
+    guild: discord.Guild | None
+
+
+AutoCloseHandler = Callable[[AutoCloseContext], Awaitable[bool]]
+
+_auto_close_handlers: dict[str, AutoCloseHandler] = {}
+
+
+def register_auto_close_handler(game_key: str, handler: AutoCloseHandler) -> None:
+    """자동 마감 시점의 단계 전이 훅을 올린다.
+
+    등록하지 않은 게임이거나, 훅이 `False`를 돌려주면 호출자는 그 라운드를
+    `close_round_record`로 최종 정산한다.
+    """
+    if game_key not in GAMES:
+        raise KeyError(f"레지스트리에 없는 게임: {game_key}")
+    _auto_close_handlers[game_key] = handler
+
+
+def auto_close_handler_for(game_key: str) -> AutoCloseHandler | None:
+    return _auto_close_handlers.get(game_key)
+
+
+@dataclass(frozen=True)
+class CreateContext:
+    """`/시작`·`/미니게임`이 받은 입력을 라운드 생성 훅에 그대로 넘긴다.
+
+    `extra`는 호출자가 이미 `duration_minutes`(그리고 필요하면 `auto_close_at`,
+    `planned_mini_game`)를 채워둔 dict를 **그대로** 준다 — 훅은 여기 이어서
+    `update()`만 하면 된다. 훅이 직접 INSERT까지 하는 이유는 라운드 컬럼 구성이
+    게임마다 다르기 때문이다(밸런스만 `option_a`/`option_b`를 쓴다).
+    """
+
+    conn: sqlite3.Connection
+    game_key: str
+    title: str
+    duration_minutes: int
+    close_at: float
+    extra: dict[str, Any]
+    channel_id: str
+    event_session_id: int
+    option_a: str | None = None
+    option_b: str | None = None
+    negotiation_minutes: int | None = None
+    execution_minutes: int | None = None
+
+
+@dataclass(frozen=True)
+class CreateResult:
+    round_id: int
+    embed: discord.Embed
+    view: Any
+
+
+class RoundCreationError(Exception):
+    """생성 훅이 입력 검증에 실패했을 때 던진다. 메시지가 그대로 ephemeral 응답이 된다."""
+
+
+Creator = Callable[[CreateContext], CreateResult]
+
+_creators: dict[str, Creator] = {}
+
+
+def register_creator(game_key: str, creator: Creator) -> None:
+    """라운드 생성 훅을 올린다. 모듈이 import 될 때 한 번 부른다."""
+    if game_key not in GAMES:
+        raise KeyError(f"레지스트리에 없는 게임: {game_key}")
+    _creators[game_key] = creator
+
+
+def creator_for(game_key: str) -> Creator | None:
+    return _creators.get(game_key)

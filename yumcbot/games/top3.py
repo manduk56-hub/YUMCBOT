@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import json
 from typing import Any
 
 import discord
@@ -13,13 +14,23 @@ import discord
 from ..config import (
     TOP3_NONE_CHOICE,
 )
+from ..db import (
+    now_text,
+)
 from ..scoring import (
     add_score,
 )
 from ..ui import (
     member_name,
 )
-from .registry import SettleContext, register_settler
+from .registry import (
+    CreateContext,
+    CreateResult,
+    RoundCreationError,
+    SettleContext,
+    register_creator,
+    register_settler,
+)
 
 
 def build_top3_embed(round_id: int, title: str, candidates: list[dict[str, Any]]) -> discord.Embed:
@@ -47,6 +58,57 @@ def build_top3_embed(round_id: int, title: str, candidates: list[dict[str, Any]]
         inline=False,
     )
     return embed
+
+
+def create_top3_round(ctx: CreateContext) -> CreateResult:
+    rows = ctx.conn.execute(
+        """
+        SELECT users.user_id, users.display_name, users.total_score
+        FROM event_participants
+        JOIN users ON users.user_id = event_participants.user_id
+        WHERE event_participants.event_session_id = ?
+        ORDER BY users.total_score DESC, users.updated_at ASC
+        LIMIT 3
+        """,
+        (ctx.event_session_id,),
+    ).fetchall()
+    if len(rows) < 3:
+        raise RoundCreationError(
+            "상위 3명 견제 게임은 이번 이벤트 참가자 중 점수 기록 유저가 최소 3명 필요합니다."
+        )
+
+    candidates = [
+        {
+            "user_id": str(row["user_id"]),
+            "display_name": str(row["display_name"]),
+            "score": int(row["total_score"]),
+        }
+        for row in rows
+    ]
+    ctx.extra.update({"candidates": candidates})
+    cursor = ctx.conn.execute(
+        """
+        INSERT INTO rounds
+            (type, title, question, status, channel_id, extra_json, created_at)
+        VALUES ('top3', ?, ?, 'open', ?, ?, ?)
+        """,
+        (
+            ctx.title,
+            ctx.title,
+            ctx.channel_id,
+            json.dumps(ctx.extra, ensure_ascii=False),
+            now_text(),
+        ),
+    )
+    round_id = int(cursor.lastrowid)
+    return CreateResult(
+        round_id=round_id,
+        embed=build_top3_embed(round_id, ctx.title, candidates),
+        view=top3_vote_view(round_id, candidates),
+    )
+
+
+register_creator("top3", create_top3_round)
 
 
 def top3_vote_view(round_id: int, candidates: list[dict[str, Any]]) -> discord.ui.View:

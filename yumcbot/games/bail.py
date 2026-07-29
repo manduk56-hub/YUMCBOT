@@ -80,9 +80,18 @@ from .pairing import (
     emergency_join_view,
     recent_match_pairs,
     save_pair_thread_id,
+    update_trust_main_message,
     warn_failed_pair_threads,
 )
-from .registry import SettleContext, register_settler
+from .registry import (
+    AutoCloseContext,
+    CreateContext,
+    CreateResult,
+    SettleContext,
+    register_auto_close_handler,
+    register_creator,
+    register_settler,
+)
 
 # 가라앉는 배 임베드의 공통 색. discord.Color를 쓰므로 config(의존 없는 최하단)에 못 둔다.
 BAIL_EMBED_COLOR = discord.Color.from_rgb(60, 120, 180)
@@ -501,6 +510,59 @@ def start_bail_execution(round_id: int) -> dict[str, Any] | None:
             "view": emergency_join_view(round_id) if extra.get("unmatched_user_id") else None,
             "close_at": close_at,
         }
+
+
+async def advance_bail_registration(round_id: int) -> dict[str, Any] | None:
+    """참여자 모집을 마감하고 매칭·협상 단계 시작까지 한 번에 진행한다. 실패하면 `None`."""
+    transition = start_bail_negotiation(round_id)
+    if not transition:
+        return None
+    await create_bail_pair_threads(transition)
+    await update_trust_main_message(transition)
+    return transition
+
+
+async def advance_bail_negotiation(round_id: int) -> dict[str, Any] | None:
+    """협상을 마감하고 실행 단계 시작까지 한 번에 진행한다. 실패하면 `None`.
+
+    협상 → 실행 전이는 버튼 구성이 바뀌므로 모든 방의 진행판을 다시 그린다
+    (누른 방만 갱신하는 모래성과 다른 점이다).
+    """
+    transition = start_bail_execution(round_id)
+    if not transition:
+        return None
+    await refresh_all_bail_pair_boards(round_id)
+    await refresh_main_bail_board(round_id)
+    return transition
+
+
+async def handle_bail_auto_close(ctx: AutoCloseContext) -> bool:
+    """모집·협상 단계 마감 타이머만 처리한다. 실행 단계는 제한 시간을 끝까지 쓴다."""
+    bail_phase = round_extra(ctx.row).get("bail_phase")
+    if bail_phase == "registration":
+        transition = await advance_bail_registration(ctx.round_id)
+        if transition and transition["state"] == "negotiation":
+            pairing.board_client().schedule_auto_close(ctx.round_id, float(transition["close_at"]))
+        return True
+    if bail_phase == "negotiation":
+        transition = await advance_bail_negotiation(ctx.round_id)
+        if not transition:
+            return True
+        pairing.board_client().schedule_auto_close(ctx.round_id, float(transition["close_at"]))
+        if hasattr(ctx.channel, "send"):
+            try:
+                await ctx.channel.send(
+                    "🪣 협상 시간이 끝났습니다. **실행 단계**를 시작합니다 — "
+                    "각자 실제로 퍼낼 횟수를 비공개로 제출하세요. "
+                    f"(마감 {close_time_text(transition['close_at'])})"
+                )
+            except discord.HTTPException:
+                pass
+        return True
+    return False
+
+
+register_auto_close_handler("bail", handle_bail_auto_close)
 
 
 def bail_pair_intro(user_a_id: str, user_b_id: str) -> str:
@@ -998,6 +1060,45 @@ def build_bail_registration_embed(round_id: int, title: str, registration_minute
     embed.add_field(name="🎮 진행 게임", value="가라앉는 배", inline=False)
     embed.add_field(name="📜 메인 규칙", value=bail_rules_text(), inline=False)
     return embed
+
+
+def create_bail_round(ctx: CreateContext) -> CreateResult:
+    """rounds.type CHECK 제약을 못 고쳐서 type은 sand를 재사용하고 mode로 갈라 쓴다."""
+    ctx.extra.update(
+        {
+            "mode": "bail",
+            "bail_phase": "registration",
+            "registration_minutes": ctx.duration_minutes,
+            "registration_close_at": ctx.close_at,
+            "negotiation_seconds": int(
+                ctx.negotiation_minutes or BAIL_DEFAULT_NEGOTIATION_MINUTES
+            ) * 60,
+            "execution_seconds": int(ctx.execution_minutes or BAIL_DEFAULT_EXECUTION_MINUTES) * 60,
+        }
+    )
+    cursor = ctx.conn.execute(
+        """
+        INSERT INTO rounds
+            (type, title, question, status, channel_id, extra_json, created_at)
+        VALUES ('sand', ?, ?, 'open', ?, ?, ?)
+        """,
+        (
+            ctx.title,
+            ctx.title,
+            ctx.channel_id,
+            json.dumps(ctx.extra, ensure_ascii=False),
+            now_text(),
+        ),
+    )
+    round_id = int(cursor.lastrowid)
+    return CreateResult(
+        round_id=round_id,
+        embed=build_bail_registration_embed(round_id, ctx.title, ctx.duration_minutes),
+        view=discord.utils.MISSING,
+    )
+
+
+register_creator("bail", create_bail_round)
 
 
 def bail_pair_status_text(pair: dict[str, Any], extra: dict[str, Any]) -> str:

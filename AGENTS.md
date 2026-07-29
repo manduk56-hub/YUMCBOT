@@ -46,7 +46,7 @@ shellcheck deploy/*.sh                                # CI가 도는 배포 스�
 | `yumcbot/ui.py` | 임베드 표시 유틸(`field_text`·`close_time_text`·`vote_view` 등). 전부 순수 함수 |
 | `yumcbot/permissions.py` | 운영자 판정(`is_operator_user`·`admin_only`) |
 | `yumcbot/discussion.py` | 익명 토론(스레드 발언·번호 배정·토론방 버튼판) |
-| `yumcbot/games/registry.py` | 게임 목록(`GameSpec`)과 정산 훅 디스패치 |
+| `yumcbot/games/registry.py` | 게임 목록(`GameSpec`)과 생성·자동 마감 전이·정산 훅 디스패치 |
 | `yumcbot/games/pairing.py` | 메인게임 셋이 공유하는 1:1 짝 매칭·비공개 방 |
 | `yumcbot/games/*.py` | **게임 하나가 한 파일이다.** `trust`·`sand`·`bail`(메인), `balance`·`defuse`·`top3`·`unique_number`·`cutting`·`baseball`(미니) |
 | `bot.py` | `EventBot` + 슬래시 명령어 + 이벤트/라운드 생성 + 엔트리포인트 |
@@ -100,6 +100,28 @@ bot.py의 재노출 사본만 바꾸므로 게임 모듈에 닿지 않는다 —
 남았다. 새 게임을 추가하면서 여기에 `elif`를 넣지 말 것. 훅을 빠뜨리면 라운드는 정상으로
 진행되다가 마감에서만 "더 이상 지원하지 않는 게임"으로 조용히 0점이 된다
 (`test_every_game_settles_through_the_registry`가 지킨다).
+
+같은 패턴이 라운드 **생성**과 **자동 마감 단계 전이**에도 있다:
+
+- `register_creator(key, fn)` — `/시작`·`/미니게임`이 받은 입력(`CreateContext`: 제목·시간·
+  `선택_a/b`·협상/실행 시간 등)으로 그 게임의 `rounds` INSERT까지 훅이 직접 한다. 컬럼 구성이
+  게임마다 달라서(밸런스만 `option_a`/`option_b`를 쓴다) 공통 INSERT로 묶을 수 없다. 검증
+  실패(예: 밸런스인데 선택지 누락, 상위 3명 견제인데 참가자 3명 미만)는 `RoundCreationError`를
+  던진다 — 메시지가 그대로 ephemeral 응답이 된다. `create_round_from_setup`에는 게임별 분기가
+  없고, 이 결과를 받아 이벤트/활동 로그·메시지 발행·토론방 생성 같은 **모든 게임 공통** 후처리만
+  한다.
+- `register_auto_close_handler(key, fn)` — 자동 마감 타이머(`EventBot.auto_close_round`)가
+  발화했을 때 "다음 단계로 넘어가야 하는가"만 훅에게 묻는다(`AutoCloseContext`). 넘어갈 단계가
+  있으면 훅이 처리하고 `True`를, 없으면(그 게임이 아니거나 이미 최종 단계라면) `False`를
+  돌려줘 호출자가 `close_round_record`로 정산하게 한다. 등록/협상 마감처럼 자동 마감과
+  `/라운드마감`(수동) 양쪽에서 똑같이 필요한 시퀀스는 게임 모듈에 `advance_*` 함수
+  (`advance_trust_registration`·`advance_sand_registration`·`advance_bail_registration`·
+  `advance_bail_negotiation`·`advance_minority_balance_initial`)로 한 번만 정의해 두 호출부가
+  공유한다 — 어느 한쪽만 고치면 자동 마감과 수동 마감이 조용히 갈라지기 때문이다.
+
+셋 다 등록을 빠뜨려도 예외가 없다는 공통점이 있다. 정산 훅이 없으면 0점, 생성 훅이 없으면
+"아직 지원하지 않는 게임" 응답, 자동 마감 훅이 없으면 그 게임의 등록 단계가 시간이 다 돼도
+다음 단계로 안 넘어가고 조용히 정산행이다.
 
 ### 상태는 전부 SQLite에 있다 (재시작 안전성)
 

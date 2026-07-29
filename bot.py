@@ -110,7 +110,12 @@ from yumcbot.games.registry import (
     GAME_NAMES,
     MAIN_GAME_TYPES,
     MINI_GAME_TYPES,
+    AutoCloseContext,
+    CreateContext,
+    RoundCreationError,
     SettleContext,
+    auto_close_handler_for,
+    creator_for,
     register_settler,
     settler_for,
 )
@@ -142,21 +147,16 @@ from yumcbot.discussion import (
 from yumcbot.games import balance, cutting, defuse, top3, unique_number
 from yumcbot.games.defuse import (
     build_defuse_embed,
-    defuse_vote_view,
 )
 from yumcbot.games.unique_number import (
     build_unique_number_embed,
     unique_number_reward,
     unique_number_vote_view,
 )
-from yumcbot.games.top3 import (
-    build_top3_embed,
-    top3_vote_view,
-)
 from yumcbot.games.balance import (
+    advance_minority_balance_initial,
     build_balance_embed,
     build_minority_balance_revote_embed,
-    publish_minority_balance_revote,
     start_minority_balance_revote,
 )
 from yumcbot.games.cutting import (
@@ -167,12 +167,10 @@ from yumcbot.games.cutting import (
     cutting_reward_text,
     cutting_success_rate,
     cutting_success_rate_text,
-    cutting_vote_view,
     finalize_cutting_round,
     handle_cutting_button,
 )
 from yumcbot.games.pairing import (
-    update_trust_main_message,
     build_random_trust_pairs,
     create_pair_thread,
     emergency_join_notice,
@@ -184,29 +182,27 @@ from yumcbot.games.pairing import (
 )
 from yumcbot.games import trust
 from yumcbot.games.trust import (
+    advance_trust_registration,
     build_trust_decision_embed,
     build_trust_pair_result_embed,
-    build_trust_registration_embed,
-    create_trust_pair_threads,
     handle_trust_decision,
     handle_trust_join,
     publish_trust_pair_results,
     refresh_main_trust_board,
     settle_trust,
-    start_trust_decision,
     trust_decision_view,
     trust_pair_intro,
     trust_registration_view,
 )
 from yumcbot.games import sand
 from yumcbot.games.sand import (
+    advance_sand_registration,
     apply_sand_action,
     autocomplete_sand_pair,
     build_sand_pair_embed,
     build_sand_pair_result_embed,
     build_sand_play_embed,
     build_sand_registration_embed,
-    create_sand_pair_threads,
     find_sand_pair,
     handle_sand_action,
     handle_sand_join,
@@ -230,6 +226,8 @@ from yumcbot.games.sand import (
 )
 from yumcbot.games import bail
 from yumcbot.games.bail import (
+    advance_bail_negotiation,
+    advance_bail_registration,
     advance_or_finish_bail_round,
     apply_bail_offer,
     apply_bail_response,
@@ -252,7 +250,6 @@ from yumcbot.games.bail import (
     build_bail_pair_result_embed,
     build_bail_play_embed,
     build_bail_registration_embed,
-    create_bail_pair_threads,
     find_bail_pair,
     handle_bail_offer,
     handle_bail_response,
@@ -260,7 +257,6 @@ from yumcbot.games.bail import (
     load_open_bail_pair,
     publish_bail_pair_results,
     redraw_bail_pair_board,
-    refresh_all_bail_pair_boards,
     refresh_bail_pair_board,
     refresh_main_bail_board,
     resolve_bail_pair,
@@ -1525,68 +1521,17 @@ class EventBot(discord.Client):
                 return
             row = fresh_row
 
-            if row["type"] == "trust" and round_extra(row).get("trust_phase") == "registration":
-                transition = start_trust_decision(round_id)
-                if not transition:
+            # 등록 마감 등 게임별 단계 전이는 각 게임 모듈이 register_auto_close_handler()로
+            # 올린 훅으로 간다. 여기에 게임별 분기를 다시 넣지 말 것 — 훅이 없거나 False를
+            # 돌려주면(예: 가라앉는 배 실행 단계처럼 제한 시간을 끝까지 써야 하는 경우)
+            # 아래 close_round_record로 최종 정산한다.
+            handler = auto_close_handler_for(round_game_key(row))
+            if handler is not None:
+                handled = await handler(
+                    AutoCloseContext(round_id=round_id, row=row, channel=channel, guild=guild)
+                )
+                if handled:
                     return
-                await create_trust_pair_threads(transition)
-                await update_trust_main_message(transition)
-                if transition["state"] == "decision":
-                    self.schedule_auto_close(round_id, float(transition["close_at"]))
-                return
-
-            if row["type"] == "sand" and round_extra(row).get("sand_phase") == "registration":
-                transition = start_sand_game(round_id)
-                if not transition:
-                    return
-                await create_sand_pair_threads(transition)
-                await update_trust_main_message(transition)
-                if transition["state"] == "playing":
-                    self.schedule_auto_close(round_id, float(transition["close_at"]))
-                return
-
-            # 가라앉는 배는 단계가 하나 더 있다: 모집 → 협상 → 실행 → 정산.
-            if round_game_key(row) == "bail":
-                bail_phase = round_extra(row).get("bail_phase")
-                if bail_phase == "registration":
-                    transition = start_bail_negotiation(round_id)
-                    if not transition:
-                        return
-                    await create_bail_pair_threads(transition)
-                    await update_trust_main_message(transition)
-                    if transition["state"] == "negotiation":
-                        self.schedule_auto_close(round_id, float(transition["close_at"]))
-                    return
-                if bail_phase == "negotiation":
-                    transition = start_bail_execution(round_id)
-                    if not transition:
-                        return
-                    await refresh_all_bail_pair_boards(round_id)
-                    await refresh_main_bail_board(round_id)
-                    self.schedule_auto_close(round_id, float(transition["close_at"]))
-                    if hasattr(channel, "send"):
-                        try:
-                            await channel.send(
-                                "🪣 협상 시간이 끝났습니다. **실행 단계**를 시작합니다 — "
-                                "각자 실제로 퍼낼 횟수를 비공개로 제출하세요. "
-                                f"(마감 {close_time_text(transition['close_at'])})"
-                            )
-                        except discord.HTTPException:
-                            pass
-                    return
-
-            row_extra = round_extra(row)
-            if (
-                row["type"] == "balance"
-                and row_extra.get("mode") == "minority_balance"
-                and row_extra.get("balance_phase") == "initial"
-            ):
-                transition = start_minority_balance_revote(round_id)
-                if not transition:
-                    return
-                await publish_minority_balance_revote(transition)
-                self.schedule_auto_close(round_id, float(transition["close_at"]))
-                return
 
             result = close_round_record(round_id, guild, closed_by="자동 마감")
             if not result:
@@ -2628,260 +2573,36 @@ async def create_round_from_setup(
                 )
                 return
 
-        if 게임 in {"balance", "minority_balance"}:
-            if not 선택_a or not 선택_b:
-                await interaction.followup.send(
-                    "밸런스 게임은 `선택_a`와 `선택_b`가 필요합니다.",
-                    ephemeral=True,
+        # 라운드 INSERT·embed·view는 각 게임 모듈이 register_creator()로 올린 훅이 만든다.
+        # 여기에 게임별 분기를 다시 넣지 말 것 — 컬럼 구성(밸런스만 option_a/b를 쓰는 등)이
+        # 게임마다 달라 훅이 직접 INSERT까지 한다.
+        creator = creator_for(게임)
+        if creator is None:
+            await interaction.followup.send(f"'{게임}'은(는) 아직 지원하지 않는 게임입니다.", ephemeral=True)
+            return
+        try:
+            created = creator(
+                CreateContext(
+                    conn=conn,
+                    game_key=게임,
+                    title=제목,
+                    duration_minutes=int(진행시간분),
+                    close_at=close_at,
+                    extra=extra,
+                    channel_id=main_channel_id,
+                    event_session_id=event_session_id,
+                    option_a=선택_a,
+                    option_b=선택_b,
+                    negotiation_minutes=협상시간분,
+                    execution_minutes=실행시간분,
                 )
-                return
-
-            if 게임 == "minority_balance":
-                extra.update({"mode": "minority_balance", "balance_phase": "initial"})
-
-            cursor = conn.execute(
-                """
-                INSERT INTO rounds
-                    (type, title, question, option_a, option_b, status, channel_id, extra_json, created_at)
-                VALUES ('balance', ?, ?, ?, ?, 'open', ?, ?, ?)
-                """,
-                (
-                    "밸런스 게임 라운드",
-                    제목,
-                    선택_a,
-                    선택_b,
-                    main_channel_id,
-                    json.dumps(extra, ensure_ascii=False),
-                    now_text(),
-                ),
             )
-            round_id = int(cursor.lastrowid)
-            embed = build_balance_embed(round_id, 제목, 선택_a, 선택_b)
-            view = vote_view(round_id, BALANCE_VOTE_CHOICES)
-        elif 게임 == "defuse4":
-            wire_map = {
-                color["id"]: f"{color['emoji']} {color['name']}"
-                for color in DEFUSE_COLORS
-            }
-            extra.update(
-                {
-                    "mode": "defuse4",
-                    "wires": wire_map,
-                    "settlement_rule": "top_vote_penalty",
-                }
-            )
-
-            cursor = conn.execute(
-                """
-                INSERT INTO rounds
-                    (type, title, question, status, channel_id, extra_json, created_at)
-                VALUES ('bomb', ?, ?, 'open', ?, ?, ?)
-                """,
-                (
-                    제목,
-                    제목,
-                    main_channel_id,
-                    json.dumps(extra, ensure_ascii=False),
-                    now_text(),
-                ),
-            )
-            round_id = int(cursor.lastrowid)
-            embed = build_defuse_embed(round_id, 제목)
-            view = defuse_vote_view(round_id)
-        elif 게임 == "trust":
-            extra.update(
-                {
-                    "trust_phase": "registration",
-                    "registration_minutes": int(진행시간분),
-                    "registration_close_at": close_at,
-                }
-            )
-            cursor = conn.execute(
-                """
-                INSERT INTO rounds
-                    (type, title, question, status, channel_id, extra_json, created_at)
-                VALUES ('trust', ?, ?, 'open', ?, ?, ?)
-                """,
-                (
-                    제목,
-                    제목,
-                    main_channel_id,
-                    json.dumps(extra, ensure_ascii=False),
-                    now_text(),
-                ),
-            )
-            round_id = int(cursor.lastrowid)
-            embed = build_trust_registration_embed(round_id, 제목, int(진행시간분))
-            view = discord.utils.MISSING
-        elif 게임 == "sand":
-            extra.update(
-                {
-                    "sand_phase": "registration",
-                    "registration_minutes": int(진행시간분),
-                    "registration_close_at": close_at,
-                }
-            )
-            cursor = conn.execute(
-                """
-                INSERT INTO rounds
-                    (type, title, question, status, channel_id, extra_json, created_at)
-                VALUES ('sand', ?, ?, 'open', ?, ?, ?)
-                """,
-                (
-                    제목,
-                    제목,
-                    main_channel_id,
-                    json.dumps(extra, ensure_ascii=False),
-                    now_text(),
-                ),
-            )
-            round_id = int(cursor.lastrowid)
-            embed = build_sand_registration_embed(round_id, 제목, int(진행시간분))
-            view = discord.utils.MISSING
-        elif 게임 == "bail":
-            # rounds.type CHECK 제약을 못 고쳐서 type은 sand를 재사용하고 mode로 갈라 쓴다.
-            extra.update(
-                {
-                    "mode": "bail",
-                    "bail_phase": "registration",
-                    "registration_minutes": int(진행시간분),
-                    "registration_close_at": close_at,
-                    "negotiation_seconds": int(
-                        협상시간분 or BAIL_DEFAULT_NEGOTIATION_MINUTES
-                    ) * 60,
-                    "execution_seconds": int(실행시간분 or BAIL_DEFAULT_EXECUTION_MINUTES) * 60,
-                }
-            )
-            cursor = conn.execute(
-                """
-                INSERT INTO rounds
-                    (type, title, question, status, channel_id, extra_json, created_at)
-                VALUES ('sand', ?, ?, 'open', ?, ?, ?)
-                """,
-                (
-                    제목,
-                    제목,
-                    main_channel_id,
-                    json.dumps(extra, ensure_ascii=False),
-                    now_text(),
-                ),
-            )
-            round_id = int(cursor.lastrowid)
-            embed = build_bail_registration_embed(round_id, 제목, int(진행시간분))
-            view = discord.utils.MISSING
-        elif 게임 == "top3":
-            rows = conn.execute(
-                """
-                SELECT users.user_id, users.display_name, users.total_score
-                FROM event_participants
-                JOIN users ON users.user_id = event_participants.user_id
-                WHERE event_participants.event_session_id = ?
-                ORDER BY users.total_score DESC, users.updated_at ASC
-                LIMIT 3
-                """,
-                (event_session_id,),
-            ).fetchall()
-            if len(rows) < 3:
-                await interaction.followup.send(
-                    "상위 3명 견제 게임은 이번 이벤트 참가자 중 점수 기록 유저가 최소 3명 필요합니다.",
-                    ephemeral=True,
-                )
-                return
-
-            candidates = [
-                {
-                    "user_id": str(row["user_id"]),
-                    "display_name": str(row["display_name"]),
-                    "score": int(row["total_score"]),
-                }
-                for row in rows
-            ]
-            extra.update({"candidates": candidates})
-            cursor = conn.execute(
-                """
-                INSERT INTO rounds
-                    (type, title, question, status, channel_id, extra_json, created_at)
-                VALUES ('top3', ?, ?, 'open', ?, ?, ?)
-                """,
-                (
-                    제목,
-                    제목,
-                    main_channel_id,
-                    json.dumps(extra, ensure_ascii=False),
-                    now_text(),
-                ),
-            )
-            round_id = int(cursor.lastrowid)
-            embed = build_top3_embed(round_id, 제목, candidates)
-            view = top3_vote_view(round_id, candidates)
-        elif 게임 == "unique_number":
-            # BASE_SCHEMA의 불변 CHECK 제약에 남아 있는 레거시 grid 슬롯을 사용하고,
-            # mode로 과거 제거된 grid 라운드와 새 게임을 명확히 구분한다.
-            extra.update({"mode": "unique_number"})
-            cursor = conn.execute(
-                """
-                INSERT INTO rounds
-                    (type, title, question, status, channel_id, extra_json, created_at)
-                VALUES ('grid', ?, ?, 'open', ?, ?, ?)
-                """,
-                (
-                    제목,
-                    제목,
-                    main_channel_id,
-                    json.dumps(extra, ensure_ascii=False),
-                    now_text(),
-                ),
-            )
-            round_id = int(cursor.lastrowid)
-            embed = build_unique_number_embed(round_id, 제목)
-            view = unique_number_vote_view(round_id)
-        elif 게임 == "baseball":
-            # BASE_SCHEMA의 불변 CHECK 제약에 남아 있는 레거시 grid 슬롯을 사용한다.
-            extra.update(
-                {
-                    "mode": "baseball",
-                    "baseball_pitch": 1,
-                    "baseball_phase": "waiting_prepare",
-                    "baseball_settled_pitches": [],
-                    "baseball_result_message_ids": {},
-                }
-            )
-            cursor = conn.execute(
-                """
-                INSERT INTO rounds
-                    (type, title, question, status, channel_id, extra_json, created_at)
-                VALUES ('grid', ?, ?, 'open', ?, ?, ?)
-                """,
-                (
-                    제목,
-                    제목,
-                    main_channel_id,
-                    json.dumps(extra, ensure_ascii=False),
-                    now_text(),
-                ),
-            )
-            round_id = int(cursor.lastrowid)
-            embed = build_baseball_embed(round_id, 제목, 1)
-            view = None
-        else:
-            extra.update({"max_level": 6})
-            cursor = conn.execute(
-                """
-                INSERT INTO rounds
-                    (type, title, question, status, channel_id, extra_json, created_at)
-                VALUES ('cutting', ?, ?, 'open', ?, ?, ?)
-                """,
-                (
-                    제목,
-                    제목,
-                    main_channel_id,
-                    json.dumps(extra, ensure_ascii=False),
-                    now_text(),
-                ),
-            )
-            round_id = int(cursor.lastrowid)
-            embed = build_cutting_embed(round_id, 제목)
-            view = cutting_vote_view(round_id)
+        except RoundCreationError as exc:
+            await interaction.followup.send(str(exc), ephemeral=True)
+            return
+        round_id = created.round_id
+        embed = created.embed
+        view = created.view
 
         conn.execute(
             "UPDATE rounds SET event_session_id = ? WHERE id = ?",
@@ -3089,15 +2810,13 @@ async def close_round(interaction: discord.Interaction) -> None:
 
     if round_row["type"] == "trust" and round_extra(round_row).get("trust_phase") == "registration":
         await interaction.response.defer(ephemeral=True)
-        transition = start_trust_decision(int(round_row["id"]))
+        transition = await advance_trust_registration(int(round_row["id"]))
         if not transition:
             await interaction.followup.send("참여자 모집을 마감하지 못했습니다.", ephemeral=True)
             return
         task = bot.auto_close_tasks.pop(int(round_row["id"]), None)
         if task:
             task.cancel()
-        await create_trust_pair_threads(transition)
-        await update_trust_main_message(transition)
         if transition["state"] == "decision":
             bot.schedule_auto_close(int(round_row["id"]), float(transition["close_at"]))
             await interaction.followup.send("참여자 모집을 마감하고 랜덤 매칭 및 3분 선택을 시작했습니다.", ephemeral=True)
@@ -3108,15 +2827,13 @@ async def close_round(interaction: discord.Interaction) -> None:
     if round_row["type"] == "sand" and round_extra(round_row).get("sand_phase") == "registration":
         # 짝마다 비공개 방을 여느라 API 호출이 여러 번이다. 3초 응답 제한을 넘기므로 먼저 defer한다.
         await interaction.response.defer(ephemeral=True)
-        transition = start_sand_game(int(round_row["id"]))
+        transition = await advance_sand_registration(int(round_row["id"]))
         if not transition:
             await interaction.followup.send("참여자 모집을 마감하지 못했습니다.", ephemeral=True)
             return
         task = bot.auto_close_tasks.pop(int(round_row["id"]), None)
         if task:
             task.cancel()
-        await create_sand_pair_threads(transition)
-        await update_trust_main_message(transition)
         if transition["state"] == "playing":
             bot.schedule_auto_close(int(round_row["id"]), float(transition["close_at"]))
             await interaction.followup.send("참여자 모집을 마감하고 1:1 모래성 게임을 시작했습니다.", ephemeral=True)
@@ -3133,7 +2850,9 @@ async def close_round(interaction: discord.Interaction) -> None:
         round_id = int(round_row["id"])
         registration = main_game_phase(round_row) == "registration"
         transition = (
-            start_bail_negotiation(round_id) if registration else start_bail_execution(round_id)
+            await advance_bail_registration(round_id)
+            if registration
+            else await advance_bail_negotiation(round_id)
         )
         if not transition:
             await interaction.followup.send("현재 단계를 마감하지 못했습니다.", ephemeral=True)
@@ -3142,18 +2861,13 @@ async def close_round(interaction: discord.Interaction) -> None:
         if task:
             task.cancel()
         if transition["state"] == "cancelled":
-            await update_trust_main_message(transition)
             await interaction.followup.send("참여자가 부족해 가라앉는 배를 취소했습니다.", ephemeral=True)
             return
         if registration:
-            await create_bail_pair_threads(transition)
-            await update_trust_main_message(transition)
             await interaction.followup.send(
                 "참여자 모집을 마감하고 1:1 협상 단계를 시작했습니다.", ephemeral=True
             )
         else:
-            await refresh_all_bail_pair_boards(round_id)
-            await refresh_main_bail_board(round_id)
             await interaction.followup.send("협상을 마감하고 실행 단계를 시작했습니다.", ephemeral=True)
         bot.schedule_auto_close(round_id, float(transition["close_at"]))
         return
@@ -3165,16 +2879,15 @@ async def close_round(interaction: discord.Interaction) -> None:
         and round_extra_row.get("balance_phase") == "initial"
     ):
         await interaction.response.defer(ephemeral=True)
-        transition = start_minority_balance_revote(int(round_row["id"]))
+        transition = await advance_minority_balance_initial(int(round_row["id"]))
         if not transition:
             await interaction.followup.send("1차 집계를 마감하지 못했습니다.", ephemeral=True)
             return
         task = bot.auto_close_tasks.pop(int(round_row["id"]), None)
         if task:
             task.cancel()
-        published = await publish_minority_balance_revote(transition)
         bot.schedule_auto_close(int(round_row["id"]), float(transition["close_at"]))
-        if published:
+        if transition["published"]:
             await interaction.followup.send(
                 "1차 인원수를 공개하고 같은 선택지의 재선택을 시작했습니다.",
                 ephemeral=True,

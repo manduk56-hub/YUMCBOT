@@ -59,7 +59,13 @@ from ..rounds import (
     round_extra,
     round_game_key,
 )
-from .registry import SettleContext, register_settler
+from .registry import (
+    CreateContext,
+    CreateResult,
+    SettleContext,
+    register_creator,
+    register_settler,
+)
 
 
 @runtime_checkable
@@ -1013,6 +1019,46 @@ def build_baseball_embed(
     )
     embed.set_footer(text=f"라운드 #{round_id} · 치기 버튼이 열린 뒤 7초 후 결과 공개")
     return embed
+
+
+def create_baseball_round(ctx: CreateContext) -> CreateResult:
+    """BASE_SCHEMA의 불변 CHECK 제약에 남아 있는 레거시 grid 슬롯을 사용한다.
+
+    이미지 첨부·조작판 메시지 발행은 라운드 메시지를 보낸 뒤에야 가능해서
+    호출자(공통 발행 로직)가 이어서 처리한다.
+    """
+    ctx.extra.update(
+        {
+            "mode": "baseball",
+            "baseball_pitch": 1,
+            "baseball_phase": "waiting_prepare",
+            "baseball_settled_pitches": [],
+            "baseball_result_message_ids": {},
+        }
+    )
+    cursor = ctx.conn.execute(
+        """
+        INSERT INTO rounds
+            (type, title, question, status, channel_id, extra_json, created_at)
+        VALUES ('grid', ?, ?, 'open', ?, ?, ?)
+        """,
+        (
+            ctx.title,
+            ctx.title,
+            ctx.channel_id,
+            json.dumps(ctx.extra, ensure_ascii=False),
+            now_text(),
+        ),
+    )
+    round_id = int(cursor.lastrowid)
+    return CreateResult(
+        round_id=round_id,
+        embed=build_baseball_embed(round_id, ctx.title, 1),
+        view=None,
+    )
+
+
+register_creator("baseball", create_baseball_round)
 
 
 def baseball_control_content(pitch_number: int, phase: str) -> str:
