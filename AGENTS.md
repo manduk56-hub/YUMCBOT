@@ -46,10 +46,12 @@ shellcheck deploy/*.sh                                # CI가 도는 배포 스�
 | `yumcbot/ui.py` | 임베드 표시 유틸(`field_text`·`close_time_text`·`vote_view` 등). 전부 순수 함수 |
 | `yumcbot/permissions.py` | 운영자 판정(`is_operator_user`·`admin_only`) |
 | `yumcbot/discussion.py` | 익명 토론(스레드 발언·번호 배정·토론방 버튼판) |
+| `yumcbot/events.py` | 이벤트/라운드 생애주기 — `close_round_record`(정산 디스패치)와 `/오픈`·`/start`·`/미니게임`·`/라운드마감`·`/이벤트종료`·`/이벤트리스트`의 실제 본체 |
+| `yumcbot/ranking.py` | 점수·랭킹·백업 — `/잠수`·`/지목`·`/점수`·`/랭킹`·`/익명랭킹`·`/데이터백업`의 실제 본체 |
 | `yumcbot/games/registry.py` | 게임 목록(`GameSpec`)과 생성·자동 마감 전이·정산 훅 디스패치 |
 | `yumcbot/games/pairing.py` | 메인게임 셋이 공유하는 1:1 짝 매칭·비공개 방 |
 | `yumcbot/games/*.py` | **게임 하나가 한 파일이다.** `trust`·`sand`·`bail`(메인), `balance`·`defuse`·`top3`·`unique_number`·`cutting`·`baseball`(미니) |
-| `bot.py` | `EventBot` + 슬래시 명령어 + 이벤트/라운드 생성 + 엔트리포인트 |
+| `bot.py` | `EventBot` + 슬래시 명령어 **껍데기**(데코레이터 + 한 줄 위임) + systemd 연동/엔트리포인트 |
 
 의존은 위에서 아래 한 방향이다. `bot.py`는 옮긴 이름을 재노출해서 기존 호출부와 테스트를 그대로
 살려두고 있는데, 재노출은 사본이라 원본과 갈라질 수 있다 — `tests/test_packaging.py`가 그걸 막는다.
@@ -65,8 +67,14 @@ shellcheck deploy/*.sh                                # CI가 도는 배포 스�
 
 | 등록 | 쓰는 곳 | 빠뜨리면 |
 | --- | --- | --- |
-| `runtime.set_client(bot)` | `resolve_text_channel`·`resolve_thread`, 타이머 스케줄 | 클릭으로 하는 조작은 멀쩡하고 타이머 경로만 죽는다 |
+| `runtime.set_client(bot)` | `resolve_text_channel`·`resolve_thread`, 타이머 스케줄, `runtime.auto_close_scheduler()` | 클릭으로 하는 조작은 멀쩡하고 타이머 경로만 죽는다 |
 | `runtime.set_round_services(...)` | 게임이 스스로 라운드를 끝낼 때(야구 3구 완료, 모래성 전원 종료) | 마지막 결과만 뜨고 정산이 안 된다 |
+
+`runtime.AutoCloseScheduler`(`schedule_auto_close`/`cancel_auto_close`)는 `games.pairing.PairBoardClient`와
+별개 프로토콜이다. 소수파 밸런스(1차→재선택 전이)처럼 1:1 방이 없는 게임도 다음 마감을 다시 걸어야
+하는데, 그 게임엔 `PairBoardClient`가 요구하는 스레드 락 기능이 없다. `yumcbot/events.py`도
+`/라운드마감`·`/이벤트종료`에서 이 프로토콜로 타이머를 취소한다 — `bot.auto_close_tasks`를 직접
+만지지 않는다.
 
 `RoundServices`는 정산·다음 미니게임 뷰·이벤트 요약 **셋을 따로** 노출한다. 한 번에 다 해주는
 함수로 감싸지 않는 이유는 순서와 조건이 게임마다 다르기 때문이다 — 야구는 정산 결과가 없어도
@@ -86,8 +94,35 @@ bot.py의 재노출 사본만 바꾸므로 게임 모듈에 닿지 않는다 —
 `ImportCompletenessTest`가 모든 모듈을 AST로 훑어 이걸 잡는다.
 
 `bot.py`에 남은 구역 순서는 대략:
-게임별 상태 전이 함수 → `EventBot` 클래스 → embed/view 빌더 → `close_round_record`(정산) →
-슬래시 명령어 → systemd 연동/엔트리포인트.
+`EventBot` 클래스 → 인터랙션 핸들러(`on_interaction`이 부르는 `handle_*`) → 슬래시 명령어 껍데기 →
+systemd 연동/엔트리포인트.
+
+### 슬래시 명령어도 게임과 같은 패턴이다 — 껍데기는 bot.py, 본체는 모듈
+
+`@bot.tree.command(...)`는 `bot` 인스턴스가 있어야 붙는데, `bot = EventBot()`은 bot.py에서만
+만들어진다. 그래서 명령어 모듈(`events.py`·`ranking.py`, 게임의 `/준비`·`/세공진행`도 같다)은
+데코레이터 없는 평범한 async 함수만 갖고, bot.py가 데코레이터 + 한 줄 위임으로 감싼다:
+
+```python
+# yumcbot/events.py — 본체, 데코레이터 없음
+async def open_event_command(interaction: discord.Interaction) -> None: ...
+
+# bot.py — 껍데기. 이름(open_event)과 옵션(Choice 등)은 여기 남는다
+@bot.tree.command(name="오픈", description="...")
+@app_commands.default_permissions()
+@admin_only()
+async def open_event(interaction: discord.Interaction) -> None:
+    await events.open_event_command(interaction)
+```
+
+`close_round_record`가 `yumcbot/events.py`에 있는 이유도 같은 제약이다 — `/라운드마감`도 쓰고
+`EventBot.auto_close_round`(자동 마감 타이머)도 쓰는데, 어느 한쪽에 종속되지 않는 자리가 필요하다.
+bot.py는 이 함수를 게임 모듈처럼 다시 가져다 쓴다.
+
+`/라운드마감`·`/이벤트종료`는 `bot.auto_close_tasks`·`bot.baseball_pitch_tasks`를 직접 만지지
+않는다 — `runtime.auto_close_scheduler()`(위 참고)와 `games.baseball.cancel_baseball_timers(round_id)`를
+거친다. 등록 마감 → 다음 단계 시작 시퀀스(`advance_trust_registration` 등 게임 모듈의 `advance_*`
+함수)도 자동 마감 타이머와 `/라운드마감`이 같은 헬퍼를 공유해서, 어느 한쪽만 고쳐 갈라지는 일이 없다.
 
 ### 게임 하나를 어디에 등록하는가
 

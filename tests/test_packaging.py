@@ -23,7 +23,9 @@ from yumcbot import (
     activity,
     config,
     discussion,
+    events,
     permissions,
+    ranking,
     rounds,
     roulette,
     runtime,
@@ -48,7 +50,7 @@ from yumcbot.games import (
 # bot.py가 재노출하는 모듈들. 새로 추출할 때마다 여기에 추가한다.
 EXTRACTED = (
     config, schema, activity, scoring, roulette, registry, rounds, ui, pairing,
-    permissions, discussion,
+    permissions, discussion, events, ranking,
     bail, sand, trust, baseball, balance, cutting, defuse, top3, unique_number,
 )
 
@@ -223,6 +225,45 @@ class PairGameWiringTest(unittest.TestCase):
         ):
             with self.subTest(game=key):
                 self.assertIs(registry.settler_for(key), expected)
+
+    def test_every_game_creates_through_the_registry(self) -> None:
+        """생성 훅이 없는 게임은 `/시작`·`/미니게임`에서 '아직 지원하지 않는 게임'으로 막힌다."""
+        for key in registry.GAMES:
+            with self.subTest(game=key):
+                self.assertIsNotNone(
+                    registry.creator_for(key), f"'{key}'의 생성 훅이 등록되지 않았습니다."
+                )
+
+
+class AutoCloseWiringTest(unittest.TestCase):
+    """자동 마감 타이머의 게임별 단계 전이 훅이 EventBot과 이어지는 지점."""
+
+    def test_scheduler_protocol_is_satisfied_by_event_bot(self) -> None:
+        """1:1 방이 없는 게임(소수파 밸런스)도 다음 마감을 다시 걸 수 있어야 한다."""
+        self.assertIsInstance(bot.bot, runtime.AutoCloseScheduler)
+
+    def test_scheduler_protocol_rejects_unrelated_objects(self) -> None:
+        class Unrelated:
+            pass
+
+        self.assertNotIsInstance(Unrelated(), runtime.AutoCloseScheduler)
+
+    def test_baseball_timer_client_exposes_cancel(self) -> None:
+        """라운드마감·이벤트종료가 야구 타이머 두 개를 한 번에 버리는 통로."""
+        self.assertIsInstance(bot.bot, baseball.BaseballTimerClient)
+        self.assertTrue(hasattr(bot.bot, "cancel_baseball_timers"))
+
+    def test_registration_phase_handlers_are_registered(self) -> None:
+        """등록 마감 단계가 있는 메인게임·소수파 밸런스는 자동 마감 훅이 반드시 있어야 한다.
+
+        빠뜨리면 등록 마감 타이머가 울려도 다음 단계로 안 넘어가고 조용히 정산행이 된다.
+        """
+        for key in ("trust", "sand", "bail", "minority_balance"):
+            with self.subTest(game=key):
+                self.assertIsNotNone(
+                    registry.auto_close_handler_for(key),
+                    f"'{key}'의 자동 마감 전이 훅이 등록되지 않았습니다.",
+                )
 
 
 def unresolved_names(path: Path) -> list[str]:

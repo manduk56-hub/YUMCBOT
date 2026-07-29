@@ -32,6 +32,7 @@ import discord
 from .config import (
     BOT_VERSION,
     ROULETTE_BETTING_SECONDS,
+    ROULETTE_CHALLENGE_SECONDS,
     ROULETTE_DAILY_LIMIT,
     ROULETTE_MAX_BET,
     ROULETTE_MIN_BET,
@@ -49,6 +50,7 @@ from .activity import (
 )
 from .scoring import (
     add_score,
+    ensure_user,
     get_roulette_stack,
     set_roulette_stack,
 )
@@ -1149,3 +1151,149 @@ async def handle_roulette_trigger(interaction: discord.Interaction, game_id: int
             )
         else:
             client.cancel_roulette_turn(game_id)
+
+
+async def russian_roulette_command(
+    interaction: discord.Interaction, 플레이어: discord.Member
+) -> None:
+    if interaction.guild is None:
+        await interaction.response.send_message(
+            "서버의 공개 텍스트 채널에서만 러시안룰렛을 시작할 수 있습니다.", ephemeral=True
+        )
+        return
+    if not isinstance(interaction.channel, discord.TextChannel):
+        await interaction.response.send_message(
+            "러시안룰렛은 일반 텍스트 채널에서만 시작할 수 있습니다.",
+            ephemeral=True,
+        )
+        return
+    if not interaction.channel.permissions_for(플레이어).view_channel:
+        await interaction.response.send_message(
+            "선택한 상대방이 이 채널을 볼 수 없어 결투 요청을 받을 수 없습니다. "
+            "상대방이 접근할 수 있는 채널에서 실행해주세요.",
+            ephemeral=True,
+        )
+        return
+    if 플레이어.bot:
+        await interaction.response.send_message("봇에게는 결투를 신청할 수 없습니다.", ephemeral=True)
+        return
+    if 플레이어.id == interaction.user.id:
+        await interaction.response.send_message("자기 자신에게는 결투를 신청할 수 없습니다.", ephemeral=True)
+        return
+
+    challenger_id = str(interaction.user.id)
+    target_id = str(플레이어.id)
+    with db() as conn:
+        ensure_user(conn, interaction.user)
+        ensure_user(conn, 플레이어)
+        expire_stale_roulette_games(conn)
+
+        if active_roulette_game_for_user(conn, challenger_id):
+            await interaction.response.send_message(
+                "이미 진행 중이거나 응답을 기다리는 러시안룰렛이 있습니다.", ephemeral=True
+            )
+            return
+        target_active = active_roulette_game_for_user(conn, target_id)
+        if target_active is not None:
+            await interaction.response.send_message(
+                "상대방이 이미 다른 러시안룰렛에 참여 중입니다.", ephemeral=True
+            )
+            return
+
+        score_rows = conn.execute(
+            "SELECT user_id, total_score FROM users WHERE user_id IN (?, ?)",
+            (challenger_id, target_id),
+        ).fetchall()
+        scores = {str(row["user_id"]): int(row["total_score"]) for row in score_rows}
+        challenger_score = scores.get(challenger_id, 0)
+        target_score = scores.get(target_id, 0)
+        if is_roulette_credit_user(challenger_score):
+            await interaction.response.send_message(
+                f"러시안룰렛을 신청하려면 최소 {ROULETTE_MIN_BET}점이 필요합니다. "
+                f"(현재 {challenger_score}점)\n"
+                "점수가 부족해도 다른 사람의 신청을 **수락**할 수는 있습니다.",
+                ephemeral=True,
+            )
+            return
+
+        # 상대의 잔여 횟수는 여기서 보지 않는다. 신청 단계에서 걸러주면 그 실패가
+        # 상대의 오늘 활동을 알려주는 무료 조회가 된다. 수락 시점에 상대 본인이 확인한다.
+        if count_roulette_games_today(conn, challenger_id) >= ROULETTE_DAILY_LIMIT:
+            await interaction.response.send_message(
+                f"오늘 러시안룰렛을 {ROULETTE_DAILY_LIMIT}번 모두 사용했습니다. "
+                "내일 다시 도전해주세요.",
+                ephemeral=True,
+            )
+            return
+        if (
+            count_roulette_games_with_opponent_today(conn, challenger_id, target_id)
+            >= ROULETTE_PAIR_DAILY_LIMIT
+        ):
+            await interaction.response.send_message(
+                "오늘 이 상대와는 이미 겨뤘습니다. 같은 상대와는 하루 "
+                f"{ROULETTE_PAIR_DAILY_LIMIT}번까지입니다.",
+                ephemeral=True,
+            )
+            return
+
+        cursor = conn.execute(
+            """
+            INSERT INTO russian_roulette_games (
+                guild_id, channel_id, challenger_id, target_id,
+                challenger_name, target_name, status, created_at, expires_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?)
+            """,
+            (
+                str(interaction.guild.id),
+                str(interaction.channel.id),
+                challenger_id,
+                target_id,
+                getattr(interaction.user, "display_name", interaction.user.name),
+                플레이어.display_name,
+                now_text(),
+                time.time() + ROULETTE_CHALLENGE_SECONDS,
+            ),
+        )
+        game_id = int(cursor.lastrowid)
+        log_activity(
+            conn,
+            "roulette",
+            "challenge",
+            actor_user_id=challenger_id,
+            target_user_id=target_id,
+            payload={
+                "game_id": game_id,
+                "challenger_score": challenger_score,
+                "target_score": target_score,
+            },
+        )
+        game = dict(
+            conn.execute(
+                "SELECT * FROM russian_roulette_games WHERE id = ?", (game_id,)
+            ).fetchone()
+        )
+
+    try:
+        await interaction.response.send_message(
+            content=f"<@{target_id}>님, 러시안룰렛 결투 요청이 도착했습니다.",
+            embed=build_roulette_embed(game),
+            view=roulette_view(game),
+            allowed_mentions=discord.AllowedMentions(
+                everyone=False, roles=False, users=True, replied_user=False
+            ),
+        )
+        message = await interaction.original_response()
+    except discord.HTTPException:
+        with db() as conn:
+            conn.execute(
+                "UPDATE russian_roulette_games SET status = 'expired', finished_at = ? WHERE id = ?",
+                (now_text(), game_id),
+            )
+        raise
+
+    with db() as conn:
+        conn.execute(
+            "UPDATE russian_roulette_games SET message_id = ? WHERE id = ?",
+            (str(message.id), game_id),
+        )

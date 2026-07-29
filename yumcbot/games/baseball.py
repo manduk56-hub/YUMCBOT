@@ -85,12 +85,19 @@ class BaseballTimerClient(Protocol):
         self, round_id: int, activate_at: float, pitch_number: int
     ) -> None: ...
 
+    def cancel_baseball_timers(self, round_id: int) -> None: ...
+
 
 def _timer_client() -> BaseballTimerClient:
     client = runtime.get_client()
     if not isinstance(client, BaseballTimerClient):
         raise RuntimeError("투구 타이머를 걸 수 없는 클라이언트입니다.")
     return client
+
+
+def cancel_baseball_timers(round_id: int) -> None:
+    """라운드마감·이벤트종료가 야구가 아닌 라운드에도 무조건 부른다. 야구가 아니면 조용히 아무 일도 없다."""
+    _timer_client().cancel_baseball_timers(round_id)
 
 
 async def delete_baseball_control_message(round_row: sqlite3.Row | dict[str, Any]) -> None:
