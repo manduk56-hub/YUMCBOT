@@ -331,5 +331,44 @@ class EntrypointTest(unittest.TestCase):
         self.assertTrue(callable(bot.main))
 
 
+class SlashCommandRegistryTest(unittest.TestCase):
+    """등록된 슬래시 명령어 집합이 조용히 줄어드는 것을 잡는다.
+
+    명령어 본체를 모듈로 옮기는 대규모 텍스트 삭제 도중 실제로 `/오픈`·`/start`·
+    `/미니게임`·`/준비` 4개가 통째로 같이 지워진 적이 있다. 그때는 재노출 검증이
+    잡아줬지만, 명령어는 지워져도 예외가 나지 않고 그냥 디스코드에서 사라질
+    뿐이라 이 테스트가 없으면 다음엔 안 잡힐 수 있다.
+    """
+
+    EXPECTED_COMMANDS = frozenset(
+        {
+            "start",
+            "데이터백업",
+            "라운드마감",
+            "랭킹",
+            "러시안룰렛",
+            "미니게임",
+            "세공진행",
+            "오픈",
+            "이벤트리스트",
+            "이벤트종료",
+            "익명랭킹",
+            "잠수",
+            "점수",
+            "준비",
+            "지목",
+        }
+    )
+
+    def test_registered_commands_match_expected_set(self) -> None:
+        registered = {command.name for command in bot.bot.tree.get_commands()}
+        self.assertEqual(
+            registered,
+            self.EXPECTED_COMMANDS,
+            "등록된 슬래시 명령어 집합이 바뀌었습니다. 의도한 추가/삭제라면 "
+            "EXPECTED_COMMANDS를 함께 갱신하세요.",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
