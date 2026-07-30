@@ -23,8 +23,8 @@ import discord
 
 from .config import (
     BAIL_FAILED_REWARD_POOL,
-    BAIL_FALLBACK_SCOOPS,
     BAIL_NEGOTIATION_MAX_OFFERS,
+    BAIL_PROGRESS_UPDATE_INTERVAL,
     BAIL_REQUIRED_SCOOPS,
     BAIL_REWARD_POOL,
     BAIL_SCOOP_COST,
@@ -132,7 +132,7 @@ def game_settings_snapshot(game_key: str) -> dict[str, Any]:
         settings["sink_penalty_low"] = BAIL_SINK_PENALTY_LOW
         settings["sink_penalty_even"] = BAIL_SINK_PENALTY_EVEN
         settings["max_offers"] = BAIL_NEGOTIATION_MAX_OFFERS
-        settings["fallback_scoops"] = BAIL_FALLBACK_SCOOPS
+        settings["progress_update_interval"] = BAIL_PROGRESS_UPDATE_INTERVAL
         settings["match_history_rounds"] = MATCH_HISTORY_ROUNDS
     elif game_key == "unique_number":
         settings["number_choices"] = UNIQUE_NUMBER_CHOICES

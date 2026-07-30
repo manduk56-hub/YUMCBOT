@@ -160,8 +160,18 @@ BAIL_REWARD_POOL = 10  # 배가 뜨면 두 사람이 나눠 받는 구조 보상
 BAIL_REWARD_CHOICES = [str(index) for index in range(BAIL_REWARD_POOL + 1)]  # 0~10
 BAIL_FAILED_REWARD_POOL = 6  # 협상 결렬 시 감액된 보상금 (둘이 균등 분배)
 BAIL_REQUIRED_SCOOPS = 6  # 배가 뜨는 데 필요한 두 사람 합계 퍼내기 횟수
-BAIL_SCOOP_CHOICES = [str(index) for index in range(BAIL_REQUIRED_SCOOPS + 1)]  # 0~6
 BAIL_SCOOP_COST = 1  # 퍼내기 1회당 차감
+BAIL_PROGRESS_UPDATE_INTERVAL = 2  # 공동 진행 상황 메시지는 합계가 이 배수를 지날 때만 갱신
+# 문턱값 미만 구간은 직전 문턱의 이미지를 그대로 보여준다 (합계 0/2/4일 때만 갱신되고 홀수는 건너뜀).
+# 파일은 assets/에 있다 (bail_0.png · bail_2.png · bail_4.png · bail_6.png · bail_fail.png).
+BAIL_PROGRESS_STAGES: list[tuple[int, str]] = [
+    (0, "bail_0.png"),
+    (2, "bail_2.png"),
+    (4, "bail_4.png"),
+]
+BAIL_PROGRESS_SUCCESS_IMAGE = "bail_6.png"
+BAIL_PROGRESS_SUNK_IMAGE = "bail_fail.png"
+BAIL_PROGRESS_SUNK_CAPTION = "크아악!!💢💢"  # 침몰 이미지 아래에 큰 글씨로 한 줄 더 붙인다
 # 침몰 페널티는 보상 몫에 비례한다. 많이 받기로 한 쪽이 더 크게 잃어야
 # "협상에서 욕심낸 만큼 침몰 리스크를 진다"가 성립하고, 적게 받은 쪽에 배신 카드가 생긴다.
 BAIL_SINK_PENALTY_HIGH = 4  # 보상 몫이 많은 쪽
@@ -170,7 +180,6 @@ BAIL_SINK_PENALTY_EVEN = 3  # 몫이 같을 때 (결렬 포함)
 BAIL_NEGOTIATION_MAX_OFFERS = 3  # 교대 제안 최대 횟수
 BAIL_DEFAULT_NEGOTIATION_MINUTES = 5
 BAIL_DEFAULT_EXECUTION_MINUTES = 3
-BAIL_FALLBACK_SCOOPS = BAIL_REQUIRED_SCOOPS // 2  # 실행 단계 미제출 시의 자동 제출값
 BAIL_OUTCOME_LABELS = {
     "survived": "생존",
     "sunk": "침몰",

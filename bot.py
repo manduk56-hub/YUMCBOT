@@ -29,13 +29,16 @@ from yumcbot.config import (
     AUTO_CLOSE_COUNTDOWN_SECONDS,
     AUTO_CLOSE_WARNING_SECONDS,
     BAIL_FAILED_REWARD_POOL,
-    BAIL_FALLBACK_SCOOPS,
     BAIL_NEGOTIATION_MAX_OFFERS,
     BAIL_OUTCOME_LABELS,
+    BAIL_PROGRESS_STAGES,
+    BAIL_PROGRESS_SUCCESS_IMAGE,
+    BAIL_PROGRESS_SUNK_CAPTION,
+    BAIL_PROGRESS_SUNK_IMAGE,
+    BAIL_PROGRESS_UPDATE_INTERVAL,
     BAIL_REQUIRED_SCOOPS,
     BAIL_REWARD_CHOICES,
     BAIL_REWARD_POOL,
-    BAIL_SCOOP_CHOICES,
     BAIL_SCOOP_COST,
     BAIL_SINK_PENALTY_EVEN,
     BAIL_SINK_PENALTY_HIGH,
@@ -210,8 +213,9 @@ from yumcbot.games.bail import (
     advance_or_finish_bail_round,
     apply_bail_offer,
     apply_bail_response,
-    apply_bail_scoop,
+    apply_bail_scoop_click,
     autocomplete_bail_pair,
+    bail_executions_complete,
     bail_negotiations_complete,
     bail_new_pair,
     bail_pair_intro,
@@ -220,6 +224,10 @@ from yumcbot.games.bail import (
     bail_pair_thread_matches,
     bail_pair_threads,
     bail_pair_view,
+    bail_progress_image_filename,
+    bail_progress_stage_image,
+    bail_progress_stage_index,
+    bail_progress_view,
     bail_reward_share,
     bail_rules_text,
     bail_score_text,
@@ -228,22 +236,29 @@ from yumcbot.games.bail import (
     build_bail_pair_embed,
     build_bail_pair_result_embed,
     build_bail_play_embed,
+    build_bail_progress_embed,
+    build_bail_progress_embeds,
     build_bail_registration_embed,
     find_bail_pair,
+    finish_bail_execution_round,
     handle_bail_offer,
     handle_bail_response,
     handle_bail_scoop,
     load_open_bail_pair,
     publish_bail_pair_results,
     redraw_bail_pair_board,
+    redraw_bail_progress_board,
+    refresh_all_bail_progress_boards,
     refresh_bail_pair_board,
     refresh_main_bail_board,
     resolve_bail_pair,
     save_bail_pair_message_id,
+    save_bail_pair_progress_message_id,
     settle_bail,
     start_bail_execution,
     start_bail_negotiation,
     store_bail_thread_ids,
+    write_bail_progress_message,
 )
 from yumcbot.games import baseball
 from yumcbot.games.baseball import (
@@ -777,24 +792,6 @@ async def handle_emergency_join(interaction: discord.Interaction, round_id: int)
         await refresh_main_trust_board(round_id)
 
 
-# ---------------------------------------------------------------------------
-# 가라앉는 배 (bail) — 협상 → 실행 2단계 메인게임
-#
-# 모래성과 같은 1:1 비공개 방 구조를 쓰지만 단계가 하나 더 있다.
-#   registration → negotiation(교대 제안) → execution(동시 비공개 제출) → scored
-# 협상에서 맺은 합의는 기록만 되고 점수에 영향이 없다. 그게 이 게임의 핵심 규칙이라
-# 정산은 오직 execution 단계의 제출값만 본다.
-#
-# execution 단계는 **조기 종료가 없다.** 협상은 모든 방이 끝나면 바로 넘어가지만, 퍼내기는
-# 두 사람이 다 제출해도 제한 시간을 끝까지 쓰고 마감 시점에 한꺼번에 정산한다. 제출 인원수를
-# 진행판에 세지 않는 것과 한 묶음이다 — 결과가 뜨는 시점이나 "1/2" 표시 중 하나라도 남으면
-# 상대가 제출했는지가 새고, 그러면 비공개 제출이 눈치싸움으로 바뀐다.
-# 대신 방 안에서 남은 시간을 알 수 없어지므로 마감 카운트다운을 방마다 띄운다.
-# 정산이 마감에만 일어나므로 제출은 그때까지 몇 번이든 덮어쓸 수 있다(`apply_bail_scoop`).
-# 번복해도 진행판이 변하지 않아 상대는 알아챌 수 없다 — 위 두 규칙이 무너지면 번복 허용도 못 쓴다.
-# ---------------------------------------------------------------------------
-
-
 # 하루 횟수를 언제 차감할지의 기준.
 #   playing/finished          : 게임이 성립했으므로 양쪽 모두 차감
 #   betting 만료(accepted_at O): 베팅을 넣지 않은 쪽만 차감
@@ -1131,19 +1128,22 @@ class EventBot(discord.Client):
                     return
             guild = getattr(channel, "guild", None)
 
-            # 가라앉는 배 실행 단계는 참가자가 전부 비공개 방에 들어가 있어서 메인 채널
-            # 카운트다운이 보이지 않는다. 같은 모듈을 방마다 하나씩 더 돌려 남은 시간을 알린다.
-            countdown_targets: list[tuple[Any, str]] = [(channel, auto_close_action_label(row))]
             if round_game_key(row) == "bail" and round_extra(row).get("bail_phase") == "execution":
-                countdown_targets.extend(
-                    (thread, "퍼내기 마감") for _, thread in await bail_pair_threads(round_id)
+                # 참가자가 전부 비공개 방에 들어가 있어서 메인 채널 카운트다운은 의미가 없다.
+                # 이미 조기 정산된 방은 기다리기만 하면 되므로 아직 안 끝난 방에만 띄운다.
+                unresolved_threads = [
+                    thread
+                    for pair, thread in await bail_pair_threads(round_id)
+                    if str(pair.get("phase")) != "resolved"
+                ]
+                await asyncio.gather(
+                    *(
+                        publish_auto_close_countdown(thread, "퍼내기 마감", close_at)
+                        for thread in unresolved_threads
+                    )
                 )
-            await asyncio.gather(
-                *(
-                    publish_auto_close_countdown(target, label, close_at)
-                    for target, label in countdown_targets
-                )
-            )
+            else:
+                await publish_auto_close_countdown(channel, auto_close_action_label(row), close_at)
 
             # 카운트다운 도중 수동 마감이나 긴급 연장으로 상태가 바뀔 수 있다.
             # 취소 신호가 늦게 도착해도 오래된 마감 시각으로 정산하지 않도록 다시 확인한다.
@@ -1304,24 +1304,29 @@ class EventBot(discord.Client):
             await handle_sand_action(interaction, round_id, parts[3])
             return
 
-        # 협상은 보상금(0~8)을, 실행은 퍼낼 횟수(0~6)를 고르므로 허용 범위가 다르다.
-        if action in {"bailoffer", "bailscoop"}:
-            choices = BAIL_REWARD_CHOICES if action == "bailoffer" else BAIL_SCOOP_CHOICES
-            if len(parts) != 4 or parts[3] not in choices:
-                await interaction.response.send_message(
-                    "잘못된 보상금 제안입니다." if action == "bailoffer" else "잘못된 퍼내기 횟수입니다.",
-                    ephemeral=True,
-                )
+        if action == "bailoffer":
+            if len(parts) != 4 or parts[3] not in BAIL_REWARD_CHOICES:
+                await interaction.response.send_message("잘못된 보상금 제안입니다.", ephemeral=True)
                 return
             try:
                 round_id = int(parts[2])
             except ValueError:
                 await interaction.response.send_message("잘못된 라운드 번호입니다.", ephemeral=True)
                 return
-            if action == "bailoffer":
-                await handle_bail_offer(interaction, round_id, int(parts[3]))
-            else:
-                await handle_bail_scoop(interaction, round_id, int(parts[3]))
+            await handle_bail_offer(interaction, round_id, int(parts[3]))
+            return
+
+        if action == "bailscoop":
+            # 퍼내기는 선택값 없이 누른 횟수만큼 누적되는 버튼이라 round_id만 온다.
+            if len(parts) != 3:
+                await interaction.response.send_message("잘못된 퍼내기 요청입니다.", ephemeral=True)
+                return
+            try:
+                round_id = int(parts[2])
+            except ValueError:
+                await interaction.response.send_message("잘못된 라운드 번호입니다.", ephemeral=True)
+                return
+            await handle_bail_scoop(interaction, round_id)
             return
 
         if action == "bailrespond":

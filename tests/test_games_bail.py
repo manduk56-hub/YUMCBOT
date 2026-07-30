@@ -196,7 +196,8 @@ class BailGameTests(unittest.TestCase):
         # 두 경우 모두 배는 뜬다 — 합계가 같기 때문이다.
         self.assertEqual(worked["outcome"], shirked["outcome"])
 
-    def test_bail_autocomplete_fills_missing_submissions(self) -> None:
+    def test_bail_autocomplete_defaults_unclicked_scoops_to_zero(self) -> None:
+        """퍼내기는 실시간 클릭이라 안 누르면 0일 뿐이다 — 예전처럼 절반으로 채워주지 않는다."""
         pair = self.bail_pair(
             phase="submitting",
             reward_split=self.bail_even_split(),
@@ -206,24 +207,25 @@ class BailGameTests(unittest.TestCase):
 
         bot.autocomplete_bail_pair(pair)
 
-        # 미제출자만 절반으로 채우고, 이미 낸 사람은 낸 값 그대로.
-        self.assertEqual(pair["scoop_a"], bot.BAIL_FALLBACK_SCOOPS)
+        self.assertEqual(pair["scoop_a"], 0)
         self.assertEqual(pair["scoop_b"], 1)
         self.assertEqual(pair["phase"], "resolved")
-        self.assertTrue(pair["auto_completed"])
+        # 협상은 이미 끝난 상태였으니 자동 처리로 세지 않는다.
+        self.assertNotIn("auto_completed", pair)
 
     def test_bail_autocomplete_during_negotiation_counts_as_failure(self) -> None:
         pair = self.bail_pair(phase="negotiating", offer={"proposer_id": "1", "reward": 8})
 
         bot.autocomplete_bail_pair(pair)
 
-        self.assertEqual(pair["scoop_a"], bot.BAIL_FALLBACK_SCOOPS)
-        self.assertEqual(pair["scoop_b"], bot.BAIL_FALLBACK_SCOOPS)
+        self.assertEqual(pair["scoop_a"], 0)
+        self.assertEqual(pair["scoop_b"], 0)
         self.assertIsNone(pair["reward_split"])
         self.assertEqual(pair["result"]["reward_a"], bot.BAIL_FAILED_REWARD_POOL // 2)
         self.assertIsNone(pair["offer"])
-        # 절반씩이면 배가 뜬다 — 잠수 한 명이 상대까지 침몰시키지 않는다.
-        self.assertEqual(pair["outcome"], "survived")
+        # 아무도 퍼내지 않았으니(0/필요치) 침몰한다.
+        self.assertEqual(pair["outcome"], "sunk")
+        self.assertTrue(pair["auto_completed"])
 
     def test_bail_negotiations_complete_flag(self) -> None:
         negotiating = {"bail_pairs": [self.bail_pair()]}
@@ -234,19 +236,36 @@ class BailGameTests(unittest.TestCase):
         # 짝이 없으면 완료가 아니다 (라운드가 조기 전이되지 않게).
         self.assertFalse(bot.bail_negotiations_complete({"bail_pairs": []}))
 
-    def test_bail_scoop_can_be_resubmitted_until_close(self) -> None:
-        """마감까지 정산이 없으므로 제출은 몇 번이든 덮어쓴다. 직전 값은 로그용으로 돌려준다."""
-        pair = self.bail_pair(phase="submitting")
+    def test_bail_executions_complete_flag(self) -> None:
+        """전부 정산됐을 때만 True — 라운드 전체 조기 마감 판정에 쓴다."""
+        one_pending = {
+            "bail_pairs": [
+                self.bail_submitted_pair(3, 3, reward_split=self.bail_even_split()),
+                self.bail_pair(phase="submitting", scoop_a=1, scoop_b=0),
+            ]
+        }
+        all_resolved = {
+            "bail_pairs": [
+                self.bail_submitted_pair(3, 3, reward_split=self.bail_even_split()),
+                self.bail_submitted_pair(1, 1, reward_split=self.bail_even_split()),
+            ]
+        }
 
-        self.assertIsNone(bot.apply_bail_scoop(pair, "1", 2))
+        self.assertFalse(bot.bail_executions_complete(one_pending))
+        self.assertTrue(bot.bail_executions_complete(all_resolved))
+        self.assertFalse(bot.bail_executions_complete({"bail_pairs": []}))
+
+    def test_bail_scoop_click_accumulates_per_person(self) -> None:
+        """퍼내기는 번호를 선언하던 예전과 달리 실제 클릭이 그대로 쌓이는 되돌릴 수 없는 행동이다."""
+        pair = self.bail_pair(phase="submitting", scoop_a=0, scoop_b=0)
+
+        self.assertEqual(bot.apply_bail_scoop_click(pair, "1"), 1)
+        self.assertEqual(bot.apply_bail_scoop_click(pair, "1"), 2)
         self.assertEqual(pair["scoop_a"], 2)
+        # 클릭은 본인 쪽만 건드린다.
+        self.assertEqual(pair["scoop_b"], 0)
 
-        self.assertEqual(bot.apply_bail_scoop(pair, "1", 5), 2)
-        self.assertEqual(pair["scoop_a"], 5)
-        # 번복은 본인 쪽만 건드린다.
-        self.assertIsNone(pair["scoop_b"])
-
-        self.assertIsNone(bot.apply_bail_scoop(pair, "2", 1))
+        self.assertEqual(bot.apply_bail_scoop_click(pair, "2"), 1)
         self.assertEqual(pair["scoop_b"], 1)
 
     def test_bail_execution_status_hides_submission_progress(self) -> None:
@@ -332,31 +351,46 @@ class BailGameTests(unittest.TestCase):
         self.assertIsNone(bot.start_bail_execution(round_id))
 
     def test_bail_close_autocompletes_and_scores_pairs(self) -> None:
-        for user_id in ("1", "2", "3", "4", "5", "6"):
+        for user_id in ("1", "2", "3", "4", "5", "6", "7", "8"):
             self.add_user(user_id, f"참가자{user_id}", 0)
         split = {"user_a": 7, "user_b": 3}
+        # 아래 둘은 실행 중 필요 횟수를 채워 마감 전에 이미 조기 정산된(phase="resolved") 방이다.
         survived = self.bail_submitted_pair(2, 4, reward_split=split)
         sunk = {
             **self.bail_submitted_pair(3, 2, reward_split=split),
             "user_a_id": "3",
             "user_b_id": "4",
         }
-        unfinished = self.bail_pair(
+        # 실시간으로 3번까지만 퍼내고 마감을 맞은 방 — 남은 시간을 다 써도 필요 횟수를 못 채우면 침몰한다.
+        ran_out_of_time = self.bail_pair(
             user_a_id="5",
             user_b_id="6",
             phase="submitting",
             reward_split=self.bail_even_split(),
             scoop_a=3,
+            scoop_b=0,
+        )
+        # 협상조차 못 끝낸 채 마감된 방 — 결렬로 자동 처리된다.
+        still_negotiating = self.bail_pair(
+            user_a_id="7",
+            user_b_id="8",
+            phase="negotiating",
+            offer={"proposer_id": "7", "reward": 8},
         )
         round_id = self.insert_bail_round(
-            {"bail_phase": "execution", "bail_pairs": [survived, sunk, unfinished]}
+            {
+                "bail_phase": "execution",
+                "bail_pairs": [survived, sunk, ran_out_of_time, still_negotiating],
+            }
         )
 
         result = bot.close_round_record(round_id, None)
 
-        half = bot.BAIL_REWARD_POOL // 2
         self.assertEqual(
-            {user_id: self.score_of(user_id) for user_id in ("1", "2", "3", "4", "5", "6")},
+            {
+                user_id: self.score_of(user_id)
+                for user_id in ("1", "2", "3", "4", "5", "6", "7", "8")
+            },
             {
                 # 7점 받고 2번, 3점 받고 4번 → 배는 떴다.
                 "1": 7 - 2,
@@ -364,9 +398,12 @@ class BailGameTests(unittest.TestCase):
                 # 침몰: 많이 받기로 한 3번이 더 크게 잃는다.
                 "3": -bot.BAIL_SINK_PENALTY_HIGH,
                 "4": -bot.BAIL_SINK_PENALTY_LOW,
-                # 미제출자는 절반(3번)으로 자동 제출되어 배가 뜬다.
-                "5": half - 3,
-                "6": half - 3,
+                # 필요 횟수를 못 채운 채 마감 — 배분이 같아 페널티도 같다.
+                "5": -bot.BAIL_SINK_PENALTY_EVEN,
+                "6": -bot.BAIL_SINK_PENALTY_EVEN,
+                # 협상도 못 끝내 결렬 처리되고, 아무도 퍼내지 않아(0/필요치) 침몰한다.
+                "7": -bot.BAIL_SINK_PENALTY_EVEN,
+                "8": -bot.BAIL_SINK_PENALTY_EVEN,
             },
         )
         with bot.db() as conn:
@@ -376,7 +413,8 @@ class BailGameTests(unittest.TestCase):
                 ).fetchone()["extra_json"]
             )
         self.assertEqual(extra["bail_phase"], "scored")
-        self.assertTrue(extra["bail_pairs"][2]["auto_completed"])
+        self.assertNotIn("auto_completed", extra["bail_pairs"][2])
+        self.assertTrue(extra["bail_pairs"][3]["auto_completed"])
         rendered = json.dumps(result[1].to_dict(), ensure_ascii=False)
         self.assertIn("자동 제출", rendered)
         self.assertIn("침몰", rendered)
@@ -399,6 +437,15 @@ class BailGameTests(unittest.TestCase):
         self.assertIn("결렬", rendered)
         self.assertNotIn("⚠️", rendered)
 
+    def test_bail_settlement_and_split_text_do_not_repeat_mentions(self) -> None:
+        """짝을 소개하는 줄에서 이미 멘션이 나오므로, 상세 줄은 좌/우 값만 나열한다."""
+        pair = self.bail_submitted_pair(2, 4, reward_split={"user_a": 7, "user_b": 3})
+
+        self.assertNotIn("<@", bot.bail_pair_settlement_text(pair))
+        self.assertNotIn("<@", bot.bail_split_text(pair))
+        self.assertIn("/", bot.bail_pair_settlement_text(pair))
+        self.assertIn("/", bot.bail_split_text(pair))
+
     def test_bail_rules_text_is_generated_from_constants(self) -> None:
         # 상수를 읽는 것은 bail 모듈이다. bot의 재노출은 사본이라 갈아끼워도 안 통한다.
         with patch.object(bail, "BAIL_SINK_PENALTY_HIGH", 9):
@@ -419,7 +466,9 @@ class BailGameTests(unittest.TestCase):
             per_row: dict[int, int] = {}
             for item in view.children:
                 per_row[item.row] = per_row.get(item.row, 0) + 1
-            self.assertLessEqual(max(per_row.values()), 5, extra)
+            # 실행 단계의 진행판은 버튼이 없다 — 퍼내기 버튼은 별도의 공동 진행 상황 메시지에 있다.
+            if per_row:
+                self.assertLessEqual(max(per_row.values()), 5, extra)
             self.assertLessEqual(len(view.children), 25, extra)
             self.assertTrue(
                 all(item.custom_id.startswith("eventbot:bail") for item in view.children),
@@ -442,6 +491,95 @@ class BailGameTests(unittest.TestCase):
         view = bot.bail_pair_view(1, self.bail_submitted_pair(3, 3), {"bail_phase": "execution"})
 
         self.assertEqual(view.children, [])
+
+    def test_bail_progress_stage_image_thresholds(self) -> None:
+        """공동 진행 상황 이미지는 합계 0/2/4에서만 바뀌고, 필요치에 도달하면 성공 이미지가 된다."""
+        self.assertEqual(bot.bail_progress_stage_image(0), bot.BAIL_PROGRESS_STAGES[0][1])
+        self.assertEqual(bot.bail_progress_stage_image(1), bot.BAIL_PROGRESS_STAGES[0][1])
+        self.assertEqual(bot.bail_progress_stage_image(2), bot.BAIL_PROGRESS_STAGES[1][1])
+        self.assertEqual(bot.bail_progress_stage_image(3), bot.BAIL_PROGRESS_STAGES[1][1])
+        self.assertEqual(bot.bail_progress_stage_image(4), bot.BAIL_PROGRESS_STAGES[2][1])
+        self.assertEqual(bot.bail_progress_stage_image(5), bot.BAIL_PROGRESS_STAGES[2][1])
+        self.assertEqual(
+            bot.bail_progress_stage_image(bot.BAIL_REQUIRED_SCOOPS),
+            bot.BAIL_PROGRESS_SUCCESS_IMAGE,
+        )
+
+    def test_bail_progress_image_filename_reflects_resolved_outcome(self) -> None:
+        survived = self.bail_submitted_pair(3, 3, reward_split=self.bail_even_split())
+        sunk = self.bail_submitted_pair(1, 1, reward_split=self.bail_even_split())
+
+        self.assertEqual(bot.bail_progress_image_filename(survived), bot.BAIL_PROGRESS_SUCCESS_IMAGE)
+        self.assertEqual(bot.bail_progress_image_filename(sunk), bot.BAIL_PROGRESS_SUNK_IMAGE)
+
+    def test_bail_progress_stage_index_counts_up_then_disappears_on_success(self) -> None:
+        """단계 번호는 퍼내기 횟수가 아니라 지금 보이는 이미지가 몇 번째인지를 가리킨다."""
+        self.assertEqual(bot.bail_progress_stage_index(0), 1)
+        self.assertEqual(bot.bail_progress_stage_index(1), 1)
+        self.assertEqual(bot.bail_progress_stage_index(2), 2)
+        self.assertEqual(bot.bail_progress_stage_index(4), 3)
+        self.assertIsNone(bot.bail_progress_stage_index(bot.BAIL_REQUIRED_SCOOPS))
+
+    def test_bail_progress_embed_shows_stage_only_while_in_progress(self) -> None:
+        pending = self.bail_pair(phase="submitting", scoop_a=2, scoop_b=0)
+        resolved = self.bail_submitted_pair(3, 3, reward_split=self.bail_even_split())
+
+        pending_embed = bot.build_bail_progress_embed(pending)
+        resolved_embed = bot.build_bail_progress_embed(resolved)
+
+        # 문구 대신 단계별 이미지를 첨부파일 URL로 보여준다.
+        self.assertEqual(
+            pending_embed.image.url, f"attachment://{bot.BAIL_PROGRESS_STAGES[1][1]}"
+        )
+        self.assertIn("2/3", pending_embed.footer.text)
+        self.assertEqual(
+            resolved_embed.image.url, f"attachment://{bot.BAIL_PROGRESS_SUCCESS_IMAGE}"
+        )
+        # 정산된 뒤에는 더 이상 '단계'가 아니므로 각주를 붙이지 않는다.
+        self.assertFalse(resolved_embed.footer.text)
+
+    def test_bail_progress_embeds_add_caption_only_when_sunk(self) -> None:
+        """침몰이면 사진 밑에 큰 문구를 한 줄 더 붙인다 — 생존/진행 중에는 이미지 하나뿐이다."""
+        pending = self.bail_pair(phase="submitting", scoop_a=2, scoop_b=0)
+        survived = self.bail_submitted_pair(3, 3, reward_split=self.bail_even_split())
+        sunk = self.bail_submitted_pair(1, 1, reward_split=self.bail_even_split())
+
+        self.assertEqual(len(bot.build_bail_progress_embeds(pending)), 1)
+        self.assertEqual(len(bot.build_bail_progress_embeds(survived)), 1)
+
+        sunk_embeds = bot.build_bail_progress_embeds(sunk)
+        self.assertEqual(len(sunk_embeds), 2)
+        self.assertEqual(sunk_embeds[1].description, f"# {bot.BAIL_PROGRESS_SUNK_CAPTION}")
+
+    def test_bail_progress_view_has_no_button_once_resolved(self) -> None:
+        pending = self.bail_pair(phase="submitting", scoop_a=0, scoop_b=0)
+        resolved = self.bail_submitted_pair(3, 3, reward_split=self.bail_even_split())
+
+        pending_view = bot.bail_progress_view(1, pending)
+        resolved_view = bot.bail_progress_view(1, resolved)
+
+        self.assertEqual(len(pending_view.children), 1)
+        self.assertEqual(pending_view.children[0].custom_id, "eventbot:bailscoop:1")
+        self.assertEqual(resolved_view.children, [])
+
+    def test_bail_pair_resolves_early_once_required_scoops_are_clicked(self) -> None:
+        """필요 횟수를 채우는 순간 그 짝은 바로 정산된다 — 마감을 기다리지 않는다."""
+        pair = self.bail_pair(phase="submitting", reward_split=self.bail_even_split())
+        pair["scoop_a"] = 0
+        pair["scoop_b"] = 0
+
+        for _ in range(bot.BAIL_REQUIRED_SCOOPS - 1):
+            bot.apply_bail_scoop_click(pair, "1")
+            total = int(pair["scoop_a"]) + int(pair["scoop_b"])
+            self.assertLess(total, bot.BAIL_REQUIRED_SCOOPS)
+
+        bot.apply_bail_scoop_click(pair, "2")
+        total = int(pair["scoop_a"]) + int(pair["scoop_b"])
+        self.assertEqual(total, bot.BAIL_REQUIRED_SCOOPS)
+
+        bot.resolve_bail_pair(pair)
+        self.assertEqual(pair["phase"], "resolved")
+        self.assertEqual(pair["outcome"], "survived")
 
     def test_bail_embeds_render_in_every_phase(self) -> None:
         """embed 필드는 1024자 제한이 있어 단계별로 한 번씩 만들어봐야 한다."""
@@ -467,14 +605,10 @@ class BailGameTests(unittest.TestCase):
                     self.assertLessEqual(len(field.value), 1024, (phase, field.name))
 
     def test_bail_choices_cover_full_range(self) -> None:
-        # 협상은 보상금 전부를, 실행은 노동 전부를 요구할 수 있어야 폭이 나온다.
+        # 협상은 보상금 전부를 요구할 수 있어야 폭이 나온다.
         self.assertEqual(
             bot.BAIL_REWARD_CHOICES,
             [str(index) for index in range(bot.BAIL_REWARD_POOL + 1)],
-        )
-        self.assertEqual(
-            bot.BAIL_SCOOP_CHOICES,
-            [str(index) for index in range(bot.BAIL_REQUIRED_SCOOPS + 1)],
         )
 
     def test_bail_greedy_split_cannot_beat_a_moderate_one(self) -> None:
