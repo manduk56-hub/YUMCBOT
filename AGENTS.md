@@ -13,13 +13,17 @@ This file provides guidance to AI coding agents (Claude Code, Cursor, Codex 등)
 .\run.ps1                                   # 봇 실행 (.venv 없으면 자동 생성 + 의존성 설치)
 
 python -m unittest discover -s tests -v     # 전체
-python -m unittest tests.test_bot -v        # 파일 단위 (단일 테스트는 뒤에 .클래스.메서드)
+python -m unittest tests.test_games_bail -v # 파일 단위 (단일 테스트는 뒤에 .클래스.메서드)
 
 python -m compileall -q bot.py deploy/check_idle.py   # CI가 도는 문법 검사
 shellcheck deploy/*.sh                                # CI가 도는 배포 스크립트 검사
 ```
 
 테스트는 `bot.DB_PATH`를 임시 디렉터리로 patch해서 돈다. 디스코드 연결 없이 순수 함수와 DB 로직만 검증한다.
+`tests/`도 `yumcbot/` 모듈 경계를 그대로 따른다 (`tests/test_games_bail.py` ↔ `yumcbot/games/bail.py` 등).
+`tests/test_bot.py`에는 아직 bot.py에 직접 남아 있는 로직(이벤트 취소·자동 마감 카운트다운·긴급 투입)만 남는다.
+setUp의 DB patch·`add_user` 같은 헬퍼는 파일마다 필요한 만큼 복제한다 — 공용 베이스 클래스로 묶지 않는 이유는
+파일 하나만 읽어도 그 파일이 뭘 준비하는지 알 수 있어야 하기 때문이다.
 
 ## 개발자마다 전용 Discord 앱이 필요하다
 

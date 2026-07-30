@@ -1,0 +1,215 @@
+from __future__ import annotations
+
+import csv
+import json
+import tempfile
+import unittest
+from pathlib import Path
+from unittest.mock import patch
+
+import bot
+from yumcbot import config
+
+
+class RankingTests(unittest.TestCase):
+    """점수 조회·랭킹 공개·백업(yumcbot/ranking.py) 회귀 테스트."""
+
+    def setUp(self) -> None:
+        self.temp_dir = tempfile.TemporaryDirectory()
+        # patch 대상이 config인 이유는 test_bot.py setUp의 주석 참고.
+        self.db_patch = patch.object(config, "DB_PATH", Path(self.temp_dir.name) / "test.sqlite3")
+        self.db_patch.start()
+        bot.init_db()
+
+    def tearDown(self) -> None:
+        self.db_patch.stop()
+        self.temp_dir.cleanup()
+
+    def add_user(self, user_id: str, display_name: str, score: int) -> None:
+        with bot.db() as conn:
+            conn.execute(
+                """
+                INSERT INTO users (user_id, display_name, total_score, created_at, updated_at)
+                VALUES (?, ?, ?, '2026-01-01 00:00:00', '2026-01-01 00:00:00')
+                """,
+                (user_id, display_name, score),
+            )
+
+    def test_my_score_message_shows_only_scores(self) -> None:
+        message = bot.format_my_score_message(7, 5)
+        self.assertEqual(message, "3등 점수: **7점**\n내 점수: **5점**")
+        self.assertNotIn("<@", message)
+
+    def test_my_score_message_without_third_place(self) -> None:
+        self.assertIn("아직 없음", bot.format_my_score_message(None, 2))
+
+    def test_third_place_is_fixed_to_one_user_when_tied(self) -> None:
+        """3등이 동점이어도 항상 같은 한 명이 3등으로 뽑혀야 한다.
+
+        점수가 그대로인 한 몇 번을 조회해도 같은 유저·같은 점수가 나와야 하고,
+        그래야 '3등이 두 명이구나'를 유저가 눈치챌 수 없다.
+        """
+        self.add_user("100", "봇", 0)
+        self.add_user("200", "1등", 9)
+        self.add_user("300", "공동 3등 A", 4)
+        self.add_user("400", "2등", 7)
+        self.add_user("500", "공동 3등 B", 4)
+        with bot.db() as conn:
+            cursor = conn.execute(
+                """
+                INSERT INTO rounds (type, title, question, status, extra_json, created_at)
+                VALUES ('balance', '테스트', '선택', 'closed', '{}', '2026-01-01 00:00:00')
+                """
+            )
+            conn.executemany(
+                """
+                INSERT INTO votes (round_id, user_id, choice, created_at, updated_at)
+                VALUES (?, ?, 'A', '2026-01-01 00:00:00', '2026-01-01 00:00:00')
+                """,
+                [(int(cursor.lastrowid), user_id) for user_id in ("200", "300", "400", "500")],
+            )
+
+        thirds = []
+        for _ in range(5):
+            with bot.db() as conn:
+                rows = bot.fetch_ranking_rows(conn, "100")
+            thirds.append((rows[2]["user_id"], rows[2]["total_score"]))
+
+        self.assertEqual(thirds, [("300", 4)] * 5)
+
+    def test_third_place_stays_fixed_after_unrelated_score_change(self) -> None:
+        """동점자의 updated_at이 갱신돼도 3등이 다른 사람으로 바뀌면 안 된다."""
+        self.add_user("100", "봇", 0)
+        self.add_user("300", "공동 1등 A", 4)
+        self.add_user("500", "공동 1등 B", 4)
+        with bot.db() as conn:
+            cursor = conn.execute(
+                """
+                INSERT INTO rounds (type, title, question, status, extra_json, created_at)
+                VALUES ('balance', '테스트', '선택', 'closed', '{}', '2026-01-01 00:00:00')
+                """
+            )
+            round_id = int(cursor.lastrowid)
+            conn.executemany(
+                """
+                INSERT INTO votes (round_id, user_id, choice, created_at, updated_at)
+                VALUES (?, ?, 'A', '2026-01-01 00:00:00', '2026-01-01 00:00:00')
+                """,
+                [(round_id, user_id) for user_id in ("300", "500")],
+            )
+            before = [row["user_id"] for row in bot.fetch_ranking_rows(conn, "100")]
+
+            # 500번이 +1 되었다가 -1 되어 같은 점수로 돌아온다 (updated_at만 바뀐다).
+            bot.add_score(conn, "500", "공동 1등 B", 1, "테스트", round_id)
+            bot.add_score(conn, "500", "공동 1등 B", -1, "테스트", round_id)
+            after = [row["user_id"] for row in bot.fetch_ranking_rows(conn, "100")]
+
+        self.assertEqual(before, after)
+
+    def test_ranking_includes_only_users_with_game_participation(self) -> None:
+        self.add_user("100", "이벤트 봇", 99)
+        self.add_user("200", "미참가자", 8)
+        self.add_user("300", "참가자", 7)
+        with bot.db() as conn:
+            cursor = conn.execute(
+                """
+                INSERT INTO rounds (type, title, question, status, extra_json, created_at)
+                VALUES ('balance', '테스트', '선택', 'closed', '{}', '2026-01-01 00:00:00')
+                """
+            )
+            conn.execute(
+                """
+                INSERT INTO votes (round_id, user_id, choice, created_at, updated_at)
+                VALUES (?, '300', 'A', '2026-01-01 00:00:00', '2026-01-01 00:00:00')
+                """,
+                (int(cursor.lastrowid),),
+            )
+
+        with bot.db() as conn:
+            rows = bot.fetch_ranking_rows(conn, "100")
+
+        self.assertEqual([row["user_id"] for row in rows], ["300"])
+
+    def test_public_ranking_lines_show_users_and_scores(self) -> None:
+        rows = [
+            {"user_id": "200", "display_name": "1등", "total_score": 9},
+            {"user_id": "300", "display_name": "2등", "total_score": 7},
+        ]
+
+        self.assertEqual(
+            bot.format_public_ranking_lines(rows),
+            ["1. <@200> - **9점**", "2. <@300> - **7점**"],
+        )
+        self.assertEqual(
+            bot.format_public_ranking_lines([rows[1]], start_rank=2),
+            ["2. <@300> - **7점**"],
+        )
+
+    def test_ranking_command_is_admin_only(self) -> None:
+        command = bot.bot.tree.get_command("랭킹")
+
+        self.assertIsNotNone(command)
+        self.assertEqual(command.default_permissions.value, 0)
+        self.assertEqual(len(command.checks), 1)
+        rank_parameter = command.parameters[0]
+        self.assertEqual(rank_parameter.name, "등수")
+        self.assertFalse(rank_parameter.required)
+        self.assertEqual(rank_parameter.min_value, 1)
+        self.assertEqual(rank_parameter.max_value, 1000)
+
+    def test_anonymous_ranking_hides_all_user_information(self) -> None:
+        rows = [
+            {"user_id": "200", "display_name": "1등 이름", "total_score": 9},
+            {"user_id": "300", "display_name": "2등 이름", "total_score": 7},
+        ]
+
+        lines = bot.format_anonymous_ranking_lines(rows)
+        self.assertEqual(lines, ["1등 - **9점**", "2등 - **7점**"])
+        self.assertNotIn("200", "".join(lines))
+        self.assertNotIn("300", "".join(lines))
+        self.assertNotIn("이름", "".join(lines))
+        self.assertEqual(
+            bot.format_anonymous_ranking_lines([rows[1]], start_rank=2),
+            ["2등 - **7점**"],
+        )
+
+    def test_anonymous_ranking_command_is_admin_only(self) -> None:
+        command = bot.bot.tree.get_command("익명랭킹")
+
+        self.assertIsNotNone(command)
+        self.assertEqual(command.default_permissions.value, 0)
+        self.assertEqual(len(command.checks), 1)
+        rank_parameter = command.parameters[0]
+        self.assertEqual(rank_parameter.name, "등수")
+        self.assertFalse(rank_parameter.required)
+        self.assertEqual(rank_parameter.min_value, 1)
+        self.assertEqual(rank_parameter.max_value, 1000)
+
+    def test_admin_score_report_records_user_names_and_scores(self) -> None:
+        report_path = Path(self.temp_dir.name) / "score_report.csv"
+        rows = [
+            {
+                "user_id": "200",
+                "display_name": "첫번째 참가자",
+                "total_score": 7,
+                "updated_at": "2026-01-01 00:00:00",
+            },
+            {
+                "user_id": "300",
+                "display_name": "두번째 참가자",
+                "total_score": 4,
+                "updated_at": "2026-01-01 00:00:01",
+            },
+        ]
+
+        bot.write_admin_score_report(report_path, rows)
+
+        with report_path.open("r", encoding="utf-8-sig", newline="") as report_file:
+            report_rows = list(csv.DictReader(report_file))
+        self.assertEqual(report_rows[0]["display_name"], "첫번째 참가자")
+        self.assertEqual(report_rows[0]["total_score"], "7")
+        self.assertEqual(report_rows[1]["user_id"], "300")
+
+
+if __name__ == "__main__":
+    unittest.main()
