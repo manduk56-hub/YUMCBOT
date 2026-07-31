@@ -106,6 +106,139 @@ class RankingTests(unittest.TestCase):
 
         self.assertEqual(before, after)
 
+    def test_finalization_orders_by_score_participation_wins_then_draw(self) -> None:
+        """참여 장려가 승수보다 앞서고, 세 값이 모두 같은 그룹만 한 번 추첨한다."""
+        for user_id, name in (
+            ("100", "봇"),
+            ("200", "참여 우선"),
+            ("300", "승수는 많지만 참여 적음"),
+            ("400", "완전 동률 A"),
+            ("500", "완전 동률 B"),
+        ):
+            self.add_user(user_id, name, 10 if user_id != "100" else 0)
+
+        with bot.db() as conn:
+            round_ids: list[int] = []
+            for event_index in range(3):
+                event = conn.execute(
+                    """
+                    INSERT INTO event_sessions (status, channel_id, created_at, closed_at)
+                    VALUES ('closed', '10', ?, ?)
+                    """,
+                    (
+                        f"2026-01-0{event_index + 1} 00:00:00",
+                        f"2026-01-0{event_index + 1} 01:00:00",
+                    ),
+                )
+                event_id = int(event.lastrowid)
+                participants = ["200", "400", "500"]
+                if event_index < 2:
+                    participants.append("300")
+                conn.executemany(
+                    """
+                    INSERT INTO event_participants (event_session_id, user_id, joined_at)
+                    VALUES (?, ?, '2026-01-01 00:00:00')
+                    """,
+                    [(event_id, user_id) for user_id in participants],
+                )
+                round_cursor = conn.execute(
+                    """
+                    INSERT INTO rounds (
+                        type, title, question, status, extra_json,
+                        created_at, closed_at, event_session_id
+                    ) VALUES (
+                        'balance', ?, '선택', 'closed', '{}',
+                        '2026-01-01 00:00:00', '2026-01-01 01:00:00', ?
+                    )
+                    """,
+                    (f"라운드 {event_index + 1}", event_id),
+                )
+                round_ids.append(int(round_cursor.lastrowid))
+
+            # 1라운드: 전원 승리, 2라운드: 300/400/500만 승리, 3라운드: 승자 없음.
+            for user_id in ("200", "300", "400", "500"):
+                conn.execute(
+                    """
+                    INSERT INTO score_logs (round_id, user_id, delta, reason, created_at)
+                    VALUES (?, ?, 1, '테스트 승리', '2026-01-01 01:00:00')
+                    """,
+                    (round_ids[0], user_id),
+                )
+            for user_id in ("300", "400", "500"):
+                conn.execute(
+                    """
+                    INSERT INTO score_logs (round_id, user_id, delta, reason, created_at)
+                    VALUES (?, ?, 2, '테스트 승리', '2026-01-02 01:00:00')
+                    """,
+                    (round_ids[1], user_id),
+                )
+
+            stats = bot.fetch_ranking_stat_rows(conn, "100")
+            self.assertEqual(
+                [
+                    (row["user_id"], row["participation_count"], row["win_count"])
+                    for row in stats
+                ],
+                [("400", 3, 2), ("500", 3, 2), ("200", 3, 1), ("300", 2, 2)],
+            )
+
+            class ReverseRng:
+                @staticmethod
+                def shuffle(values) -> None:
+                    values.reverse()
+
+            finalized = bot.finalize_season_rankings(
+                conn, "100", "999", rng=ReverseRng()
+            )
+            self.assertEqual(
+                [row["user_id"] for row in finalized],
+                ["500", "400", "200", "300"],
+            )
+            self.assertEqual(
+                [row["final_rank"] for row in finalized], [1, 2, 3, 4]
+            )
+            self.assertTrue(bot.season_is_closed(conn))
+            self.assertEqual(
+                [row["user_id"] for row in bot.fetch_ranking_rows(conn, "100")],
+                ["500", "400", "200", "300"],
+            )
+
+        with bot.db() as conn:
+            persisted = bot.fetch_final_ranking_rows(conn)
+        self.assertEqual([row["user_id"] for row in persisted], ["500", "400", "200", "300"])
+
+    def test_finalization_rejects_an_open_event(self) -> None:
+        with bot.db() as conn:
+            conn.execute(
+                """
+                INSERT INTO event_sessions (status, channel_id, created_at)
+                VALUES ('recruiting', '10', '2026-01-01 00:00:00')
+                """
+            )
+            with self.assertRaises(bot.SeasonFinalizationBlockedError) as raised:
+                bot.finalize_season_rankings(conn, "100", "999")
+        self.assertIn("진행 중인 이벤트", str(raised.exception))
+
+    def test_finalized_ranking_cannot_be_drawn_again(self) -> None:
+        self.add_user("200", "참가자", 3)
+        with bot.db() as conn:
+            round_cursor = conn.execute(
+                """
+                INSERT INTO rounds (type, title, question, status, extra_json, created_at, closed_at)
+                VALUES ('balance', '완료', '선택', 'closed', '{}', '2026-01-01', '2026-01-01')
+                """
+            )
+            conn.execute(
+                """
+                INSERT INTO votes (round_id, user_id, choice, created_at, updated_at)
+                VALUES (?, '200', 'A', '2026-01-01', '2026-01-01')
+                """,
+                (int(round_cursor.lastrowid),),
+            )
+            bot.finalize_season_rankings(conn, "100", "999")
+            with self.assertRaises(bot.SeasonAlreadyClosedError):
+                bot.finalize_season_rankings(conn, "100", "999")
+
     def test_ranking_includes_only_users_with_game_participation(self) -> None:
         self.add_user("100", "이벤트 봇", 99)
         self.add_user("200", "미참가자", 8)

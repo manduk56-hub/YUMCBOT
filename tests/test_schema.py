@@ -123,6 +123,32 @@ class FreshDatabaseTest(unittest.TestCase):
             },
         )
 
+    def test_season_finalization_tables_are_created_open(self) -> None:
+        """v8 마이그레이션. 종료 상태와 추첨까지 끝난 고유 순위를 재시작 뒤에도 보존한다."""
+        schema.init_db()
+        with schema.db() as conn:
+            state = conn.execute(
+                "SELECT singleton_id, status FROM season_state"
+            ).fetchone()
+            ranking_columns = {
+                row["name"]
+                for row in conn.execute("PRAGMA table_info(final_rankings)").fetchall()
+            }
+        self.assertEqual((state["singleton_id"], state["status"]), (1, "open"))
+        self.assertEqual(
+            ranking_columns,
+            {
+                "user_id",
+                "final_rank",
+                "display_name",
+                "total_score",
+                "participation_count",
+                "win_count",
+                "draw_order",
+                "finalized_at",
+            },
+        )
+
     def test_init_db_is_idempotent(self) -> None:
         schema.init_db()
         schema.init_db()

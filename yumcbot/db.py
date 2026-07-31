@@ -289,6 +289,35 @@ MIGRATIONS: dict[int, list[str]] = {
         ON baseball_swings(round_id, pitch_number, id)
         """,
     ],
+    # 누적 시즌 종료 상태와 그 순간 확정한 고유 순위. 종료 뒤 점수·참여 이력이
+    # 바뀌지 않더라도 추첨을 다시 하면 순위가 흔들리므로 결과 전체를 영속화한다.
+    8: [
+        """
+        CREATE TABLE IF NOT EXISTS season_state (
+            singleton_id INTEGER PRIMARY KEY CHECK (singleton_id = 1),
+            status TEXT NOT NULL CHECK (status IN ('open', 'closed')) DEFAULT 'open',
+            closed_at TEXT,
+            closed_by_user_id TEXT
+        )
+        """,
+        """
+        INSERT OR IGNORE INTO season_state (singleton_id, status)
+        VALUES (1, 'open')
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS final_rankings (
+            user_id TEXT PRIMARY KEY,
+            final_rank INTEGER NOT NULL UNIQUE CHECK (final_rank > 0),
+            display_name TEXT NOT NULL,
+            total_score INTEGER NOT NULL,
+            participation_count INTEGER NOT NULL CHECK (participation_count >= 0),
+            win_count INTEGER NOT NULL CHECK (win_count >= 0),
+            draw_order INTEGER NOT NULL CHECK (draw_order > 0),
+            finalized_at TEXT NOT NULL,
+            FOREIGN KEY (user_id) REFERENCES users(user_id) ON DELETE CASCADE
+        )
+        """,
+    ],
 }
 
 SCHEMA_VERSION = max([BASELINE_VERSION, *MIGRATIONS])

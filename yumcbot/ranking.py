@@ -1,25 +1,30 @@
 """점수 조회·랭킹 공개·관리자 백업 — `/잠수`·`/지목`·`/점수`·`/랭킹`·`/익명랭킹`·`/데이터백업`.
 
-랭킹은 게임 기록이 있는 사람만, 봇은 제외하고 보여준다. 동점자는 `user_id` 순으로 고정한다 —
-`updated_at`으로 정렬하면 `add_score()`가 그 값을 건드려 순서가 흔들리기 때문이다.
+랭킹은 정상 종료된 게임의 참가 기록이 있는 사람만 보여준다. 시즌이 열려 있을 때는
+점수→참여→승리→user_id 순으로 안정적으로 표시하고, `/시즌종료`가 확정되면 완전
+동률 그룹만 안전하게 추첨한 고유 순위를 `final_rankings`에서 그대로 읽는다.
 """
 
 from __future__ import annotations
 
 import csv
+import secrets
 import sqlite3
 from datetime import datetime
 from pathlib import Path
+from typing import Any
 
 import discord
 
 from . import config
+from .activity import log_activity
 from .config import (
     AFK_COIN_PER_TICK,
     SCORE_REVEAL_COST,
 )
 from .db import (
     db,
+    now_text,
 )
 from .scoring import (
     ensure_user,
@@ -28,41 +33,274 @@ from .scoring import (
 )
 
 
+class SeasonAlreadyClosedError(RuntimeError):
+    """최종 순위가 이미 확정된 뒤 다시 종료하려 할 때 발생한다."""
+
+
+class SeasonFinalizationBlockedError(RuntimeError):
+    """미정산 게임 때문에 현재 시점의 순위를 확정할 수 없을 때 발생한다."""
+
+    def __init__(self, blockers: list[str]) -> None:
+        self.blockers = blockers
+        super().__init__(" · ".join(blockers))
+
+
 def format_my_score_message(third_score: int | None, my_score: int) -> str:
     """3등 점수와 내 점수만 알려준다. 이름은 넣지 않는다.
 
-    3등이 동점이어도 보여주는 값이 '점수'뿐이라, 누가 3등으로 뽑히든 결과가 같다.
-    (동점자가 몇 명인지 유저가 알 수 없어야 한다.)
+    최종 순위가 확정된 뒤에는 추첨 결과까지 반영된 정확한 3등 행을 사용한다.
+    그 전에는 보여주는 값이 점수뿐이라 동점자의 신원은 노출되지 않는다.
     """
     third_text = f"**{third_score}점**" if third_score is not None else "아직 없음"
     return f"3등 점수: {third_text}\n내 점수: **{my_score}점**"
 
 
-def fetch_ranking_rows(conn: sqlite3.Connection, current_bot_id: str) -> list[sqlite3.Row]:
-    """점수 순으로 줄 세운 참여자 명단. 게임 기록이 있는 사람만, 봇은 제외.
+def season_is_closed(conn: sqlite3.Connection) -> bool:
+    row = conn.execute(
+        "SELECT status FROM season_state WHERE singleton_id = 1"
+    ).fetchone()
+    return bool(row and row["status"] == "closed")
 
-    동점자는 user_id 순으로 고정한다. 점수가 그대로면 몇 번을 불러도 같은 사람이 3등으로
-    뽑혀야 하기 때문이다. (updated_at으로 정렬하면 add_score가 그 값을 건드려 순서가 흔들린다.)
+
+def season_finalization_blockers(conn: sqlite3.Connection) -> list[str]:
+    """점수·예치금이 아직 변할 수 있어 시즌 종료를 막아야 하는 상태를 돌려준다."""
+    blockers: list[str] = []
+    open_events = int(
+        conn.execute(
+            "SELECT COUNT(*) FROM event_sessions WHERE status != 'closed'"
+        ).fetchone()[0]
+    )
+    open_rounds = int(
+        conn.execute("SELECT COUNT(*) FROM rounds WHERE status = 'open'").fetchone()[0]
+    )
+    active_roulette = int(
+        conn.execute(
+            """
+            SELECT COUNT(*) FROM russian_roulette_games
+            WHERE status IN ('pending', 'betting', 'playing')
+            """
+        ).fetchone()[0]
+    )
+    if open_events:
+        blockers.append(f"진행 중인 이벤트 {open_events}개")
+    if open_rounds:
+        blockers.append(f"열린 라운드 {open_rounds}개")
+    if active_roulette:
+        blockers.append(f"진행 중인 러시안룰렛 {active_roulette}개")
+    return blockers
+
+
+def fetch_ranking_stat_rows(
+    conn: sqlite3.Connection, current_bot_id: str
+) -> list[sqlite3.Row]:
+    """정상 종료된 메인·미니게임별 참가 횟수와 양수 정산 승수를 계산한다.
+
+    현재 이벤트 모델에서는 event_participants가 한 이벤트의 모든 라운드 참가 명단이다.
+    event_session_id가 없던 과거 라운드는 votes/trust_registrations/baseball_swings와
+    score_logs로 보완한다. 강제 종료된 개발용 라운드는 참가·승리 양쪽에서 제외한다.
     """
     return conn.execute(
         """
-        SELECT users.user_id, users.display_name, users.total_score
-        FROM users
+        WITH eligible_round_participants(round_id, user_id) AS (
+            SELECT rounds.id, event_participants.user_id
+            FROM rounds
+            JOIN event_participants
+              ON event_participants.event_session_id = rounds.event_session_id
+            WHERE rounds.status = 'closed'
+              AND CASE
+                    WHEN json_valid(rounds.extra_json)
+                    THEN COALESCE(json_extract(rounds.extra_json, '$.force_closed'), 0)
+                    ELSE 0
+                  END = 0
+            UNION
+            SELECT rounds.id, votes.user_id
+            FROM rounds JOIN votes ON votes.round_id = rounds.id
+            WHERE rounds.status = 'closed'
+              AND CASE
+                    WHEN json_valid(rounds.extra_json)
+                    THEN COALESCE(json_extract(rounds.extra_json, '$.force_closed'), 0)
+                    ELSE 0
+                  END = 0
+            UNION
+            SELECT rounds.id, trust_registrations.user_id
+            FROM rounds
+            JOIN trust_registrations ON trust_registrations.round_id = rounds.id
+            WHERE rounds.status = 'closed'
+              AND CASE
+                    WHEN json_valid(rounds.extra_json)
+                    THEN COALESCE(json_extract(rounds.extra_json, '$.force_closed'), 0)
+                    ELSE 0
+                  END = 0
+            UNION
+            SELECT rounds.id, baseball_swings.user_id
+            FROM rounds
+            JOIN baseball_swings ON baseball_swings.round_id = rounds.id
+            WHERE rounds.status = 'closed'
+              AND CASE
+                    WHEN json_valid(rounds.extra_json)
+                    THEN COALESCE(json_extract(rounds.extra_json, '$.force_closed'), 0)
+                    ELSE 0
+                  END = 0
+            UNION
+            SELECT rounds.id, score_logs.user_id
+            FROM rounds JOIN score_logs ON score_logs.round_id = rounds.id
+            WHERE rounds.status = 'closed'
+              AND CASE
+                    WHEN json_valid(rounds.extra_json)
+                    THEN COALESCE(json_extract(rounds.extra_json, '$.force_closed'), 0)
+                    ELSE 0
+                  END = 0
+        ),
+        round_scores AS (
+            SELECT round_id, user_id, SUM(delta) AS delta
+            FROM score_logs
+            WHERE round_id IS NOT NULL
+            GROUP BY round_id, user_id
+        )
+        SELECT
+            users.user_id,
+            users.display_name,
+            users.total_score,
+            COUNT(*) AS participation_count,
+            SUM(CASE WHEN COALESCE(round_scores.delta, 0) > 0 THEN 1 ELSE 0 END) AS win_count
+        FROM eligible_round_participants
+        JOIN users ON users.user_id = eligible_round_participants.user_id
+        LEFT JOIN round_scores
+          ON round_scores.round_id = eligible_round_participants.round_id
+         AND round_scores.user_id = eligible_round_participants.user_id
         WHERE users.user_id != ?
-          AND (
-              EXISTS (
-                  SELECT 1 FROM votes
-                  WHERE votes.user_id = users.user_id
-              )
-              OR EXISTS (
-                  SELECT 1 FROM trust_registrations
-                  WHERE trust_registrations.user_id = users.user_id
-              )
-          )
-        ORDER BY users.total_score DESC, users.user_id ASC
+        GROUP BY users.user_id, users.display_name, users.total_score
+        ORDER BY
+            users.total_score DESC,
+            participation_count DESC,
+            win_count DESC,
+            users.user_id ASC
         """,
         (current_bot_id,),
     ).fetchall()
+
+
+def fetch_final_ranking_rows(conn: sqlite3.Connection) -> list[sqlite3.Row]:
+    return conn.execute(
+        """
+        SELECT
+            user_id,
+            display_name,
+            total_score,
+            participation_count,
+            win_count,
+            final_rank,
+            draw_order
+        FROM final_rankings
+        ORDER BY final_rank ASC
+        """
+    ).fetchall()
+
+
+def fetch_ranking_rows(conn: sqlite3.Connection, current_bot_id: str) -> list[sqlite3.Row]:
+    """진행 중에는 계산 랭킹, 종료 후에는 영속된 고유 최종 랭킹을 반환한다."""
+    if season_is_closed(conn):
+        return fetch_final_ranking_rows(conn)
+    return fetch_ranking_stat_rows(conn, current_bot_id)
+
+
+def finalize_season_rankings(
+    conn: sqlite3.Connection,
+    current_bot_id: str,
+    closed_by_user_id: str,
+    *,
+    rng: Any | None = None,
+) -> list[sqlite3.Row]:
+    """점수→참여→승리 순으로 정렬하고 완전 동률만 추첨해 한 번만 확정한다."""
+    if season_is_closed(conn):
+        raise SeasonAlreadyClosedError("이미 시즌이 종료되어 최종 순위가 확정되었습니다.")
+
+    blockers = season_finalization_blockers(conn)
+    if blockers:
+        raise SeasonFinalizationBlockedError(blockers)
+
+    candidates = fetch_ranking_stat_rows(conn, current_bot_id)
+    if not candidates:
+        raise SeasonFinalizationBlockedError(["최종 순위를 계산할 게임 참가자가 없음"])
+
+    random_source = rng if rng is not None else secrets.SystemRandom()
+    ordered: list[tuple[sqlite3.Row, int]] = []
+    index = 0
+    while index < len(candidates):
+        first = candidates[index]
+        key = (
+            int(first["total_score"]),
+            int(first["participation_count"]),
+            int(first["win_count"]),
+        )
+        end = index + 1
+        while end < len(candidates):
+            candidate = candidates[end]
+            candidate_key = (
+                int(candidate["total_score"]),
+                int(candidate["participation_count"]),
+                int(candidate["win_count"]),
+            )
+            if candidate_key != key:
+                break
+            end += 1
+
+        group = list(candidates[index:end])
+        if len(group) > 1:
+            random_source.shuffle(group)
+        ordered.extend((row, draw_order) for draw_order, row in enumerate(group, start=1))
+        index = end
+
+    finalized_at = now_text()
+    conn.execute("SAVEPOINT finalize_season")
+    try:
+        conn.execute("DELETE FROM final_rankings")
+        for final_rank, (row, draw_order) in enumerate(ordered, start=1):
+            conn.execute(
+                """
+                INSERT INTO final_rankings (
+                    user_id, final_rank, display_name, total_score,
+                    participation_count, win_count, draw_order, finalized_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    str(row["user_id"]),
+                    final_rank,
+                    str(row["display_name"]),
+                    int(row["total_score"]),
+                    int(row["participation_count"]),
+                    int(row["win_count"]),
+                    draw_order,
+                    finalized_at,
+                ),
+            )
+        updated = conn.execute(
+            """
+            UPDATE season_state
+            SET status = 'closed', closed_at = ?, closed_by_user_id = ?
+            WHERE singleton_id = 1 AND status = 'open'
+            """,
+            (finalized_at, closed_by_user_id),
+        )
+        if updated.rowcount != 1:
+            raise SeasonAlreadyClosedError("이미 시즌이 종료되어 최종 순위가 확정되었습니다.")
+        log_activity(
+            conn,
+            "season",
+            "close",
+            actor_user_id=closed_by_user_id,
+            payload={
+                "participant_count": len(ordered),
+                "criteria": ["total_score", "participation_count", "win_count", "random_draw"],
+            },
+        )
+        conn.execute("RELEASE SAVEPOINT finalize_season")
+    except Exception:
+        conn.execute("ROLLBACK TO SAVEPOINT finalize_season")
+        conn.execute("RELEASE SAVEPOINT finalize_season")
+        raise
+
+    return fetch_final_ranking_rows(conn)
 
 
 def format_public_ranking_lines(rows: list[sqlite3.Row], start_rank: int = 1) -> list[str]:
