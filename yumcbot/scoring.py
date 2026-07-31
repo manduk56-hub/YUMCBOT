@@ -32,6 +32,17 @@ def ensure_user(conn: sqlite3.Connection, user: discord.abc.User) -> None:
     )
 
 
+class SeasonClosedError(RuntimeError):
+    """최종 순위 확정 뒤 점수를 바꾸려는 내부 경로를 차단한다."""
+
+
+def _season_is_closed(conn: sqlite3.Connection) -> bool:
+    row = conn.execute(
+        "SELECT status FROM season_state WHERE singleton_id = 1"
+    ).fetchone()
+    return bool(row and row["status"] == "closed")
+
+
 def add_score(
     conn: sqlite3.Connection,
     user_id: str,
@@ -40,6 +51,8 @@ def add_score(
     reason: str,
     round_id: int | None = None,
 ) -> None:
+    if _season_is_closed(conn):
+        raise SeasonClosedError("시즌이 종료되어 점수를 변경할 수 없습니다.")
     ts = now_text()
     # display_name이 None(멤버 캐시 미스)이면 신규 행은 플레이스홀더로,
     # 기존 행은 이름을 보존한다. excluded는 VALUES에서 파생돼 이 분기를 못 하므로
@@ -127,6 +140,9 @@ def get_afk_coins(conn: sqlite3.Connection, user_id: str) -> int:
 
 
 def grant_afk_coins(conn: sqlite3.Connection, user_id: str, amount: int) -> None:
+    # 매분 도는 백그라운드 루프는 종료 뒤에도 살아 있으므로 조용히 적립만 건너뛴다.
+    if _season_is_closed(conn):
+        return
     conn.execute(
         """
         INSERT INTO afk_coins (user_id, coins, updated_at)

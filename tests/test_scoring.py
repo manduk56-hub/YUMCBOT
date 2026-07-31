@@ -89,6 +89,23 @@ class ScoringTests(unittest.TestCase):
             self.assertTrue(bot.spend_afk_coins(conn, "1", bot.SCORE_REVEAL_COST))
             self.assertEqual(bot.get_afk_coins(conn, "1"), 3)
 
+    def test_season_close_blocks_score_and_afk_coin_mutations(self) -> None:
+        self.add_user("1", "참가자", 5)
+        with bot.db() as conn:
+            bot.grant_afk_coins(conn, "1", 3)
+            conn.execute(
+                "UPDATE season_state SET status = 'closed', closed_at = '2026-01-02' WHERE singleton_id = 1"
+            )
+
+            bot.grant_afk_coins(conn, "1", 10)
+            self.assertEqual(bot.get_afk_coins(conn, "1"), 3)
+            with self.assertRaises(bot.SeasonClosedError):
+                bot.add_score(conn, "1", "참가자", 2, "종료 뒤 보상")
+            self.assertEqual(self.scores_of(conn, "1")["1"], 5)
+            self.assertEqual(
+                conn.execute("SELECT COUNT(*) FROM score_logs").fetchone()[0], 0
+            )
+
     def test_spending_afk_coins_without_any_row_fails(self) -> None:
         self.add_user("1", "참가자", 0)
         with bot.db() as conn:

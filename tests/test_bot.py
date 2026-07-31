@@ -26,6 +26,37 @@ class BotRegressionTests(unittest.TestCase):
         self.db_patch.stop()
         self.temp_dir.cleanup()
 
+    def test_closed_season_allows_only_score_slash_command(self) -> None:
+        with bot.db() as conn:
+            conn.execute(
+                "UPDATE season_state SET status = 'closed', closed_at = '2026-01-02' WHERE singleton_id = 1"
+            )
+
+        score_interaction = SimpleNamespace(command=SimpleNamespace(name="점수"))
+        game_interaction = SimpleNamespace(command=SimpleNamespace(name="러시안룰렛"))
+        self.assertTrue(asyncio.run(bot.bot.tree.interaction_check(score_interaction)))
+        with self.assertRaises(bot.app_commands.CheckFailure) as raised:
+            asyncio.run(bot.bot.tree.interaction_check(game_interaction))
+        self.assertEqual(str(raised.exception), bot.SEASON_CLOSED_MESSAGE)
+
+    def test_closed_season_rejects_existing_component_buttons(self) -> None:
+        with bot.db() as conn:
+            conn.execute(
+                "UPDATE season_state SET status = 'closed', closed_at = '2026-01-02' WHERE singleton_id = 1"
+            )
+        interaction = SimpleNamespace(
+            type=bot.discord.InteractionType.component,
+            data={"custom_id": "eventbot:eventjoin:1"},
+            response=SimpleNamespace(send_message=AsyncMock()),
+        )
+
+        asyncio.run(bot.bot.on_interaction(interaction))
+
+        interaction.response.send_message.assert_awaited_once_with(
+            bot.SEASON_CLOSED_MESSAGE,
+            ephemeral=True,
+        )
+
     def test_season_end_button_rejects_non_operator(self) -> None:
         interaction = SimpleNamespace(
             type=bot.discord.InteractionType.component,
