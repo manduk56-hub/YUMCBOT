@@ -26,6 +26,43 @@ class BotRegressionTests(unittest.TestCase):
         self.db_patch.stop()
         self.temp_dir.cleanup()
 
+    def test_season_end_button_rejects_non_operator(self) -> None:
+        interaction = SimpleNamespace(
+            type=bot.discord.InteractionType.component,
+            data={"custom_id": "eventbot:seasonend:confirm"},
+            user=SimpleNamespace(
+                guild_permissions=SimpleNamespace(administrator=False, manage_guild=False),
+                roles=[],
+            ),
+            response=SimpleNamespace(send_message=AsyncMock()),
+        )
+
+        asyncio.run(bot.bot.on_interaction(interaction))
+
+        interaction.response.send_message.assert_awaited_once_with(
+            "이 버튼은 관리자 권한 또는 운영자 역할이 필요합니다.",
+            ephemeral=True,
+        )
+
+    def test_season_end_cancel_button_dispatches_for_operator(self) -> None:
+        interaction = SimpleNamespace(
+            type=bot.discord.InteractionType.component,
+            data={"custom_id": "eventbot:seasonend:cancel"},
+            user=SimpleNamespace(
+                guild_permissions=SimpleNamespace(administrator=True, manage_guild=False),
+                roles=[],
+            ),
+            response=SimpleNamespace(send_message=AsyncMock()),
+        )
+
+        with patch.object(
+            bot.ranking, "cancel_season_end", new=AsyncMock()
+        ) as cancel_handler:
+            asyncio.run(bot.bot.on_interaction(interaction))
+
+        cancel_handler.assert_awaited_once_with(interaction)
+        interaction.response.send_message.assert_not_awaited()
+
     def test_auto_close_countdown_announces_ten_then_counts_five_to_one(self) -> None:
         warning_message = SimpleNamespace(edit=AsyncMock(), delete=AsyncMock())
         countdown_message = SimpleNamespace(edit=AsyncMock(), delete=AsyncMock())

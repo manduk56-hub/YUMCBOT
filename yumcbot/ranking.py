@@ -45,6 +45,216 @@ class SeasonFinalizationBlockedError(RuntimeError):
         super().__init__(" · ".join(blockers))
 
 
+def is_placeholder_display_name(display_name: str, user_id: str) -> bool:
+    """멤버 캐시 미스 때 만들어지는 정확한 `User <id>` 이름인지 확인한다."""
+    return display_name == f"User {user_id}"
+
+
+def season_end_confirmation_embed() -> discord.Embed:
+    embed = discord.Embed(
+        title="⚠️ 시즌을 종료합니다",
+        description=(
+            "시즌을 종료하면 현재 점수와 게임 기록으로 최종 순위를 확정합니다.\n"
+            "**종료 후에는 `/점수`를 제외한 게임과 명령을 더 이상 진행할 수 없고, "
+            "잠수 코인도 적립되지 않습니다.**"
+        ),
+        color=discord.Color.orange(),
+    )
+    embed.add_field(
+        name="최종 순위 기준",
+        value="점수 → 참여 횟수 → 승리 횟수 → 완전 동률 무작위 추첨",
+        inline=False,
+    )
+    return embed
+
+
+def season_end_cancelled_embed() -> discord.Embed:
+    return discord.Embed(
+        title="시즌 종료 취소",
+        description="시즌 종료가 취소되었습니다. 현재 상태로 게임을 계속 진행할 수 있습니다.",
+        color=discord.Color.light_grey(),
+    )
+
+
+def season_end_confirmation_view() -> discord.ui.View:
+    view = discord.ui.View(timeout=None)
+    view.add_item(
+        discord.ui.Button(
+            label="시즌종료",
+            style=discord.ButtonStyle.danger,
+            custom_id="eventbot:seasonend:confirm",
+        )
+    )
+    view.add_item(
+        discord.ui.Button(
+            label="시즌종료 취소",
+            style=discord.ButtonStyle.secondary,
+            custom_id="eventbot:seasonend:cancel",
+        )
+    )
+    return view
+
+
+def format_final_ranking_lines(rows: list[sqlite3.Row]) -> list[str]:
+    lines: list[str] = []
+    for row in rows:
+        display_name = discord.utils.escape_markdown(str(row["display_name"]))
+        lines.append(
+            f"**{int(row['final_rank'])}위** · {display_name} · **{int(row['total_score'])}점**"
+        )
+    return lines
+
+
+def build_final_ranking_embeds(rows: list[sqlite3.Row]) -> list[discord.Embed]:
+    """Discord description 제한을 넘지 않게 전체 최종 순위를 여러 임베드로 나눈다."""
+    lines = format_final_ranking_lines(rows)
+    chunks: list[list[str]] = []
+    current: list[str] = []
+    current_length = 0
+    for line in lines:
+        added_length = len(line) + (1 if current else 0)
+        if current and current_length + added_length > 3800:
+            chunks.append(current)
+            current = []
+            current_length = 0
+        current.append(line)
+        current_length += len(line) + (1 if len(current) > 1 else 0)
+    if current:
+        chunks.append(current)
+
+    embeds: list[discord.Embed] = []
+    for chunk_index, chunk in enumerate(chunks, start=1):
+        first_rank = sum(len(previous) for previous in chunks[: chunk_index - 1]) + 1
+        last_rank = first_rank + len(chunk) - 1
+        title = "🏆 시즌 최종 순위"
+        if len(chunks) > 1:
+            title += f" · {first_rank}~{last_rank}위"
+        embeds.append(
+            discord.Embed(
+                title=title,
+                description="\n".join(chunk),
+                color=discord.Color.gold(),
+            )
+        )
+    return embeds
+
+
+async def refresh_placeholder_user_names(
+    guild: discord.Guild,
+    client: discord.Client,
+    current_bot_id: str,
+) -> int:
+    """`User <id>` 참가자만 REST API로 다시 확인해 실제 표시 이름을 DB에 반영한다."""
+    with db() as conn:
+        candidates = fetch_ranking_stat_rows(conn, current_bot_id)
+    placeholders = [
+        row
+        for row in candidates
+        if is_placeholder_display_name(str(row["display_name"]), str(row["user_id"]))
+    ]
+
+    updates: list[tuple[str, str]] = []
+    for row in placeholders:
+        user_id = str(row["user_id"])
+        user: discord.abc.User | None = None
+        try:
+            user = await guild.fetch_member(int(user_id))
+        except discord.NotFound:
+            try:
+                user = await client.fetch_user(int(user_id))
+            except discord.NotFound:
+                continue
+        display_name = getattr(user, "display_name", None) if user else None
+        if display_name and not is_placeholder_display_name(str(display_name), user_id):
+            updates.append((str(display_name), user_id))
+
+    if updates:
+        with db() as conn:
+            conn.executemany(
+                "UPDATE users SET display_name = ?, updated_at = ? WHERE user_id = ?",
+                [(display_name, now_text(), user_id) for display_name, user_id in updates],
+            )
+    return len(updates)
+
+
+async def season_end_command(interaction: discord.Interaction) -> None:
+    if interaction.guild is None:
+        await interaction.response.send_message(
+            "서버 안에서만 시즌을 종료할 수 있습니다.", ephemeral=True
+        )
+        return
+    with db() as conn:
+        if season_is_closed(conn):
+            await interaction.response.send_message(
+                "이미 시즌이 종료되어 최종 순위가 확정되었습니다.", ephemeral=True
+            )
+            return
+    await interaction.response.send_message(
+        embed=season_end_confirmation_embed(),
+        view=season_end_confirmation_view(),
+    )
+
+
+async def cancel_season_end(interaction: discord.Interaction) -> None:
+    await interaction.response.edit_message(
+        embed=season_end_cancelled_embed(),
+        view=None,
+    )
+
+
+async def confirm_season_end(interaction: discord.Interaction) -> None:
+    if interaction.guild is None:
+        await interaction.response.send_message(
+            "서버 안에서만 시즌을 종료할 수 있습니다.", ephemeral=True
+        )
+        return
+
+    await interaction.response.defer()
+    current_bot_id = str(interaction.client.user.id) if interaction.client.user else ""
+    try:
+        refreshed_count = await refresh_placeholder_user_names(
+            interaction.guild, interaction.client, current_bot_id
+        )
+        with db() as conn:
+            final_rows = finalize_season_rankings(
+                conn,
+                current_bot_id,
+                str(interaction.user.id),
+            )
+    except SeasonAlreadyClosedError as error:
+        await interaction.followup.send(str(error), ephemeral=True)
+        return
+    except SeasonFinalizationBlockedError as error:
+        await interaction.followup.send(
+            "아직 시즌을 종료할 수 없습니다: " + " · ".join(error.blockers),
+            ephemeral=True,
+        )
+        return
+    except discord.HTTPException:
+        await interaction.followup.send(
+            "참가자 이름을 Discord에서 다시 확인하지 못했습니다. 잠시 후 다시 시도해주세요.",
+            ephemeral=True,
+        )
+        return
+
+    completed = discord.Embed(
+        title="✅ 시즌 종료 완료",
+        description=(
+            f"총 **{len(final_rows)}명**의 최종 순위를 확정했습니다.\n"
+            "이제 `/점수`를 제외한 게임과 명령은 사용할 수 없습니다."
+        ),
+        color=discord.Color.green(),
+    )
+    if refreshed_count:
+        completed.set_footer(text=f"플레이스홀더 이름 {refreshed_count}건 갱신")
+    await interaction.edit_original_response(embed=completed, view=None)
+    for embed in build_final_ranking_embeds(final_rows):
+        await interaction.followup.send(
+            embed=embed,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+
+
 def format_my_score_message(third_score: int | None, my_score: int) -> str:
     """3등 점수와 내 점수만 알려준다. 이름은 넣지 않는다.
 

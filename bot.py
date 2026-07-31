@@ -329,13 +329,21 @@ from yumcbot import ranking
 from yumcbot.ranking import (
     SeasonAlreadyClosedError,
     SeasonFinalizationBlockedError,
+    build_final_ranking_embeds,
+    cancel_season_end,
+    confirm_season_end,
     fetch_final_ranking_rows,
     fetch_ranking_rows,
     fetch_ranking_stat_rows,
     finalize_season_rankings,
     format_anonymous_ranking_lines,
+    format_final_ranking_lines,
     format_my_score_message,
     format_public_ranking_lines,
+    is_placeholder_display_name,
+    refresh_placeholder_user_names,
+    season_end_confirmation_embed,
+    season_end_confirmation_view,
     season_finalization_blockers,
     season_is_closed,
     write_admin_score_report,
@@ -1215,6 +1223,24 @@ class EventBot(discord.Client):
             return
 
         _, action = parts[:2]
+        if action == "seasonend":
+            if len(parts) != 3 or parts[2] not in {"confirm", "cancel"}:
+                await interaction.response.send_message(
+                    "잘못된 시즌 종료 요청입니다.", ephemeral=True
+                )
+                return
+            if not is_operator_user(interaction.user):
+                await interaction.response.send_message(
+                    "이 버튼은 관리자 권한 또는 운영자 역할이 필요합니다.",
+                    ephemeral=True,
+                )
+                return
+            if parts[2] == "confirm":
+                await ranking.confirm_season_end(interaction)
+            else:
+                await ranking.cancel_season_end(interaction)
+            return
+
         if action in {
             "rouletteaccept",
             "roulettedecline",
@@ -1766,6 +1792,13 @@ async def baseball_prepare(interaction: discord.Interaction) -> None:
 @admin_only()
 async def close_round(interaction: discord.Interaction) -> None:
     await events.close_round_command(interaction)
+
+
+@bot.tree.command(name="시즌종료", description="누적 점수의 최종 순위를 확정하고 모든 게임을 종료합니다.")
+@app_commands.default_permissions()
+@admin_only()
+async def end_season(interaction: discord.Interaction) -> None:
+    await ranking.season_end_command(interaction)
 
 
 @bot.tree.command(name="이벤트종료", description="개발 중인 현재 이벤트를 남은 게임과 관계없이 강제로 종료합니다.")

@@ -349,6 +349,7 @@ class SlashCommandRegistryTest(unittest.TestCase):
             "러시안룰렛",
             "미니게임",
             "세공진행",
+            "시즌종료",
             "오픈",
             "이벤트리스트",
             "이벤트종료",

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import csv
 import json
 import tempfile
@@ -277,6 +278,83 @@ class RankingTests(unittest.TestCase):
             bot.format_public_ranking_lines([rows[1]], start_rank=2),
             ["2. <@300> - **7점**"],
         )
+
+    def test_season_end_confirmation_explains_irreversible_lock(self) -> None:
+        embed = bot.season_end_confirmation_embed()
+        view = bot.season_end_confirmation_view()
+
+        self.assertIn("시즌을 종료", embed.title)
+        self.assertIn("더 이상", embed.description)
+        self.assertIn("`/점수`", embed.description)
+        self.assertEqual(
+            [item.custom_id for item in view.children],
+            ["eventbot:seasonend:confirm", "eventbot:seasonend:cancel"],
+        )
+        self.assertEqual(
+            [item.label for item in view.children], ["시즌종료", "시즌종료 취소"]
+        )
+
+    def test_final_ranking_lines_show_unique_rank_name_and_score(self) -> None:
+        rows = [
+            {"final_rank": 1, "display_name": "첫째", "total_score": 9},
+            {"final_rank": 2, "display_name": "둘째", "total_score": 7},
+        ]
+        self.assertEqual(
+            bot.format_final_ranking_lines(rows),
+            ["**1위** · 첫째 · **9점**", "**2위** · 둘째 · **7점**"],
+        )
+        embeds = bot.build_final_ranking_embeds(rows)
+        self.assertEqual(len(embeds), 1)
+        self.assertIn("첫째", embeds[0].description)
+        self.assertIn("둘째", embeds[0].description)
+
+    def test_placeholder_name_is_refetched_before_finalization(self) -> None:
+        self.add_user("200", "User 200", 3)
+        with bot.db() as conn:
+            round_cursor = conn.execute(
+                """
+                INSERT INTO rounds (type, title, question, status, extra_json, created_at, closed_at)
+                VALUES ('balance', '완료', '선택', 'closed', '{}', '2026-01-01', '2026-01-01')
+                """
+            )
+            conn.execute(
+                """
+                INSERT INTO votes (round_id, user_id, choice, created_at, updated_at)
+                VALUES (?, '200', 'A', '2026-01-01', '2026-01-01')
+                """,
+                (int(round_cursor.lastrowid),),
+            )
+
+        class FakeMember:
+            display_name = "실제 이름"
+
+        class FakeGuild:
+            @staticmethod
+            async def fetch_member(user_id: int):
+                if user_id != 200:
+                    raise AssertionError(user_id)
+                return FakeMember()
+
+        class FakeClient:
+            @staticmethod
+            async def fetch_user(user_id: int):
+                raise AssertionError(user_id)
+
+        refreshed = asyncio.run(
+            bot.refresh_placeholder_user_names(FakeGuild(), FakeClient(), "100")
+        )
+        with bot.db() as conn:
+            name = conn.execute(
+                "SELECT display_name FROM users WHERE user_id = '200'"
+            ).fetchone()["display_name"]
+        self.assertEqual(refreshed, 1)
+        self.assertEqual(name, "실제 이름")
+
+    def test_season_end_command_is_admin_only(self) -> None:
+        command = bot.bot.tree.get_command("시즌종료")
+        self.assertIsNotNone(command)
+        self.assertEqual(command.default_permissions.value, 0)
+        self.assertEqual(len(command.checks), 1)
 
     def test_ranking_command_is_admin_only(self) -> None:
         command = bot.bot.tree.get_command("랭킹")
