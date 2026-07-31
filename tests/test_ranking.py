@@ -107,6 +107,53 @@ class RankingTests(unittest.TestCase):
 
         self.assertEqual(before, after)
 
+    def test_win_count_checks_each_game_score_without_cross_game_sum(self) -> None:
+        """게임별 +2/-3/0은 합계 -1이 아니라 양수였던 게임 1개로 계산한다."""
+        self.add_user("200", "참가자", -1)
+        with bot.db() as conn:
+            event = conn.execute(
+                """
+                INSERT INTO event_sessions (status, channel_id, created_at, closed_at)
+                VALUES ('closed', '10', '2026-01-01', '2026-01-01')
+                """
+            )
+            event_id = int(event.lastrowid)
+            conn.execute(
+                """
+                INSERT INTO event_participants (event_session_id, user_id, joined_at)
+                VALUES (?, '200', '2026-01-01')
+                """,
+                (event_id,),
+            )
+            round_ids = []
+            for index in range(3):
+                cursor = conn.execute(
+                    """
+                    INSERT INTO rounds (
+                        type, title, question, status, extra_json,
+                        created_at, closed_at, event_session_id
+                    ) VALUES (
+                        'balance', ?, '선택', 'closed', '{}',
+                        '2026-01-01', '2026-01-01', ?
+                    )
+                    """,
+                    (f"게임 {index + 1}", event_id),
+                )
+                round_ids.append(int(cursor.lastrowid))
+            conn.executemany(
+                """
+                INSERT INTO score_logs (round_id, user_id, delta, reason, created_at)
+                VALUES (?, '200', ?, '게임 최종 정산', '2026-01-01')
+                """,
+                [(round_ids[0], 2), (round_ids[1], -3), (round_ids[2], 0)],
+            )
+
+            rows = bot.fetch_ranking_stat_rows(conn, "100")
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["participation_count"], 3)
+        self.assertEqual(rows[0]["win_count"], 1)
+
     def test_finalization_orders_by_score_participation_wins_then_draw(self) -> None:
         """참여 장려가 승수보다 앞서고, 세 값이 모두 같은 그룹만 한 번 추첨한다."""
         for user_id, name in (

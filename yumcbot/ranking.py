@@ -361,23 +361,33 @@ def fetch_ranking_stat_rows(
                     ELSE 0
                   END = 0
         ),
-        round_scores AS (
-            SELECT round_id, user_id, SUM(delta) AS delta
-            FROM score_logs
-            WHERE round_id IS NOT NULL
-            GROUP BY round_id, user_id
+        -- DB의 round_id 하나는 메인게임 또는 미니게임 한 번을 가리킨다.
+        -- 서로 다른 게임의 점수를 더하지 않는다. 게임당 최종 점수 로그가 정확히
+        -- 한 건이고 그 값이 양수일 때만 해당 게임을 승리로 표시한다.
+        positive_game_results AS (
+            SELECT scored.round_id, scored.user_id
+            FROM score_logs AS scored
+            WHERE scored.round_id IS NOT NULL
+              AND scored.delta > 0
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM score_logs AS duplicate
+                  WHERE duplicate.round_id = scored.round_id
+                    AND duplicate.user_id = scored.user_id
+                    AND duplicate.id != scored.id
+              )
         )
         SELECT
             users.user_id,
             users.display_name,
             users.total_score,
             COUNT(*) AS participation_count,
-            SUM(CASE WHEN COALESCE(round_scores.delta, 0) > 0 THEN 1 ELSE 0 END) AS win_count
+            SUM(CASE WHEN positive_game_results.user_id IS NOT NULL THEN 1 ELSE 0 END) AS win_count
         FROM eligible_round_participants
         JOIN users ON users.user_id = eligible_round_participants.user_id
-        LEFT JOIN round_scores
-          ON round_scores.round_id = eligible_round_participants.round_id
-         AND round_scores.user_id = eligible_round_participants.user_id
+        LEFT JOIN positive_game_results
+          ON positive_game_results.round_id = eligible_round_participants.round_id
+         AND positive_game_results.user_id = eligible_round_participants.user_id
         WHERE users.user_id != ?
         GROUP BY users.user_id, users.display_name, users.total_score
         ORDER BY
