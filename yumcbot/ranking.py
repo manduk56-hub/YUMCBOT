@@ -55,8 +55,8 @@ def season_end_confirmation_embed() -> discord.Embed:
         title="⚠️ 시즌을 종료합니다",
         description=(
             "시즌을 종료하면 현재 점수와 게임 기록으로 최종 순위를 확정합니다.\n"
-            "**종료 후에는 `/점수`를 제외한 게임과 명령을 더 이상 진행할 수 없고, "
-            "잠수 코인도 적립되지 않습니다.**"
+            "**종료 후에는 `/점수`와 관리자용 `/시즌종료` 재브리핑을 제외한 "
+            "게임과 명령을 더 이상 진행할 수 없고, 잠수 코인도 적립되지 않습니다.**"
         ),
         color=discord.Color.orange(),
     )
@@ -139,6 +139,36 @@ def build_final_ranking_embeds(rows: list[sqlite3.Row]) -> list[discord.Embed]:
     return embeds
 
 
+def season_end_status_embed(
+    final_rows: list[sqlite3.Row],
+    *,
+    replay: bool = False,
+    refreshed_count: int = 0,
+) -> discord.Embed:
+    if replay:
+        embed = discord.Embed(
+            title="📌 시즌 종료 · 최종 순위 재브리핑",
+            description=(
+                f"이미 확정된 총 **{len(final_rows)}명**의 최종 순위입니다.\n"
+                "DB에 저장된 결과를 그대로 다시 게시하며 재계산하거나 재추첨하지 않습니다."
+            ),
+            color=discord.Color.gold(),
+        )
+    else:
+        embed = discord.Embed(
+            title="✅ 시즌 종료 완료",
+            description=(
+                f"총 **{len(final_rows)}명**의 최종 순위를 확정했습니다.\n"
+                "이제 `/점수`와 관리자용 `/시즌종료` 재브리핑을 제외한 "
+                "게임과 명령은 사용할 수 없습니다."
+            ),
+            color=discord.Color.green(),
+        )
+        if refreshed_count:
+            embed.set_footer(text=f"플레이스홀더 이름 {refreshed_count}건 갱신")
+    return embed
+
+
 async def refresh_placeholder_user_names(
     guild: discord.Guild,
     client: discord.Client,
@@ -184,11 +214,18 @@ async def season_end_command(interaction: discord.Interaction) -> None:
         )
         return
     with db() as conn:
-        if season_is_closed(conn):
-            await interaction.response.send_message(
-                "이미 시즌이 종료되어 최종 순위가 확정되었습니다.", ephemeral=True
+        closed = season_is_closed(conn)
+        final_rows = fetch_final_ranking_rows(conn) if closed else []
+    if closed:
+        await interaction.response.send_message(
+            embed=season_end_status_embed(final_rows, replay=True)
+        )
+        for embed in build_final_ranking_embeds(final_rows):
+            await interaction.followup.send(
+                embed=embed,
+                allowed_mentions=discord.AllowedMentions.none(),
             )
-            return
+        return
     await interaction.response.send_message(
         embed=season_end_confirmation_embed(),
         view=season_end_confirmation_view(),
@@ -237,16 +274,10 @@ async def confirm_season_end(interaction: discord.Interaction) -> None:
         )
         return
 
-    completed = discord.Embed(
-        title="✅ 시즌 종료 완료",
-        description=(
-            f"총 **{len(final_rows)}명**의 최종 순위를 확정했습니다.\n"
-            "이제 `/점수`를 제외한 게임과 명령은 사용할 수 없습니다."
-        ),
-        color=discord.Color.green(),
+    completed = season_end_status_embed(
+        final_rows,
+        refreshed_count=refreshed_count,
     )
-    if refreshed_count:
-        completed.set_footer(text=f"플레이스홀더 이름 {refreshed_count}건 갱신")
     await interaction.edit_original_response(embed=completed, view=None)
     for embed in build_final_ranking_embeds(final_rows):
         await interaction.followup.send(

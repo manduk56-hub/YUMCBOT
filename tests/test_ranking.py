@@ -6,7 +6,8 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, patch
 
 import bot
 from yumcbot import config
@@ -333,6 +334,7 @@ class RankingTests(unittest.TestCase):
         self.assertIn("시즌을 종료", embed.title)
         self.assertIn("더 이상", embed.description)
         self.assertIn("`/점수`", embed.description)
+        self.assertIn("`/시즌종료`", embed.description)
         self.assertEqual(
             [item.custom_id for item in view.children],
             ["eventbot:seasonend:confirm", "eventbot:seasonend:cancel"],
@@ -340,6 +342,51 @@ class RankingTests(unittest.TestCase):
         self.assertEqual(
             [item.label for item in view.children], ["시즌종료", "시즌종료 취소"]
         )
+
+    def test_closed_season_command_rebriefs_persisted_final_ranking(self) -> None:
+        self.add_user("200", "첫째", 9)
+        self.add_user("300", "둘째", 7)
+        with bot.db() as conn:
+            conn.execute(
+                """
+                UPDATE season_state
+                SET status = 'closed', closed_at = '2026-01-02', closed_by_user_id = '999'
+                WHERE singleton_id = 1
+                """
+            )
+            conn.executemany(
+                """
+                INSERT INTO final_rankings (
+                    user_id, final_rank, display_name, total_score,
+                    participation_count, win_count, draw_order, finalized_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, '2026-01-02')
+                """,
+                [
+                    ("200", 1, "첫째", 9, 4, 3, 1),
+                    ("300", 2, "둘째", 7, 5, 2, 1),
+                ],
+            )
+            before = [tuple(row) for row in bot.fetch_final_ranking_rows(conn)]
+
+        interaction = SimpleNamespace(
+            guild=object(),
+            response=SimpleNamespace(send_message=AsyncMock()),
+            followup=SimpleNamespace(send=AsyncMock()),
+        )
+        asyncio.run(bot.ranking.season_end_command(interaction))
+
+        summary = interaction.response.send_message.await_args.kwargs["embed"]
+        self.assertEqual(summary.title, "📌 시즌 종료 · 최종 순위 재브리핑")
+        self.assertIn("재계산하거나 재추첨하지 않습니다", summary.description)
+        interaction.followup.send.assert_awaited_once()
+        ranking_embed = interaction.followup.send.await_args.kwargs["embed"]
+        self.assertEqual(ranking_embed.title, "🏆 시즌 최종 순위")
+        self.assertIn("**1위** · 첫째 · **9점**", ranking_embed.description)
+        self.assertIn("**2위** · 둘째 · **7점**", ranking_embed.description)
+
+        with bot.db() as conn:
+            after = [tuple(row) for row in bot.fetch_final_ranking_rows(conn)]
+        self.assertEqual(after, before)
 
     def test_final_ranking_lines_show_unique_rank_name_and_score(self) -> None:
         rows = [

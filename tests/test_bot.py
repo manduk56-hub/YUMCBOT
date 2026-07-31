@@ -26,15 +26,17 @@ class BotRegressionTests(unittest.TestCase):
         self.db_patch.stop()
         self.temp_dir.cleanup()
 
-    def test_closed_season_allows_only_score_slash_command(self) -> None:
+    def test_closed_season_allows_score_and_season_end_slash_commands(self) -> None:
         with bot.db() as conn:
             conn.execute(
                 "UPDATE season_state SET status = 'closed', closed_at = '2026-01-02' WHERE singleton_id = 1"
             )
 
         score_interaction = SimpleNamespace(command=SimpleNamespace(name="점수"))
+        season_end_interaction = SimpleNamespace(command=SimpleNamespace(name="시즌종료"))
         game_interaction = SimpleNamespace(command=SimpleNamespace(name="러시안룰렛"))
         self.assertTrue(asyncio.run(bot.bot.tree.interaction_check(score_interaction)))
+        self.assertTrue(asyncio.run(bot.bot.tree.interaction_check(season_end_interaction)))
         with self.assertRaises(bot.app_commands.CheckFailure) as raised:
             asyncio.run(bot.bot.tree.interaction_check(game_interaction))
         self.assertEqual(str(raised.exception), bot.SEASON_CLOSED_MESSAGE)

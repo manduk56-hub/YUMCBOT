@@ -345,6 +345,7 @@ from yumcbot.ranking import (
     refresh_placeholder_user_names,
     season_end_confirmation_embed,
     season_end_confirmation_view,
+    season_end_status_embed,
     season_finalization_blockers,
     season_is_closed,
     write_admin_score_report,
@@ -820,13 +821,15 @@ async def handle_emergency_join(interaction: discord.Interaction, round_id: int)
 register_settler("baseball", settle_baseball)
 
 
-SEASON_CLOSED_MESSAGE = "시즌이 종료되어 `/점수`만 사용할 수 있습니다."
+SEASON_CLOSED_MESSAGE = (
+    "시즌이 종료되어 `/점수`와 관리자용 `/시즌종료` 재브리핑만 사용할 수 있습니다."
+)
 
 
 class SeasonCommandTree(app_commands.CommandTree):
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         command_name = getattr(getattr(interaction, "command", None), "name", "")
-        if command_name == "점수":
+        if command_name in {"점수", "시즌종료"}:
             return True
         with db() as conn:
             closed = season_is_closed(conn)
