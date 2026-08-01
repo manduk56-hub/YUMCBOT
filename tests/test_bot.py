@@ -26,39 +26,33 @@ class BotRegressionTests(unittest.TestCase):
         self.db_patch.stop()
         self.temp_dir.cleanup()
 
-    def test_closed_season_allows_score_and_season_end_slash_commands(self) -> None:
+    def test_closed_season_still_allows_slash_commands(self) -> None:
+        """시즌 종료 후에도 게임을 계속 열 수 있어야 한다 — 점수만 add_score()에서
+        조용히 막힌다(tests/test_scoring.py). 명령어 단계에서는 아무것도 막지 않는다."""
         with bot.db() as conn:
             conn.execute(
                 "UPDATE season_state SET status = 'closed', closed_at = '2026-01-02' WHERE singleton_id = 1"
             )
 
-        score_interaction = SimpleNamespace(command=SimpleNamespace(name="점수"))
-        season_end_interaction = SimpleNamespace(command=SimpleNamespace(name="시즌종료"))
-        optimize_interaction = SimpleNamespace(command=SimpleNamespace(name="점수최적화"))
         game_interaction = SimpleNamespace(command=SimpleNamespace(name="러시안룰렛"))
-        self.assertTrue(asyncio.run(bot.bot.tree.interaction_check(score_interaction)))
-        self.assertTrue(asyncio.run(bot.bot.tree.interaction_check(season_end_interaction)))
-        self.assertTrue(asyncio.run(bot.bot.tree.interaction_check(optimize_interaction)))
-        with self.assertRaises(bot.app_commands.CheckFailure) as raised:
-            asyncio.run(bot.bot.tree.interaction_check(game_interaction))
-        self.assertEqual(str(raised.exception), bot.SEASON_CLOSED_MESSAGE)
+        self.assertTrue(asyncio.run(bot.bot.tree.interaction_check(game_interaction)))
 
-    def test_closed_season_rejects_existing_component_buttons(self) -> None:
+    def test_closed_season_still_dispatches_component_buttons(self) -> None:
         with bot.db() as conn:
             conn.execute(
                 "UPDATE season_state SET status = 'closed', closed_at = '2026-01-02' WHERE singleton_id = 1"
             )
         interaction = SimpleNamespace(
             type=bot.discord.InteractionType.component,
-            data={"custom_id": "eventbot:eventjoin:1"},
+            data={"custom_id": "eventbot:unknown"},
             response=SimpleNamespace(send_message=AsyncMock()),
         )
 
         asyncio.run(bot.bot.on_interaction(interaction))
 
+        # 시즌 종료 안내로 가로채지 않고, 평소와 같은 "알 수 없는 버튼" 분기까지 도달해야 한다.
         interaction.response.send_message.assert_awaited_once_with(
-            bot.SEASON_CLOSED_MESSAGE,
-            ephemeral=True,
+            "알 수 없는 버튼입니다.", ephemeral=True
         )
 
     def test_season_end_button_rejects_non_operator(self) -> None:

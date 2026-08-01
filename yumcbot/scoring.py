@@ -32,10 +32,6 @@ def ensure_user(conn: sqlite3.Connection, user: discord.abc.User) -> None:
     )
 
 
-class SeasonClosedError(RuntimeError):
-    """최종 순위 확정 뒤 점수를 바꾸려는 내부 경로를 차단한다."""
-
-
 def _season_is_closed(conn: sqlite3.Connection) -> bool:
     row = conn.execute(
         "SELECT status FROM season_state WHERE singleton_id = 1"
@@ -52,7 +48,12 @@ def add_score(
     round_id: int | None = None,
 ) -> None:
     if _season_is_closed(conn):
-        raise SeasonClosedError("시즌이 종료되어 점수를 변경할 수 없습니다.")
+        # 최종 순위 확정 뒤에도 게임 자체는 계속 진행할 수 있게 열어 둔다 — 결과
+        # 표시는 그대로 나가되, 실제 총점·score_logs·연승 스택은 조용히 건드리지
+        # 않는다. 여기서 예외를 던지지 않는 이유는 호출부(각 게임의 정산 함수)가
+        # 그 결과를 그대로 받아 안내 문구를 만들기 때문이다 — 예외를 던지면 그
+        # 정산 자체가 중간에 끊긴다.
+        return
     ts = now_text()
     # display_name이 None(멤버 캐시 미스)이면 신규 행은 플레이스홀더로,
     # 기존 행은 이름을 보존한다. excluded는 VALUES에서 파생돼 이 분기를 못 하므로

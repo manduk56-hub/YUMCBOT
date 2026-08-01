@@ -292,7 +292,6 @@ from yumcbot.rounds import (
     round_game_key,
 )
 from yumcbot.scoring import (
-    SeasonClosedError,
     add_score,
     ensure_user,
     get_afk_coins,
@@ -831,23 +830,6 @@ async def handle_emergency_join(interaction: discord.Interaction, round_id: int)
 register_settler("baseball", settle_baseball)
 
 
-SEASON_CLOSED_MESSAGE = (
-    "시즌이 종료되어 `/점수`와 관리자용 `/시즌종료`·`/점수최적화`만 사용할 수 있습니다."
-)
-
-
-class SeasonCommandTree(app_commands.CommandTree):
-    async def interaction_check(self, interaction: discord.Interaction) -> bool:
-        command_name = getattr(getattr(interaction, "command", None), "name", "")
-        if command_name in {"점수", "시즌종료", "점수최적화"}:
-            return True
-        with db() as conn:
-            closed = season_is_closed(conn)
-        if closed:
-            raise app_commands.CheckFailure(SEASON_CLOSED_MESSAGE)
-        return True
-
-
 class EventBot(discord.Client):
     def __init__(self) -> None:
         intents = discord.Intents.default()
@@ -855,7 +837,7 @@ class EventBot(discord.Client):
         # SERVER MEMBERS INTENT 토글이 함께 ON이어야 로그인이 된다 (issue #19).
         intents.members = True
         super().__init__(intents=intents)
-        self.tree = SeasonCommandTree(self)
+        self.tree = app_commands.CommandTree(self)
         self.auto_close_tasks: dict[int, asyncio.Task[None]] = {}
         # 라운드 타이머와 키가 겹치면 안 된다(둘 다 int 키인데 round_id와 game_id는 별개다).
         self.roulette_turn_tasks: dict[int, asyncio.Task[None]] = {}
@@ -1246,15 +1228,6 @@ class EventBot(discord.Client):
             return
         custom_id = (interaction.data or {}).get("custom_id", "")
         if not custom_id.startswith("eventbot:"):
-            return
-
-        with db() as conn:
-            season_closed = season_is_closed(conn)
-        if season_closed:
-            await interaction.response.send_message(
-                SEASON_CLOSED_MESSAGE,
-                ephemeral=True,
-            )
             return
 
         parts = custom_id.split(":")

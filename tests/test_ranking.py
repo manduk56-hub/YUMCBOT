@@ -336,14 +336,13 @@ class RankingTests(unittest.TestCase):
             ["2. <@300> - **7점**"],
         )
 
-    def test_season_end_confirmation_explains_irreversible_lock(self) -> None:
+    def test_season_end_confirmation_explains_score_freeze(self) -> None:
         embed = bot.season_end_confirmation_embed()
         view = bot.season_end_confirmation_view()
 
         self.assertIn("시즌을 종료", embed.title)
         self.assertIn("더 이상", embed.description)
-        self.assertIn("`/점수`", embed.description)
-        self.assertIn("`/시즌종료`", embed.description)
+        self.assertIn("점수", embed.description)
         self.assertEqual(
             [item.custom_id for item in view.children],
             ["eventbot:seasonend:confirm", "eventbot:seasonend:cancel"],
