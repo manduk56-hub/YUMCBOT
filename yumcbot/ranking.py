@@ -688,6 +688,13 @@ def optimize_scores(
             },
         )
         conn.execute("RELEASE SAVEPOINT optimize_scores")
+    except sqlite3.IntegrityError:
+        # score_optimization_is_done()의 사전 확인은 트랜잭션 밖 SELECT라 두 실행이
+        # 동시에 통과할 수 있다. 이 시점에 PK/UNIQUE 충돌이 났다는 건 상대가 먼저
+        # 커밋했다는 뜻이므로, 이 실행은 자기 몫을 버리고 "이미 완료"로 취급한다.
+        conn.execute("ROLLBACK TO SAVEPOINT optimize_scores")
+        conn.execute("RELEASE SAVEPOINT optimize_scores")
+        raise ScoreOptimizationAlreadyDoneError("이미 점수 최적화가 완료되었습니다.")
     except Exception:
         conn.execute("ROLLBACK TO SAVEPOINT optimize_scores")
         conn.execute("RELEASE SAVEPOINT optimize_scores")

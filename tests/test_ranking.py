@@ -547,6 +547,50 @@ class RankingTests(unittest.TestCase):
             [row["final_rank"] for row in unchanged], [1, 1, 1, 1, 5]
         )
 
+    def test_optimize_scores_rolls_back_partial_insert_on_write_time_conflict(self) -> None:
+        """score_optimization_is_done()의 사전 확인은 트랜잭션 밖 SELECT라 두 실행이
+        동시에 통과할 수 있다. 그 레이스를 흉내 내려고 사전 확인만 강제로 통과시키고,
+        먼저 커밋된 것처럼 2등 자리에 행을 미리 심어 둔다. 1등 삽입이 먼저 성공하더라도
+        2등에서 PK 충돌이 나면 SAVEPOINT 롤백으로 1등 삽입까지 함께 사라져야 하고,
+        호출자에게는 원시 IntegrityError가 아니라 ScoreOptimizationAlreadyDoneError가 가야 한다."""
+        self.add_user("300", "1등", 9)
+        self.add_user("200", "2등", 5)
+        with bot.db() as conn:
+            conn.execute(
+                "UPDATE season_state SET status = 'closed', closed_at = '2026-01-02' "
+                "WHERE singleton_id = 1"
+            )
+            conn.executemany(
+                """
+                INSERT INTO final_rankings (
+                    user_id, final_rank, display_name, total_score,
+                    participation_count, win_count, finalized_at
+                ) VALUES (?, ?, ?, ?, ?, ?, '2026-01-02')
+                """,
+                [
+                    ("300", 1, "1등", 9, 4, 3),
+                    ("200", 2, "2등", 5, 4, 3),
+                ],
+            )
+            # 다른 실행이 2등 자리를 먼저 커밋해 둔 상황을 흉내 낸다.
+            conn.execute(
+                """
+                INSERT INTO score_optimizations (
+                    user_id, rank, display_name, total_score,
+                    participation_count, win_count, draw_order, optimized_at
+                ) VALUES ('200', 2, '2등', 5, 4, 3, 1, '2026-01-02')
+                """
+            )
+
+        with bot.db() as conn:
+            with patch.object(bot.ranking, "score_optimization_is_done", return_value=False):
+                with self.assertRaises(bot.ScoreOptimizationAlreadyDoneError):
+                    bot.optimize_scores(conn, "999")
+
+        with bot.db() as conn:
+            rows = bot.fetch_score_optimization_rows(conn)
+        self.assertEqual([row["user_id"] for row in rows], ["200"])
+
     def test_score_optimization_command_replays_persisted_result(self) -> None:
         self.add_user("200", "첫째", 9)
         with bot.db() as conn:
