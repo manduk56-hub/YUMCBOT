@@ -292,6 +292,7 @@ from yumcbot.rounds import (
     round_game_key,
 )
 from yumcbot.scoring import (
+    SeasonClosedError,
     add_score,
     ensure_user,
     get_afk_coins,
@@ -327,10 +328,36 @@ from yumcbot.roulette import (
 )
 from yumcbot import ranking
 from yumcbot.ranking import (
+    ScoreOptimizationAlreadyDoneError,
+    SeasonAlreadyClosedError,
+    SeasonFinalizationBlockedError,
+    SeasonNotClosedError,
+    assign_competition_ranks,
+    build_final_ranking_embeds,
+    build_score_optimization_embeds,
+    cancel_season_end,
+    confirm_season_end,
+    fetch_final_ranking_rows,
+    fetch_ranking_rows,
+    fetch_ranking_stat_rows,
+    fetch_score_optimization_rows,
+    finalize_season_rankings,
     format_anonymous_ranking_lines,
+    format_final_ranking_lines,
     format_my_score_message,
     format_public_ranking_lines,
-    fetch_ranking_rows,
+    format_score_optimization_lines,
+    is_placeholder_display_name,
+    optimize_scores,
+    refresh_placeholder_user_names,
+    score_optimization_command,
+    score_optimization_is_done,
+    score_optimization_status_embed,
+    season_end_confirmation_embed,
+    season_end_confirmation_view,
+    season_end_status_embed,
+    season_finalization_blockers,
+    season_is_closed,
     write_admin_score_report,
 )
 from yumcbot import events
@@ -804,6 +831,23 @@ async def handle_emergency_join(interaction: discord.Interaction, round_id: int)
 register_settler("baseball", settle_baseball)
 
 
+SEASON_CLOSED_MESSAGE = (
+    "시즌이 종료되어 `/점수`와 관리자용 `/시즌종료`·`/점수최적화`만 사용할 수 있습니다."
+)
+
+
+class SeasonCommandTree(app_commands.CommandTree):
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        command_name = getattr(getattr(interaction, "command", None), "name", "")
+        if command_name in {"점수", "시즌종료", "점수최적화"}:
+            return True
+        with db() as conn:
+            closed = season_is_closed(conn)
+        if closed:
+            raise app_commands.CheckFailure(SEASON_CLOSED_MESSAGE)
+        return True
+
+
 class EventBot(discord.Client):
     def __init__(self) -> None:
         intents = discord.Intents.default()
@@ -811,7 +855,7 @@ class EventBot(discord.Client):
         # SERVER MEMBERS INTENT 토글이 함께 ON이어야 로그인이 된다 (issue #19).
         intents.members = True
         super().__init__(intents=intents)
-        self.tree = app_commands.CommandTree(self)
+        self.tree = SeasonCommandTree(self)
         self.auto_close_tasks: dict[int, asyncio.Task[None]] = {}
         # 라운드 타이머와 키가 겹치면 안 된다(둘 다 int 키인데 round_id와 game_id는 별개다).
         self.roulette_turn_tasks: dict[int, asyncio.Task[None]] = {}
@@ -879,6 +923,8 @@ class EventBot(discord.Client):
 
     def grant_voice_afk_coins(self) -> None:
         with db() as conn:
+            if season_is_closed(conn):
+                return
             for guild in self.guilds:
                 for voice_channel in guild.voice_channels:
                     for member in voice_channel.members:
@@ -1202,12 +1248,39 @@ class EventBot(discord.Client):
         if not custom_id.startswith("eventbot:"):
             return
 
+        with db() as conn:
+            season_closed = season_is_closed(conn)
+        if season_closed:
+            await interaction.response.send_message(
+                SEASON_CLOSED_MESSAGE,
+                ephemeral=True,
+            )
+            return
+
         parts = custom_id.split(":")
         if len(parts) < 3:
             await interaction.response.send_message("알 수 없는 버튼입니다.", ephemeral=True)
             return
 
         _, action = parts[:2]
+        if action == "seasonend":
+            if len(parts) != 3 or parts[2] not in {"confirm", "cancel"}:
+                await interaction.response.send_message(
+                    "잘못된 시즌 종료 요청입니다.", ephemeral=True
+                )
+                return
+            if not is_operator_user(interaction.user):
+                await interaction.response.send_message(
+                    "이 버튼은 관리자 권한 또는 운영자 역할이 필요합니다.",
+                    ephemeral=True,
+                )
+                return
+            if parts[2] == "confirm":
+                await ranking.confirm_season_end(interaction)
+            else:
+                await ranking.cancel_season_end(interaction)
+            return
+
         if action in {
             "rouletteaccept",
             "roulettedecline",
@@ -1759,6 +1832,23 @@ async def baseball_prepare(interaction: discord.Interaction) -> None:
 @admin_only()
 async def close_round(interaction: discord.Interaction) -> None:
     await events.close_round_command(interaction)
+
+
+@bot.tree.command(name="시즌종료", description="누적 점수의 최종 순위를 확정하고 모든 게임을 종료합니다.")
+@app_commands.default_permissions()
+@admin_only()
+async def end_season(interaction: discord.Interaction) -> None:
+    await ranking.season_end_command(interaction)
+
+
+@bot.tree.command(
+    name="점수최적화",
+    description="시즌 종료 후 동점자를 완전 동률 추첨으로 풀어 유일한 순위를 확정합니다.",
+)
+@app_commands.default_permissions()
+@admin_only()
+async def optimize_season_scores(interaction: discord.Interaction) -> None:
+    await ranking.score_optimization_command(interaction)
 
 
 @bot.tree.command(name="이벤트종료", description="개발 중인 현재 이벤트를 남은 게임과 관계없이 강제로 종료합니다.")

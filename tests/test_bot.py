@@ -26,6 +26,78 @@ class BotRegressionTests(unittest.TestCase):
         self.db_patch.stop()
         self.temp_dir.cleanup()
 
+    def test_closed_season_allows_score_and_season_end_slash_commands(self) -> None:
+        with bot.db() as conn:
+            conn.execute(
+                "UPDATE season_state SET status = 'closed', closed_at = '2026-01-02' WHERE singleton_id = 1"
+            )
+
+        score_interaction = SimpleNamespace(command=SimpleNamespace(name="점수"))
+        season_end_interaction = SimpleNamespace(command=SimpleNamespace(name="시즌종료"))
+        optimize_interaction = SimpleNamespace(command=SimpleNamespace(name="점수최적화"))
+        game_interaction = SimpleNamespace(command=SimpleNamespace(name="러시안룰렛"))
+        self.assertTrue(asyncio.run(bot.bot.tree.interaction_check(score_interaction)))
+        self.assertTrue(asyncio.run(bot.bot.tree.interaction_check(season_end_interaction)))
+        self.assertTrue(asyncio.run(bot.bot.tree.interaction_check(optimize_interaction)))
+        with self.assertRaises(bot.app_commands.CheckFailure) as raised:
+            asyncio.run(bot.bot.tree.interaction_check(game_interaction))
+        self.assertEqual(str(raised.exception), bot.SEASON_CLOSED_MESSAGE)
+
+    def test_closed_season_rejects_existing_component_buttons(self) -> None:
+        with bot.db() as conn:
+            conn.execute(
+                "UPDATE season_state SET status = 'closed', closed_at = '2026-01-02' WHERE singleton_id = 1"
+            )
+        interaction = SimpleNamespace(
+            type=bot.discord.InteractionType.component,
+            data={"custom_id": "eventbot:eventjoin:1"},
+            response=SimpleNamespace(send_message=AsyncMock()),
+        )
+
+        asyncio.run(bot.bot.on_interaction(interaction))
+
+        interaction.response.send_message.assert_awaited_once_with(
+            bot.SEASON_CLOSED_MESSAGE,
+            ephemeral=True,
+        )
+
+    def test_season_end_button_rejects_non_operator(self) -> None:
+        interaction = SimpleNamespace(
+            type=bot.discord.InteractionType.component,
+            data={"custom_id": "eventbot:seasonend:confirm"},
+            user=SimpleNamespace(
+                guild_permissions=SimpleNamespace(administrator=False, manage_guild=False),
+                roles=[],
+            ),
+            response=SimpleNamespace(send_message=AsyncMock()),
+        )
+
+        asyncio.run(bot.bot.on_interaction(interaction))
+
+        interaction.response.send_message.assert_awaited_once_with(
+            "이 버튼은 관리자 권한 또는 운영자 역할이 필요합니다.",
+            ephemeral=True,
+        )
+
+    def test_season_end_cancel_button_dispatches_for_operator(self) -> None:
+        interaction = SimpleNamespace(
+            type=bot.discord.InteractionType.component,
+            data={"custom_id": "eventbot:seasonend:cancel"},
+            user=SimpleNamespace(
+                guild_permissions=SimpleNamespace(administrator=True, manage_guild=False),
+                roles=[],
+            ),
+            response=SimpleNamespace(send_message=AsyncMock()),
+        )
+
+        with patch.object(
+            bot.ranking, "cancel_season_end", new=AsyncMock()
+        ) as cancel_handler:
+            asyncio.run(bot.bot.on_interaction(interaction))
+
+        cancel_handler.assert_awaited_once_with(interaction)
+        interaction.response.send_message.assert_not_awaited()
+
     def test_auto_close_countdown_announces_ten_then_counts_five_to_one(self) -> None:
         warning_message = SimpleNamespace(edit=AsyncMock(), delete=AsyncMock())
         countdown_message = SimpleNamespace(edit=AsyncMock(), delete=AsyncMock())
