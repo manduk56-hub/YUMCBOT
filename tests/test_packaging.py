@@ -356,6 +356,7 @@ class SlashCommandRegistryTest(unittest.TestCase):
             "익명랭킹",
             "잠수",
             "점수",
+            "점수최적화",
             "준비",
             "지목",
         }

@@ -289,8 +289,9 @@ MIGRATIONS: dict[int, list[str]] = {
         ON baseball_swings(round_id, pitch_number, id)
         """,
     ],
-    # 누적 시즌 종료 상태와 그 순간 확정한 고유 순위. 종료 뒤 점수·참여 이력이
-    # 바뀌지 않더라도 추첨을 다시 하면 순위가 흔들리므로 결과 전체를 영속화한다.
+    # 누적 시즌 종료 상태와 그 순간 확정한 순위. 종료 뒤 점수·참여 이력이 바뀌지
+    # 않더라도 다시 계산하면 표시가 흔들리므로 결과 전체를 영속화한다. final_rank는
+    # 동점자가 같은 값을 공유하는 표준 경쟁 순위(1,2,3,3,5...)라 UNIQUE가 아니다.
     8: [
         """
         CREATE TABLE IF NOT EXISTS season_state (
@@ -307,13 +308,27 @@ MIGRATIONS: dict[int, list[str]] = {
         """
         CREATE TABLE IF NOT EXISTS final_rankings (
             user_id TEXT PRIMARY KEY,
-            final_rank INTEGER NOT NULL UNIQUE CHECK (final_rank > 0),
+            final_rank INTEGER NOT NULL CHECK (final_rank > 0),
+            display_name TEXT NOT NULL,
+            total_score INTEGER NOT NULL,
+            participation_count INTEGER NOT NULL CHECK (participation_count >= 0),
+            win_count INTEGER NOT NULL CHECK (win_count >= 0),
+            finalized_at TEXT NOT NULL,
+            FOREIGN KEY (user_id) REFERENCES users(user_id) ON DELETE CASCADE
+        )
+        """,
+        # /시즌종료가 표준 순위로 남겨둔 동점을 /점수최적화가 완전 동률 추첨으로
+        # 풀어 만든 별도의 유일 순위. final_rankings의 total_score 등은 건드리지 않는다.
+        """
+        CREATE TABLE IF NOT EXISTS score_optimizations (
+            user_id TEXT PRIMARY KEY,
+            rank INTEGER NOT NULL UNIQUE CHECK (rank > 0),
             display_name TEXT NOT NULL,
             total_score INTEGER NOT NULL,
             participation_count INTEGER NOT NULL CHECK (participation_count >= 0),
             win_count INTEGER NOT NULL CHECK (win_count >= 0),
             draw_order INTEGER NOT NULL CHECK (draw_order > 0),
-            finalized_at TEXT NOT NULL,
+            optimized_at TEXT NOT NULL,
             FOREIGN KEY (user_id) REFERENCES users(user_id) ON DELETE CASCADE
         )
         """,

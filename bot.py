@@ -328,21 +328,31 @@ from yumcbot.roulette import (
 )
 from yumcbot import ranking
 from yumcbot.ranking import (
+    ScoreOptimizationAlreadyDoneError,
     SeasonAlreadyClosedError,
     SeasonFinalizationBlockedError,
+    SeasonNotClosedError,
+    assign_competition_ranks,
     build_final_ranking_embeds,
+    build_score_optimization_embeds,
     cancel_season_end,
     confirm_season_end,
     fetch_final_ranking_rows,
     fetch_ranking_rows,
     fetch_ranking_stat_rows,
+    fetch_score_optimization_rows,
     finalize_season_rankings,
     format_anonymous_ranking_lines,
     format_final_ranking_lines,
     format_my_score_message,
     format_public_ranking_lines,
+    format_score_optimization_lines,
     is_placeholder_display_name,
+    optimize_scores,
     refresh_placeholder_user_names,
+    score_optimization_command,
+    score_optimization_is_done,
+    score_optimization_status_embed,
     season_end_confirmation_embed,
     season_end_confirmation_view,
     season_end_status_embed,
@@ -822,14 +832,14 @@ register_settler("baseball", settle_baseball)
 
 
 SEASON_CLOSED_MESSAGE = (
-    "시즌이 종료되어 `/점수`와 관리자용 `/시즌종료` 재브리핑만 사용할 수 있습니다."
+    "시즌이 종료되어 `/점수`와 관리자용 `/시즌종료`·`/점수최적화`만 사용할 수 있습니다."
 )
 
 
 class SeasonCommandTree(app_commands.CommandTree):
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         command_name = getattr(getattr(interaction, "command", None), "name", "")
-        if command_name in {"점수", "시즌종료"}:
+        if command_name in {"점수", "시즌종료", "점수최적화"}:
             return True
         with db() as conn:
             closed = season_is_closed(conn)
@@ -1829,6 +1839,16 @@ async def close_round(interaction: discord.Interaction) -> None:
 @admin_only()
 async def end_season(interaction: discord.Interaction) -> None:
     await ranking.season_end_command(interaction)
+
+
+@bot.tree.command(
+    name="점수최적화",
+    description="시즌 종료 후 동점자를 완전 동률 추첨으로 풀어 유일한 순위를 확정합니다.",
+)
+@app_commands.default_permissions()
+@admin_only()
+async def optimize_season_scores(interaction: discord.Interaction) -> None:
+    await ranking.score_optimization_command(interaction)
 
 
 @bot.tree.command(name="이벤트종료", description="개발 중인 현재 이벤트를 남은 게임과 관계없이 강제로 종료합니다.")

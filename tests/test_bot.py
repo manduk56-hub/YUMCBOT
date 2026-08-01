@@ -34,9 +34,11 @@ class BotRegressionTests(unittest.TestCase):
 
         score_interaction = SimpleNamespace(command=SimpleNamespace(name="점수"))
         season_end_interaction = SimpleNamespace(command=SimpleNamespace(name="시즌종료"))
+        optimize_interaction = SimpleNamespace(command=SimpleNamespace(name="점수최적화"))
         game_interaction = SimpleNamespace(command=SimpleNamespace(name="러시안룰렛"))
         self.assertTrue(asyncio.run(bot.bot.tree.interaction_check(score_interaction)))
         self.assertTrue(asyncio.run(bot.bot.tree.interaction_check(season_end_interaction)))
+        self.assertTrue(asyncio.run(bot.bot.tree.interaction_check(optimize_interaction)))
         with self.assertRaises(bot.app_commands.CheckFailure) as raised:
             asyncio.run(bot.bot.tree.interaction_check(game_interaction))
         self.assertEqual(str(raised.exception), bot.SEASON_CLOSED_MESSAGE)

@@ -124,7 +124,7 @@ class FreshDatabaseTest(unittest.TestCase):
         )
 
     def test_season_finalization_tables_are_created_open(self) -> None:
-        """v8 마이그레이션. 종료 상태와 추첨까지 끝난 고유 순위를 재시작 뒤에도 보존한다."""
+        """v8 마이그레이션. 종료 상태와 표준 순위 확정 결과를 재시작 뒤에도 보존한다."""
         schema.init_db()
         with schema.db() as conn:
             state = conn.execute(
@@ -144,8 +144,31 @@ class FreshDatabaseTest(unittest.TestCase):
                 "total_score",
                 "participation_count",
                 "win_count",
-                "draw_order",
                 "finalized_at",
+            },
+        )
+
+    def test_score_optimization_table_is_created(self) -> None:
+        """v8 마이그레이션. `/점수최적화`가 완전 동률 추첨으로 만든 유일한 순위를 보존한다."""
+        schema.init_db()
+        with schema.db() as conn:
+            columns = {
+                row["name"]
+                for row in conn.execute(
+                    "PRAGMA table_info(score_optimizations)"
+                ).fetchall()
+            }
+        self.assertEqual(
+            columns,
+            {
+                "user_id",
+                "rank",
+                "display_name",
+                "total_score",
+                "participation_count",
+                "win_count",
+                "draw_order",
+                "optimized_at",
             },
         )
 

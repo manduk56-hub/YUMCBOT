@@ -155,8 +155,8 @@ class RankingTests(unittest.TestCase):
         self.assertEqual(rows[0]["participation_count"], 3)
         self.assertEqual(rows[0]["win_count"], 1)
 
-    def test_finalization_orders_by_score_participation_wins_then_draw(self) -> None:
-        """참여 장려가 승수보다 앞서고, 세 값이 모두 같은 그룹만 한 번 추첨한다."""
+    def test_finalization_orders_by_score_only_with_shared_rank(self) -> None:
+        """참여·승리 횟수는 최종 순위에 반영하지 않는다 — 총점이 같으면 같은 순위를 공유한다."""
         for user_id, name in (
             ("100", "봇"),
             ("200", "참여 우선"),
@@ -228,33 +228,42 @@ class RankingTests(unittest.TestCase):
                     (row["user_id"], row["participation_count"], row["win_count"])
                     for row in stats
                 ],
-                [("400", 3, 2), ("500", 3, 2), ("200", 3, 1), ("300", 2, 2)],
+                [("200", 3, 1), ("300", 2, 2), ("400", 3, 2), ("500", 3, 2)],
             )
 
-            class ReverseRng:
-                @staticmethod
-                def shuffle(values) -> None:
-                    values.reverse()
-
-            finalized = bot.finalize_season_rankings(
-                conn, "100", "999", rng=ReverseRng()
-            )
+            finalized = bot.finalize_season_rankings(conn, "100", "999")
+            # 넷 다 총점이 10으로 같으므로 참여·승리 차이와 무관하게 같은 1위를 공유한다.
+            # /점수최적화가 참여·승리로 나중에 풀 수 있도록 두 값 자체는 그대로 저장된다.
             self.assertEqual(
                 [row["user_id"] for row in finalized],
-                ["500", "400", "200", "300"],
+                ["200", "300", "400", "500"],
             )
+            self.assertEqual([row["final_rank"] for row in finalized], [1, 1, 1, 1])
             self.assertEqual(
-                [row["final_rank"] for row in finalized], [1, 2, 3, 4]
+                [(row["participation_count"], row["win_count"]) for row in finalized],
+                [(3, 1), (2, 2), (3, 2), (3, 2)],
             )
             self.assertTrue(bot.season_is_closed(conn))
             self.assertEqual(
                 [row["user_id"] for row in bot.fetch_ranking_rows(conn, "100")],
-                ["500", "400", "200", "300"],
+                ["200", "300", "400", "500"],
             )
 
         with bot.db() as conn:
             persisted = bot.fetch_final_ranking_rows(conn)
-        self.assertEqual([row["user_id"] for row in persisted], ["500", "400", "200", "300"])
+        self.assertEqual([row["user_id"] for row in persisted], ["200", "300", "400", "500"])
+
+    def test_assign_competition_ranks_shares_rank_and_skips_next(self) -> None:
+        """3등이 동점이면 1·2·3·3등 다음은 5등으로 건너뛴다 (표준 경쟁 순위)."""
+        rows = [
+            {"total_score": 30},
+            {"total_score": 20},
+            {"total_score": 10},
+            {"total_score": 10},
+            {"total_score": 5},
+        ]
+        ranks = [rank for _, rank in bot.assign_competition_ranks(rows)]
+        self.assertEqual(ranks, [1, 2, 3, 3, 5])
 
     def test_finalization_rejects_an_open_event(self) -> None:
         with bot.db() as conn:
@@ -358,12 +367,12 @@ class RankingTests(unittest.TestCase):
                 """
                 INSERT INTO final_rankings (
                     user_id, final_rank, display_name, total_score,
-                    participation_count, win_count, draw_order, finalized_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, '2026-01-02')
+                    participation_count, win_count, finalized_at
+                ) VALUES (?, ?, ?, ?, ?, ?, '2026-01-02')
                 """,
                 [
-                    ("200", 1, "첫째", 9, 4, 3, 1),
-                    ("300", 2, "둘째", 7, 5, 2, 1),
+                    ("200", 1, "첫째", 9, 4, 3),
+                    ("300", 2, "둘째", 7, 5, 2),
                 ],
             )
             before = [tuple(row) for row in bot.fetch_final_ranking_rows(conn)]
@@ -401,6 +410,21 @@ class RankingTests(unittest.TestCase):
         self.assertEqual(len(embeds), 1)
         self.assertIn("첫째", embeds[0].description)
         self.assertIn("둘째", embeds[0].description)
+
+    def test_final_ranking_lines_show_shared_rank_for_ties(self) -> None:
+        rows = [
+            {"final_rank": 1, "display_name": "공동 1등 A", "total_score": 9},
+            {"final_rank": 1, "display_name": "공동 1등 B", "total_score": 9},
+            {"final_rank": 3, "display_name": "3등", "total_score": 5},
+        ]
+        self.assertEqual(
+            bot.format_final_ranking_lines(rows),
+            [
+                "**1위** · 공동 1등 A · **9점**",
+                "**1위** · 공동 1등 B · **9점**",
+                "**3위** · 3등 · **5점**",
+            ],
+        )
 
     def test_placeholder_name_is_refetched_before_finalization(self) -> None:
         self.add_user("200", "User 200", 3)
@@ -449,6 +473,121 @@ class RankingTests(unittest.TestCase):
         self.assertIsNotNone(command)
         self.assertEqual(command.default_permissions.value, 0)
         self.assertEqual(len(command.checks), 1)
+
+    def test_score_optimization_command_is_admin_only(self) -> None:
+        command = bot.bot.tree.get_command("점수최적화")
+        self.assertIsNotNone(command)
+        self.assertEqual(command.default_permissions.value, 0)
+        self.assertEqual(len(command.checks), 1)
+
+    def test_score_optimization_rejects_open_season(self) -> None:
+        interaction = SimpleNamespace(
+            guild=object(),
+            response=SimpleNamespace(send_message=AsyncMock()),
+        )
+        asyncio.run(bot.ranking.score_optimization_command(interaction))
+
+        interaction.response.send_message.assert_awaited_once()
+        args, kwargs = interaction.response.send_message.call_args
+        self.assertIn("시즌이 아직 종료되지 않았습니다", args[0])
+        self.assertTrue(kwargs["ephemeral"])
+
+    def test_score_optimization_breaks_ties_by_participation_then_wins_then_lot(self) -> None:
+        """총점 동점 그룹만 참여→승리→완전 동률 추첨 순으로 풀고, final_rankings는 그대로 둔다."""
+        for user_id, name in (
+            ("200", "참여4 승3 A"),
+            ("210", "참여4 승3 B"),
+            ("300", "참여4 승2"),
+            ("400", "참여3 승5"),
+            ("500", "5등 단독"),
+        ):
+            self.add_user(user_id, name, 9 if user_id != "500" else 5)
+        with bot.db() as conn:
+            conn.execute(
+                "UPDATE season_state SET status = 'closed', closed_at = '2026-01-02' "
+                "WHERE singleton_id = 1"
+            )
+            conn.executemany(
+                """
+                INSERT INTO final_rankings (
+                    user_id, final_rank, display_name, total_score,
+                    participation_count, win_count, finalized_at
+                ) VALUES (?, ?, ?, ?, ?, ?, '2026-01-02')
+                """,
+                [
+                    # 200/210은 참여·승리까지 완전 동률이라 추첨이 필요하다.
+                    ("200", 1, "참여4 승3 A", 9, 4, 3),
+                    ("210", 1, "참여4 승3 B", 9, 4, 3),
+                    # 300은 참여는 200/210과 같지만 승수가 낮아 추첨 없이 그 다음.
+                    ("300", 1, "참여4 승2", 9, 4, 2),
+                    # 400은 승수는 가장 높지만 참여가 우선 기준이라 이 그룹에서 꼴찌.
+                    ("400", 1, "참여3 승5", 9, 3, 5),
+                    # 총점 자체가 달라 별도 그룹 — 위 동점 여부와 무관하게 마지막.
+                    ("500", 5, "5등 단독", 5, 2, 1),
+                ],
+            )
+
+        class ReverseRng:
+            @staticmethod
+            def shuffle(values) -> None:
+                values.reverse()
+
+        with bot.db() as conn:
+            optimized = bot.optimize_scores(conn, "999", rng=ReverseRng())
+
+        self.assertEqual(
+            [row["user_id"] for row in optimized],
+            ["210", "200", "300", "400", "500"],
+        )
+        self.assertEqual([row["rank"] for row in optimized], [1, 2, 3, 4, 5])
+
+        with bot.db() as conn:
+            unchanged = bot.fetch_final_ranking_rows(conn)
+        self.assertEqual(
+            [row["final_rank"] for row in unchanged], [1, 1, 1, 1, 5]
+        )
+
+    def test_score_optimization_command_replays_persisted_result(self) -> None:
+        self.add_user("200", "첫째", 9)
+        with bot.db() as conn:
+            conn.execute(
+                "UPDATE season_state SET status = 'closed', closed_at = '2026-01-02' "
+                "WHERE singleton_id = 1"
+            )
+            conn.execute(
+                """
+                INSERT INTO final_rankings (
+                    user_id, final_rank, display_name, total_score,
+                    participation_count, win_count, finalized_at
+                ) VALUES ('200', 1, '첫째', 9, 4, 3, '2026-01-02')
+                """
+            )
+            conn.execute(
+                """
+                INSERT INTO score_optimizations (
+                    user_id, rank, display_name, total_score,
+                    participation_count, win_count, draw_order, optimized_at
+                ) VALUES ('200', 1, '첫째', 9, 4, 3, 1, '2026-01-02')
+                """
+            )
+            before = [tuple(row) for row in bot.fetch_score_optimization_rows(conn)]
+
+        interaction = SimpleNamespace(
+            guild=object(),
+            response=SimpleNamespace(send_message=AsyncMock()),
+            followup=SimpleNamespace(send=AsyncMock()),
+        )
+        asyncio.run(bot.ranking.score_optimization_command(interaction))
+
+        summary = interaction.response.send_message.await_args.kwargs["embed"]
+        self.assertEqual(summary.title, "📌 점수 최적화 · 재브리핑")
+        self.assertIn("재추첨하지 않습니다", summary.description)
+        ranking_embed = interaction.followup.send.await_args.kwargs["embed"]
+        self.assertIn("**1위** · 첫째 · **9점**", ranking_embed.description)
+
+        with bot.db() as conn:
+            after = [tuple(row) for row in bot.fetch_score_optimization_rows(conn)]
+        self.assertEqual(after, before)
 
     def test_ranking_command_is_admin_only(self) -> None:
         command = bot.bot.tree.get_command("랭킹")

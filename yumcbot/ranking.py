@@ -1,8 +1,11 @@
 """점수 조회·랭킹 공개·관리자 백업 — `/잠수`·`/지목`·`/점수`·`/랭킹`·`/익명랭킹`·`/데이터백업`.
 
 랭킹은 정상 종료된 게임의 참가 기록이 있는 사람만 보여준다. 시즌이 열려 있을 때는
-점수→참여→승리→user_id 순으로 안정적으로 표시하고, `/시즌종료`가 확정되면 완전
-동률 그룹만 안전하게 추첨한 고유 순위를 `final_rankings`에서 그대로 읽는다.
+점수→user_id 순으로 안정적으로 표시하고, `/시즌종료`가 확정되면 동점자가 같은
+순위를 공유하는 표준 경쟁 순위(1,2,3,3,5...)를 `final_rankings`에서 그대로 읽는다 —
+`/시즌종료`는 점수만으로 순위를 매기는 "진짜 종료" 동작이다. 참여·승리 횟수를 반영한
+유일한 순위가 필요하면 `/점수최적화`가 그 두 값과 완전 동률 추첨으로 동점을 풀어
+`score_optimizations`에 남긴다 — `final_rankings`의 점수·순위 표시는 건드리지 않는다.
 """
 
 from __future__ import annotations
@@ -62,7 +65,11 @@ def season_end_confirmation_embed() -> discord.Embed:
     )
     embed.add_field(
         name="최종 순위 기준",
-        value="점수 → 참여 횟수 → 승리 횟수 → 완전 동률 무작위 추첨",
+        value=(
+            "총점만으로 순위를 매깁니다. 동점자는 같은 순위를 공유하고 다음 순위는 "
+            "그만큼 건너뜁니다 (예: 3등이 2명이면 1·2·3·3·5등). 참여·승리 횟수까지 "
+            "반영한 유일한 순위는 종료 후 `/점수최적화`에서 확정합니다."
+        ),
         inline=False,
     )
     return embed
@@ -105,9 +112,8 @@ def format_final_ranking_lines(rows: list[sqlite3.Row]) -> list[str]:
     return lines
 
 
-def build_final_ranking_embeds(rows: list[sqlite3.Row]) -> list[discord.Embed]:
-    """Discord description 제한을 넘지 않게 전체 최종 순위를 여러 임베드로 나눈다."""
-    lines = format_final_ranking_lines(rows)
+def _chunk_ranking_lines(lines: list[str]) -> list[list[str]]:
+    """Discord description 제한(4096자)을 넘지 않게 줄 목록을 여러 묶음으로 나눈다."""
     chunks: list[list[str]] = []
     current: list[str] = []
     current_length = 0
@@ -121,22 +127,33 @@ def build_final_ranking_embeds(rows: list[sqlite3.Row]) -> list[discord.Embed]:
         current_length += len(line) + (1 if len(current) > 1 else 0)
     if current:
         chunks.append(current)
+    return chunks
 
+
+def _build_ranking_embeds(
+    lines: list[str], *, base_title: str, color: discord.Color
+) -> list[discord.Embed]:
+    chunks = _chunk_ranking_lines(lines)
     embeds: list[discord.Embed] = []
     for chunk_index, chunk in enumerate(chunks, start=1):
         first_rank = sum(len(previous) for previous in chunks[: chunk_index - 1]) + 1
         last_rank = first_rank + len(chunk) - 1
-        title = "🏆 시즌 최종 순위"
+        title = base_title
         if len(chunks) > 1:
             title += f" · {first_rank}~{last_rank}위"
         embeds.append(
-            discord.Embed(
-                title=title,
-                description="\n".join(chunk),
-                color=discord.Color.gold(),
-            )
+            discord.Embed(title=title, description="\n".join(chunk), color=color)
         )
     return embeds
+
+
+def build_final_ranking_embeds(rows: list[sqlite3.Row]) -> list[discord.Embed]:
+    """Discord description 제한을 넘지 않게 전체 최종 순위를 여러 임베드로 나눈다."""
+    return _build_ranking_embeds(
+        format_final_ranking_lines(rows),
+        base_title="🏆 시즌 최종 순위",
+        color=discord.Color.gold(),
+    )
 
 
 def season_end_status_embed(
@@ -339,6 +356,10 @@ def fetch_ranking_stat_rows(
     현재 이벤트 모델에서는 event_participants가 한 이벤트의 모든 라운드 참가 명단이다.
     event_session_id가 없던 과거 라운드는 votes/trust_registrations/baseball_swings와
     score_logs로 보완한다. 강제 종료된 개발용 라운드는 참가·승리 양쪽에서 제외한다.
+
+    정렬은 총점→user_id로만 하고 participation_count·win_count는 값만 계산해 돌려준다 —
+    두 값은 /랭킹·/시즌종료의 순위 결정에는 쓰이지 않고, 시즌 종료 뒤 /점수최적화가
+    동점 그룹을 풀 때만 참조한다.
     """
     return conn.execute(
         """
@@ -423,8 +444,6 @@ def fetch_ranking_stat_rows(
         GROUP BY users.user_id, users.display_name, users.total_score
         ORDER BY
             users.total_score DESC,
-            participation_count DESC,
-            win_count DESC,
             users.user_id ASC
         """,
         (current_bot_id,),
@@ -440,29 +459,53 @@ def fetch_final_ranking_rows(conn: sqlite3.Connection) -> list[sqlite3.Row]:
             total_score,
             participation_count,
             win_count,
-            final_rank,
-            draw_order
+            final_rank
         FROM final_rankings
-        ORDER BY final_rank ASC
+        ORDER BY final_rank ASC, user_id ASC
         """
     ).fetchall()
 
 
 def fetch_ranking_rows(conn: sqlite3.Connection, current_bot_id: str) -> list[sqlite3.Row]:
-    """진행 중에는 계산 랭킹, 종료 후에는 영속된 고유 최종 랭킹을 반환한다."""
+    """진행 중에는 계산 랭킹, 종료 후에는 영속된 최종 랭킹을 반환한다."""
     if season_is_closed(conn):
         return fetch_final_ranking_rows(conn)
     return fetch_ranking_stat_rows(conn, current_bot_id)
+
+
+def assign_competition_ranks(
+    candidates: list[sqlite3.Row],
+) -> list[tuple[sqlite3.Row, int]]:
+    """총점만으로 표준 경쟁 순위(1,2,3,3,5...)를 매긴다.
+
+    candidates는 이미 총점→user_id 순으로 정렬돼 있어야 한다. 참여·승리 횟수는
+    여기서 보지 않는다 — 그건 시즌 종료 뒤 `/점수최적화`가 동점을 풀 때 쓸 몫이다.
+    총점이 같은 동점 그룹은 그 그룹 첫 자리의 순위를 함께 받고, 다음 그룹은
+    동점 인원수만큼 순위를 건너뛴다.
+    """
+    ranked: list[tuple[sqlite3.Row, int]] = []
+    previous_score: int | None = None
+    rank = 0
+    for position, row in enumerate(candidates, start=1):
+        score = int(row["total_score"])
+        if score != previous_score:
+            rank = position
+            previous_score = score
+        ranked.append((row, rank))
+    return ranked
 
 
 def finalize_season_rankings(
     conn: sqlite3.Connection,
     current_bot_id: str,
     closed_by_user_id: str,
-    *,
-    rng: Any | None = None,
 ) -> list[sqlite3.Row]:
-    """점수→참여→승리 순으로 정렬하고 완전 동률만 추첨해 한 번만 확정한다."""
+    """총점만으로 정렬하고 표준 경쟁 순위로 한 번만 확정한다.
+
+    동점자는 같은 순위를 공유한다. 참여·승리 횟수는 반영하지 않는다 — 이건
+    "진짜 시즌 종료" 동작이고, 그 두 값까지 반영한 유일한 순위는 시즌 종료 뒤
+    `/점수최적화`가 별도로 만든다.
+    """
     if season_is_closed(conn):
         raise SeasonAlreadyClosedError("이미 시즌이 종료되어 최종 순위가 확정되었습니다.")
 
@@ -474,45 +517,19 @@ def finalize_season_rankings(
     if not candidates:
         raise SeasonFinalizationBlockedError(["최종 순위를 계산할 게임 참가자가 없음"])
 
-    random_source = rng if rng is not None else secrets.SystemRandom()
-    ordered: list[tuple[sqlite3.Row, int]] = []
-    index = 0
-    while index < len(candidates):
-        first = candidates[index]
-        key = (
-            int(first["total_score"]),
-            int(first["participation_count"]),
-            int(first["win_count"]),
-        )
-        end = index + 1
-        while end < len(candidates):
-            candidate = candidates[end]
-            candidate_key = (
-                int(candidate["total_score"]),
-                int(candidate["participation_count"]),
-                int(candidate["win_count"]),
-            )
-            if candidate_key != key:
-                break
-            end += 1
-
-        group = list(candidates[index:end])
-        if len(group) > 1:
-            random_source.shuffle(group)
-        ordered.extend((row, draw_order) for draw_order, row in enumerate(group, start=1))
-        index = end
+    ranked = assign_competition_ranks(candidates)
 
     finalized_at = now_text()
     conn.execute("SAVEPOINT finalize_season")
     try:
         conn.execute("DELETE FROM final_rankings")
-        for final_rank, (row, draw_order) in enumerate(ordered, start=1):
+        for row, final_rank in ranked:
             conn.execute(
                 """
                 INSERT INTO final_rankings (
                     user_id, final_rank, display_name, total_score,
-                    participation_count, win_count, draw_order, finalized_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    participation_count, win_count, finalized_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     str(row["user_id"]),
@@ -521,7 +538,6 @@ def finalize_season_rankings(
                     int(row["total_score"]),
                     int(row["participation_count"]),
                     int(row["win_count"]),
-                    draw_order,
                     finalized_at,
                 ),
             )
@@ -541,8 +557,8 @@ def finalize_season_rankings(
             "close",
             actor_user_id=closed_by_user_id,
             payload={
-                "participant_count": len(ordered),
-                "criteria": ["total_score", "participation_count", "win_count", "random_draw"],
+                "participant_count": len(ranked),
+                "criteria": ["total_score"],
             },
         )
         conn.execute("RELEASE SAVEPOINT finalize_season")
@@ -552,6 +568,218 @@ def finalize_season_rankings(
         raise
 
     return fetch_final_ranking_rows(conn)
+
+
+class SeasonNotClosedError(RuntimeError):
+    """시즌이 아직 종료되지 않은 상태에서 점수 최적화를 시도할 때 발생한다."""
+
+
+class ScoreOptimizationAlreadyDoneError(RuntimeError):
+    """점수 최적화 결과가 이미 확정된 뒤 다시 추첨하려 할 때 발생한다."""
+
+
+def score_optimization_is_done(conn: sqlite3.Connection) -> bool:
+    return conn.execute("SELECT 1 FROM score_optimizations LIMIT 1").fetchone() is not None
+
+
+def fetch_score_optimization_rows(conn: sqlite3.Connection) -> list[sqlite3.Row]:
+    return conn.execute(
+        """
+        SELECT
+            user_id,
+            display_name,
+            total_score,
+            participation_count,
+            win_count,
+            rank,
+            draw_order
+        FROM score_optimizations
+        ORDER BY rank ASC
+        """
+    ).fetchall()
+
+
+def _consecutive_groups(
+    rows: list[sqlite3.Row], key_fn: Any
+) -> list[list[sqlite3.Row]]:
+    """이미 key_fn 기준으로 정렬된 rows를 연속된 동일 키 묶음으로 나눈다."""
+    groups: list[list[sqlite3.Row]] = []
+    start = 0
+    for index in range(1, len(rows) + 1):
+        if index == len(rows) or key_fn(rows[index]) != key_fn(rows[start]):
+            groups.append(rows[start:index])
+            start = index
+    return groups
+
+
+def optimize_scores(
+    conn: sqlite3.Connection,
+    optimized_by_user_id: str,
+    *,
+    rng: Any | None = None,
+) -> list[sqlite3.Row]:
+    """`/시즌종료`가 남긴 총점 동점 그룹을 참여→승리→완전 동률 추첨 순으로 풀어
+    유일한 순위를 만들고 한 번만 확정한다.
+
+    `final_rankings`의 순위·점수는 건드리지 않는다 — 시상처럼 유일한 순서가
+    필요한 곳에서만 이 결과(`score_optimizations`)를 쓴다.
+    """
+    if not season_is_closed(conn):
+        raise SeasonNotClosedError(
+            "시즌이 아직 종료되지 않았습니다. 먼저 `/시즌종료`를 실행해주세요."
+        )
+    if score_optimization_is_done(conn):
+        raise ScoreOptimizationAlreadyDoneError("이미 점수 최적화가 완료되었습니다.")
+
+    final_rows = fetch_final_ranking_rows(conn)
+    random_source = rng if rng is not None else secrets.SystemRandom()
+    ordered: list[tuple[sqlite3.Row, int]] = []
+    for score_group in _consecutive_groups(
+        final_rows, lambda row: int(row["final_rank"])
+    ):
+        # 총점 동점 그룹 안에서만 참여→승리로 세부 정렬한다. /시즌종료는 이 두
+        # 값을 순위에 쓰지 않으므로, 서로 다른 총점 그룹끼리는 건드리지 않는다.
+        ranked_group = sorted(
+            score_group,
+            key=lambda row: (int(row["participation_count"]), int(row["win_count"])),
+            reverse=True,
+        )
+        for tie_group in _consecutive_groups(
+            ranked_group,
+            lambda row: (int(row["participation_count"]), int(row["win_count"])),
+        ):
+            tie_group = list(tie_group)
+            if len(tie_group) > 1:
+                random_source.shuffle(tie_group)
+            ordered.extend(
+                (row, draw_order) for draw_order, row in enumerate(tie_group, start=1)
+            )
+
+    optimized_at = now_text()
+    conn.execute("SAVEPOINT optimize_scores")
+    try:
+        for rank, (row, draw_order) in enumerate(ordered, start=1):
+            conn.execute(
+                """
+                INSERT INTO score_optimizations (
+                    user_id, rank, display_name, total_score,
+                    participation_count, win_count, draw_order, optimized_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    str(row["user_id"]),
+                    rank,
+                    str(row["display_name"]),
+                    int(row["total_score"]),
+                    int(row["participation_count"]),
+                    int(row["win_count"]),
+                    draw_order,
+                    optimized_at,
+                ),
+            )
+        log_activity(
+            conn,
+            "season",
+            "optimize",
+            actor_user_id=optimized_by_user_id,
+            payload={
+                "participant_count": len(ordered),
+                "criteria": ["total_score", "participation_count", "win_count", "random_draw"],
+            },
+        )
+        conn.execute("RELEASE SAVEPOINT optimize_scores")
+    except Exception:
+        conn.execute("ROLLBACK TO SAVEPOINT optimize_scores")
+        conn.execute("RELEASE SAVEPOINT optimize_scores")
+        raise
+
+    return fetch_score_optimization_rows(conn)
+
+
+def score_optimization_status_embed(
+    rows: list[sqlite3.Row], *, replay: bool = False
+) -> discord.Embed:
+    if replay:
+        return discord.Embed(
+            title="📌 점수 최적화 · 재브리핑",
+            description=(
+                f"이미 완료된 총 **{len(rows)}명**의 최적화 순위입니다.\n"
+                "DB에 저장된 결과를 그대로 다시 게시하며 재추첨하지 않습니다."
+            ),
+            color=discord.Color.gold(),
+        )
+    return discord.Embed(
+        title="✅ 점수 최적화 완료",
+        description=(
+            f"총 **{len(rows)}명**의 순위를 확정했습니다.\n"
+            "동점자만 완전 동률 추첨으로 풀어 유일한 순위로 만들었습니다."
+        ),
+        color=discord.Color.green(),
+    )
+
+
+def format_score_optimization_lines(rows: list[sqlite3.Row]) -> list[str]:
+    lines: list[str] = []
+    for row in rows:
+        display_name = discord.utils.escape_markdown(str(row["display_name"]))
+        lines.append(
+            f"**{int(row['rank'])}위** · {display_name} · **{int(row['total_score'])}점**"
+        )
+    return lines
+
+
+def build_score_optimization_embeds(rows: list[sqlite3.Row]) -> list[discord.Embed]:
+    return _build_ranking_embeds(
+        format_score_optimization_lines(rows),
+        base_title="🎲 점수 최적화 순위",
+        color=discord.Color.purple(),
+    )
+
+
+async def score_optimization_command(interaction: discord.Interaction) -> None:
+    if interaction.guild is None:
+        await interaction.response.send_message(
+            "서버 안에서만 점수 최적화를 실행할 수 있습니다.", ephemeral=True
+        )
+        return
+
+    with db() as conn:
+        closed = season_is_closed(conn)
+        done = score_optimization_is_done(conn) if closed else False
+        rows = fetch_score_optimization_rows(conn) if done else []
+
+    if not closed:
+        await interaction.response.send_message(
+            "시즌이 아직 종료되지 않았습니다. 먼저 `/시즌종료`를 실행해주세요.",
+            ephemeral=True,
+        )
+        return
+
+    if done:
+        await interaction.response.send_message(
+            embed=score_optimization_status_embed(rows, replay=True)
+        )
+        for embed in build_score_optimization_embeds(rows):
+            await interaction.followup.send(
+                embed=embed,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+        return
+
+    await interaction.response.defer()
+    try:
+        with db() as conn:
+            rows = optimize_scores(conn, str(interaction.user.id))
+    except (SeasonNotClosedError, ScoreOptimizationAlreadyDoneError) as error:
+        await interaction.followup.send(str(error), ephemeral=True)
+        return
+
+    await interaction.followup.send(embed=score_optimization_status_embed(rows))
+    for embed in build_score_optimization_embeds(rows):
+        await interaction.followup.send(
+            embed=embed,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
 
 
 def format_public_ranking_lines(rows: list[sqlite3.Row], start_rank: int = 1) -> list[str]:
