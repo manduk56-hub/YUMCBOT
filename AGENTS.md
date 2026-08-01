@@ -13,13 +13,17 @@ This file provides guidance to AI coding agents (Claude Code, Cursor, Codex 등)
 .\run.ps1                                   # 봇 실행 (.venv 없으면 자동 생성 + 의존성 설치)
 
 python -m unittest discover -s tests -v     # 전체
-python -m unittest tests.test_bot -v        # 파일 단위 (단일 테스트는 뒤에 .클래스.메서드)
+python -m unittest tests.test_games_bail -v # 파일 단위 (단일 테스트는 뒤에 .클래스.메서드)
 
 python -m compileall -q bot.py deploy/check_idle.py   # CI가 도는 문법 검사
 shellcheck deploy/*.sh                                # CI가 도는 배포 스크립트 검사
 ```
 
 테스트는 `bot.DB_PATH`를 임시 디렉터리로 patch해서 돈다. 디스코드 연결 없이 순수 함수와 DB 로직만 검증한다.
+`tests/`도 `yumcbot/` 모듈 경계를 그대로 따른다 (`tests/test_games_bail.py` ↔ `yumcbot/games/bail.py` 등).
+`tests/test_bot.py`에는 아직 bot.py에 직접 남아 있는 로직(이벤트 취소·자동 마감 카운트다운·긴급 투입)만 남는다.
+setUp의 DB patch·`add_user` 같은 헬퍼는 파일마다 필요한 만큼 복제한다 — 공용 베이스 클래스로 묶지 않는 이유는
+파일 하나만 읽어도 그 파일이 뭘 준비하는지 알 수 있어야 하기 때문이다.
 
 ## 개발자마다 전용 Discord 앱이 필요하다
 
@@ -32,9 +36,131 @@ shellcheck deploy/*.sh                                # CI가 도는 배포 스�
 
 ## 아키텍처
 
-전체 로직이 `bot.py` 한 파일에 있고, 구역 순서는 대략:
-상수/게임 설정 → 스키마·마이그레이션 → DB 헬퍼 → 게임별 상태 전이 함수 → `EventBot` 클래스 →
-embed/view 빌더 → `close_round_record`(정산) → 슬래시 명령어 → systemd 연동/엔트리포인트.
+**`bot.py` 한 파일을 `yumcbot/` 패키지로 쪼개는 중이다.** 지금은 과도기라 양쪽에 코드가 있다.
+
+| 모듈 | 담당 |
+| --- | --- |
+| `yumcbot/config.py` | 경로·환경변수·게임 튜닝 상수. 아무것도 import 하지 않는 최하단 |
+| `yumcbot/db.py` | 스키마·마이그레이션·연결(`db()`) |
+| `yumcbot/activity.py` | 활동 로그(`log_activity`), 규칙 스냅샷 |
+| `yumcbot/scoring.py` | 점수·잠수 코인·룰렛 연승 스택 |
+| `yumcbot/rounds.py` | 라운드 행 조회(`round_extra`·`round_game_key`·`can_join_round` 등). 순수 조회만 |
+| `yumcbot/runtime.py` | 게임 모듈이 bot.py 쪽 기능을 부르는 통로 (아래 참고) |
+| `yumcbot/roulette.py` | 러시안룰렛 전체 |
+| `yumcbot/ui.py` | 임베드 표시 유틸(`field_text`·`close_time_text`·`vote_view` 등). 전부 순수 함수 |
+| `yumcbot/permissions.py` | 운영자 판정(`is_operator_user`·`admin_only`) |
+| `yumcbot/discussion.py` | 익명 토론(스레드 발언·번호 배정·토론방 버튼판) |
+| `yumcbot/events.py` | 이벤트/라운드 생애주기 — `close_round_record`(정산 디스패치)와 `/오픈`·`/start`·`/미니게임`·`/라운드마감`·`/이벤트종료`·`/이벤트리스트`의 실제 본체 |
+| `yumcbot/ranking.py` | 점수·랭킹·백업 — `/잠수`·`/지목`·`/점수`·`/랭킹`·`/익명랭킹`·`/데이터백업`의 실제 본체 |
+| `yumcbot/games/registry.py` | 게임 목록(`GameSpec`)과 생성·자동 마감 전이·정산 훅 디스패치 |
+| `yumcbot/games/pairing.py` | 메인게임 셋이 공유하는 1:1 짝 매칭·비공개 방 |
+| `yumcbot/games/*.py` | **게임 하나가 한 파일이다.** `trust`·`sand`·`bail`(메인), `balance`·`defuse`·`top3`·`unique_number`·`cutting`·`baseball`(미니) |
+| `bot.py` | `EventBot` + 슬래시 명령어 **껍데기**(데코레이터 + 한 줄 위임) + systemd 연동/엔트리포인트 |
+
+의존은 위에서 아래 한 방향이다. `bot.py`는 옮긴 이름을 재노출해서 기존 호출부와 테스트를 그대로
+살려두고 있는데, 재노출은 사본이라 원본과 갈라질 수 있다 — `tests/test_packaging.py`가 그걸 막는다.
+**경로 상수(`DB_PATH` 등)와 `resolve_text_channel`은 재노출하지 않는다.** 사본이 있으면 테스트가
+임시 DB나 가짜 채널로 갈아끼웠다고 믿으면서 실제 경로를 여는, 증상 없는 실패가 난다.
+`config.DB_PATH` / `runtime.resolve_text_channel(...)`처럼 **모듈을 거쳐** 조회한다.
+
+### 게임 모듈이 위쪽을 부를 때는 `runtime.py`를 거친다
+
+게임 모듈은 bot.py를 import 할 수 없다 — bot.py가 게임 모듈을 부르므로 곧바로 순환이 된다.
+그런데 게임은 **인터랙션이 없는 자리에서도** 위쪽 기능이 필요하다(타이머 콜백에서 채널 열기,
+스스로 라운드 끝내기). 그래서 부팅 시 bot.py가 `runtime`에 등록해두고 게임 모듈이 꺼내 쓴다.
+
+| 등록 | 쓰는 곳 | 빠뜨리면 |
+| --- | --- | --- |
+| `runtime.set_client(bot)` | `resolve_text_channel`·`resolve_thread`, 타이머 스케줄, `runtime.auto_close_scheduler()` | 클릭으로 하는 조작은 멀쩡하고 타이머 경로만 죽는다 |
+| `runtime.set_round_services(...)` | 게임이 스스로 라운드를 끝낼 때(야구 3구 완료, 모래성 전원 종료) | 마지막 결과만 뜨고 정산이 안 된다 |
+
+`runtime.AutoCloseScheduler`(`schedule_auto_close`/`cancel_auto_close`)는 `games.pairing.PairBoardClient`와
+별개 프로토콜이다. 소수파 밸런스(1차→재선택 전이)처럼 1:1 방이 없는 게임도 다음 마감을 다시 걸어야
+하는데, 그 게임엔 `PairBoardClient`가 요구하는 스레드 락 기능이 없다. `yumcbot/events.py`도
+`/라운드마감`·`/이벤트종료`에서 이 프로토콜로 타이머를 취소한다 — `bot.auto_close_tasks`를 직접
+만지지 않는다.
+
+`RoundServices`는 정산·다음 미니게임 뷰·이벤트 요약 **셋을 따로** 노출한다. 한 번에 다 해주는
+함수로 감싸지 않는 이유는 순서와 조건이 게임마다 다르기 때문이다 — 야구는 정산 결과가 없어도
+이벤트 요약을 시도하고, 모래성은 그 자리에서 멈춘다.
+
+`EventBot`의 메서드가 필요할 때는 구체 타입 대신 `runtime_checkable` 프로토콜로 확인한다
+(`roulette.RouletteTimerClient`, `games.baseball.BaseballTimerClient`, `games.pairing.PairBoardClient`).
+**타이머 태스크와 진행판 락은 `EventBot`이 들고 있고**(재시작 복구도 거기서 한다) 게임 모듈은
+요청만 한다. 프로토콜은 메서드 이름만 보므로 `EventBot` 쪽 이름이 바뀌면 `isinstance`가 조용히
+False가 된다 — `tests/test_packaging.py`가 양쪽을 붙잡아 둔다.
+
+**게임 모듈의 상수를 테스트에서 갈아끼울 때는 그 모듈을 patch한다.** `patch.object(bot, "BAIL_...")`은
+bot.py의 재노출 사본만 바꾸므로 게임 모듈에 닿지 않는다 — `patch.object(bail, "BAIL_...")`이 맞다.
+
+**모듈을 옮길 때 import를 빠뜨려도 아무 증상이 없다.** 파일은 정상으로 import 되고 테스트도 통과하며,
+그 함수가 실제로 불릴 때에야 `NameError`로 터진다. `tests/test_packaging.py`의
+`ImportCompletenessTest`가 모든 모듈을 AST로 훑어 이걸 잡는다.
+
+`bot.py`에 남은 구역 순서는 대략:
+`EventBot` 클래스 → 인터랙션 핸들러(`on_interaction`이 부르는 `handle_*`) → 슬래시 명령어 껍데기 →
+systemd 연동/엔트리포인트.
+
+### 슬래시 명령어도 게임과 같은 패턴이다 — 껍데기는 bot.py, 본체는 모듈
+
+`@bot.tree.command(...)`는 `bot` 인스턴스가 있어야 붙는데, `bot = EventBot()`은 bot.py에서만
+만들어진다. 그래서 명령어 모듈(`events.py`·`ranking.py`, 게임의 `/준비`·`/세공진행`도 같다)은
+데코레이터 없는 평범한 async 함수만 갖고, bot.py가 데코레이터 + 한 줄 위임으로 감싼다:
+
+```python
+# yumcbot/events.py — 본체, 데코레이터 없음
+async def open_event_command(interaction: discord.Interaction) -> None: ...
+
+# bot.py — 껍데기. 이름(open_event)과 옵션(Choice 등)은 여기 남는다
+@bot.tree.command(name="오픈", description="...")
+@app_commands.default_permissions()
+@admin_only()
+async def open_event(interaction: discord.Interaction) -> None:
+    await events.open_event_command(interaction)
+```
+
+`close_round_record`가 `yumcbot/events.py`에 있는 이유도 같은 제약이다 — `/라운드마감`도 쓰고
+`EventBot.auto_close_round`(자동 마감 타이머)도 쓰는데, 어느 한쪽에 종속되지 않는 자리가 필요하다.
+bot.py는 이 함수를 게임 모듈처럼 다시 가져다 쓴다.
+
+`/라운드마감`·`/이벤트종료`는 `bot.auto_close_tasks`·`bot.baseball_pitch_tasks`를 직접 만지지
+않는다 — `runtime.auto_close_scheduler()`(위 참고)와 `games.baseball.cancel_baseball_timers(round_id)`를
+거친다. 등록 마감 → 다음 단계 시작 시퀀스(`advance_trust_registration` 등 게임 모듈의 `advance_*`
+함수)도 자동 마감 타이머와 `/라운드마감`이 같은 헬퍼를 공유해서, 어느 한쪽만 고쳐 갈라지는 일이 없다.
+
+### 게임 하나를 어디에 등록하는가
+
+`yumcbot/games/registry.py`의 `GAMES`가 게임 목록의 권위다. `GameSpec` 한 줄이 게임 키·표시 이름·
+분류(메인/미니)·`rounds.type`·`extra_json.mode`를 **함께** 들고 있다. 저장하는 곳과 되읽는 곳이
+떨어져 있으면 한쪽만 고쳤을 때 라운드는 열리는데 정산에서 조용히 빠지므로, 그 쌍을 한 줄로 묶는다.
+
+정산은 각 게임 모듈이 `register_settler(key, fn)`로 훅을 올린다. **`close_round_record`에는
+게임별 분기가 더 이상 없다** — 레지스트리 디스패치와 공통 후처리(다음 미니게임 안내, 활동 로그)만
+남았다. 새 게임을 추가하면서 여기에 `elif`를 넣지 말 것. 훅을 빠뜨리면 라운드는 정상으로
+진행되다가 마감에서만 "더 이상 지원하지 않는 게임"으로 조용히 0점이 된다
+(`test_every_game_settles_through_the_registry`가 지킨다).
+
+같은 패턴이 라운드 **생성**과 **자동 마감 단계 전이**에도 있다:
+
+- `register_creator(key, fn)` — `/시작`·`/미니게임`이 받은 입력(`CreateContext`: 제목·시간·
+  `선택_a/b`·협상/실행 시간 등)으로 그 게임의 `rounds` INSERT까지 훅이 직접 한다. 컬럼 구성이
+  게임마다 달라서(밸런스만 `option_a`/`option_b`를 쓴다) 공통 INSERT로 묶을 수 없다. 검증
+  실패(예: 밸런스인데 선택지 누락, 상위 3명 견제인데 참가자 3명 미만)는 `RoundCreationError`를
+  던진다 — 메시지가 그대로 ephemeral 응답이 된다. `create_round_from_setup`에는 게임별 분기가
+  없고, 이 결과를 받아 이벤트/활동 로그·메시지 발행·토론방 생성 같은 **모든 게임 공통** 후처리만
+  한다.
+- `register_auto_close_handler(key, fn)` — 자동 마감 타이머(`EventBot.auto_close_round`)가
+  발화했을 때 "다음 단계로 넘어가야 하는가"만 훅에게 묻는다(`AutoCloseContext`). 넘어갈 단계가
+  있으면 훅이 처리하고 `True`를, 없으면(그 게임이 아니거나 이미 최종 단계라면) `False`를
+  돌려줘 호출자가 `close_round_record`로 정산하게 한다. 등록/협상 마감처럼 자동 마감과
+  `/라운드마감`(수동) 양쪽에서 똑같이 필요한 시퀀스는 게임 모듈에 `advance_*` 함수
+  (`advance_trust_registration`·`advance_sand_registration`·`advance_bail_registration`·
+  `advance_bail_negotiation`·`advance_minority_balance_initial`)로 한 번만 정의해 두 호출부가
+  공유한다 — 어느 한쪽만 고치면 자동 마감과 수동 마감이 조용히 갈라지기 때문이다.
+
+셋 다 등록을 빠뜨려도 예외가 없다는 공통점이 있다. 정산 훅이 없으면 0점, 생성 훅이 없으면
+"아직 지원하지 않는 게임" 응답, 자동 마감 훅이 없으면 그 게임의 등록 단계가 시간이 다 돼도
+다음 단계로 안 넘어가고 조용히 정산행이다.
 
 ### 상태는 전부 SQLite에 있다 (재시작 안전성)
 
@@ -110,14 +236,14 @@ embed/view 빌더 → `close_round_record`(정산) → 슬래시 명령어 → s
 **짝이 하나둘 조기 정산되다가 마지막 짝까지 끝나면, 라운드 전체도 마감 시각을 기다리지 않는다**
 (`bail_executions_complete` / `finish_bail_execution_round`). 협상 단계의 방 전체 조기 전이와
 같은 논리를 실행 단계에도 적용한 것이다 — 참가자가 적어 짝이 하나뿐인 이벤트에서 특히
-중요하다: 그 한 짝만 끝나도 남은 실행 시간을 그대로 흘려보내면 안 된다. `finish_bail_execution_round`는
-`auto_close_round`가 자연 마감 때 밟는 절차(`close_round_record` → `publish_bail_pair_results` →
-토론 스레드 보관 → 메인 채널에 결과+다음 미니게임 안내 → 이벤트 요약)를 그대로 따르고, 예약된
-자동 마감 타이머도 먼저 취소한다. 아직 안 끝난 짝이 있으면 대신 `refresh_main_bail_board`로
-메인 진행판만 갱신한다. 실행 단계의 마감 카운트다운은 **메인 채널이 아니라 아직 안 끝난
-방에만** 띄운다(`auto_close_round`) — 참가자가 전부 비공개 방에 들어가 있어 메인 채널
-카운트다운은 볼 사람이 없고, 이미 조기 정산된 방은 기다리기만 하면 되므로 굳이 다시 알릴
-필요가 없다.
+중요하다: 그 한 짝만 끝나도 남은 실행 시간을 그대로 흘려보내면 안 된다. `close_round_record`는
+게임 모듈이 직접 부를 수 없어서(레지스트리를 거쳐 다시 게임 모듈을 부른다), `finish_bail_execution_round`는
+`runtime.round_services()`를 거쳐 정산·다음 미니게임 안내·이벤트 요약을 잇는다(야구의 3구 조기
+종료와 같은 패턴). 예약된 자동 마감 타이머도 먼저 취소한다. 아직 안 끝난 짝이 있으면 대신
+`refresh_main_bail_board`로 메인 진행판만 갱신한다. 실행 단계의 마감 카운트다운은 **메인 채널이
+아니라 아직 안 끝난 방에만** 띄운다(`auto_close_round`) — 참가자가 전부 비공개 방에 들어가 있어
+메인 채널 카운트다운은 볼 사람이 없고, 이미 조기 정산된 방은 기다리기만 하면 되므로 굳이 다시
+알릴 필요가 없다.
 
 **둘이 합쳐 몇 번 퍼냈는지는 실시간으로 공개되지만, 누가 몇 번 퍼냈는지는 정산 전까지 감춘다.**
 공동 진행 상황 메시지는 문구가 아니라 단계별 이미지를 보여주는 임베드다(`build_bail_progress_embed`).
@@ -133,16 +259,16 @@ embed/view 빌더 → `close_round_record`(정산) → 슬래시 명령어 → s
 개인별 분담이 새면 무임승차 여부가 정산 전에 드러나 배신 유인이 무너지므로, 이 부분은 예전의
 "제출 여부 비공개" 규칙과 같은 이유로 여전히 지킨다. 두 사람이 거의 동시에 눌러도 누적이 씹히지
 않도록, 그리고 조기 정산·결과 공개·방 잠금이 겹쳐 쓰이지 않도록 클릭 처리 전체를
-`bot.sand_board_lock(thread_id)`으로 직렬화한다.
+`pairing.board_client().sand_board_lock(thread_id)`으로 직렬화한다.
 
 **조기 정산은 '이 짝의 승패가 확정되고 방에 공개되는 시점'만 앞당길 뿐, 실제 점수 지급은 여전히
 라운드 마감에 한 번에 일어난다.** `handle_bail_scoop`는 필요치에 도달하면 `resolve_bail_pair`로
 결과(`pair["result"]`)를 확정하고 `result_published`만 남길 뿐 `add_score`를 호출하지 않는다 —
 점수 반영 경로를 둘로 나누면 이중 지급 위험이 생기기 때문이다. 실제 지급은 지금까지와 동일하게
-`close_round_record`가 모든 짝(조기 정산분 포함)을 훑으며 한 번에 처리한다 — 마지막 짝의 조기
-정산이 곧 `finish_bail_execution_round`를 통해 그 `close_round_record` 호출을 앞당기는 것일
-뿐이다. `result_published`는 오직 `publish_bail_pair_results`가 이미 공개한 결과를 마감 때 또
-보내지 않게 막는 용도다.
+`close_round_record`(정산은 `settle_bail`)가 모든 짝(조기 정산분 포함)을 훑으며 한 번에 처리한다 —
+마지막 짝의 조기 정산이 곧 `finish_bail_execution_round`를 통해 그 정산을 앞당기는 것일 뿐이다.
+`result_published`는 오직 `publish_bail_pair_results`가 이미 공개한 결과를 마감 때 또 보내지
+않게 막는 용도다.
 
 **요약 임베드는 짝을 소개하는 줄(`<@user_a> ↔ <@user_b>`) 하나에서만 멘션을 쓰고, 그 아래 정산·
 배분·실제 퍼내기 줄은 그 줄과 같은 좌(user_a)/우(user_b) 순서로 값만 "/"로 나열한다**
@@ -188,9 +314,15 @@ embed/view 빌더 → `close_round_record`(정산) → 슬래시 명령어 → s
 | 야구 | `grid` | `baseball` | `/준비` 후 비활성 3×3 판을 띄우고 3초 뒤 자동 활성화. 클릭 기록은 `baseball_swings`, 활성화 시각·조작판 메시지 ID·무작위 버튼 위치는 `extra_json`에 저장해 재시작 시 타이머 복구. 미입력은 7초로 계산하고 3구 평균 최종 순위로 한 번만 점수 지급 |
 | 가라앉는 배 | `sand` | `bail` | **모래성과 같은 타입을 쓴다.** 아래 주의 참고 |
 
-권위 있는 목록은 `MAIN_GAME_TYPES` / `MINI_GAME_TYPES` / `GAME_NAMES` 상수다. CHECK 제약이 아니다.
-이 상수들은 **게임 키 집합**이지 `rounds.type` 값 집합이 아니다 (`MAIN_GAME_TYPES`에 `bail`이 있지만
-그런 `type` 값은 DB에 없다). 게임을 갈라야 할 때는 `round_game_key(round_row)`를 쓴다.
+권위 있는 목록은 `yumcbot/games/registry.py`의 `GAMES`다. CHECK 제약이 아니다.
+`MAIN_GAME_TYPES` / `MINI_GAME_TYPES` / `GAME_NAMES`는 거기서 파생되며, **게임 키 집합**이지
+`rounds.type` 값 집합이 아니다 (`MAIN_GAME_TYPES`에 `bail`이 있지만 그런 `type` 값은 DB에 없다).
+게임을 갈라야 할 때는 `round_game_key(round_row)`를 쓴다.
+
+> 다만 호출부 몇 곳은 `round_row["type"] in MAIN_GAME_TYPES`처럼 **type으로도** 검사한다.
+> 메인게임의 저장 타입이 마침 전부 그 키 집합 안에 있어서(`bail`은 `sand`) 우연히 통과하는 것이다.
+> 새 메인게임을 다른 저장 타입으로 추가하면 그 검사만 조용히 False가 된다 —
+> `test_main_game_keys_double_as_round_types`가 지키고 있다.
 
 **`bail`은 `sand`와 타입이 겹치는 첫 사례다.** `type == "sand"`로 분기하는 코드는 모래성과 가라앉는 배를
 구분하지 못한다. 새 코드를 넣을 때 다음을 확인한다:

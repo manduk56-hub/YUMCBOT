@@ -9,6 +9,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 import bot
+from yumcbot import config
 
 
 class ActivityLogTests(unittest.TestCase):
@@ -19,7 +20,8 @@ class ActivityLogTests(unittest.TestCase):
 
     def setUp(self) -> None:
         self.temp_dir = tempfile.TemporaryDirectory()
-        self.db_patch = patch.object(bot, "DB_PATH", Path(self.temp_dir.name) / "test.sqlite3")
+        # patch 대상이 config인 이유는 test_bot.py setUp의 주석 참고.
+        self.db_patch = patch.object(config, "DB_PATH", Path(self.temp_dir.name) / "test.sqlite3")
         self.db_patch.start()
         bot.init_db()
 
