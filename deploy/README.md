@@ -225,7 +225,49 @@ sudo systemctl restart yumcbot
 
 ---
 
-## 6. 브랜치 보호 설정 (GitHub Settings → Branches)
+## 6. 시즌 종료 시 완전 정지 / 재개
+
+`systemctl stop yumcbot`만으로는 부족하다. 서버에는 프로세스가 두 개 떠 있다:
+
+1. **`yumcbot.service`** — 봇 자체
+2. **GitHub Actions self-hosted runner** (`svc.sh`로 등록된 별도 systemd 서비스) — `yumcbot`을
+   stop해도 안 죽는다. 계속 GitHub에 `Idle`로 대기하다가, 이 상태에서 `main`에 push가 들어오면
+   배포 파이프라인이 자동으로 돌아 방금 stop한 봇을 다시 `start`시켜버린다.
+
+파일(DB·릴리스 등)은 그대로 두고 프로세스·파이프라인만 완전히 멈추려면 둘 다 내려야 한다.
+
+### 정지
+
+```bash
+sudo systemctl stop yumcbot
+sudo systemctl disable yumcbot          # 재부팅해도 자동으로 안 뜨게
+
+sudo /opt/yumcbot/runner/svc.sh stop    # 러너도 정지 -> 배포 파이프라인이 서버에서 실행될 방법이 없어짐
+```
+
+`svc.sh stop`만 하면 되고 `uninstall`/`config.sh remove`까지 할 필요는 없다 — 등록은 유지한 채
+프로세스만 멈추는 것이라, 재개할 때 재등록 없이 그대로 돌아온다. 이 상태에서 `main`에 push가
+들어오면 test 잡만 돌고 deploy 잡은 러너가 없어 대기(queued)로 남는다 — 실패가 아니라 조용히 쌓인다.
+
+### 재개
+
+```bash
+sudo systemctl enable --now yumcbot     # enable(재부팅 시 자동시작 복구) + start
+sudo /opt/yumcbot/runner/svc.sh start   # 러너 재개
+```
+
+챙길 것 두 가지:
+
+1. **밀려있던 배포 확인.** 정지 기간 동안 `main`에 push가 있었다면 그 배포 워크플로우가 대기 상태로
+   쌓여 있다가 러너가 뜨자마자 자동 실행된다. GitHub 저장소 → Actions 탭에서 미리 확인하고, 원치
+   않는 타이밍이면 러너를 켜기 전에 처리한다.
+2. **정상 기동 확인.** `enable --now`는 systemd 명령 성공만 보장한다. 실제로 디스코드 로그인 후
+   `READY=1`을 보냈는지는 `sudo journalctl -u yumcbot -f`로 직접 확인한다 (오래 꺼져 있던 뒤라
+   토큰 만료 등 문제가 있을 수 있다).
+
+---
+
+## 7. 브랜치 보호 설정 (GitHub Settings → Branches)
 
 **`main`**
 
